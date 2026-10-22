@@ -1,0 +1,757 @@
+From 8154629d3bc5d10150b10d1494229a073bd63fff Mon Sep 17 00:00:00 2001
+From: Strata Orin Port <orin-port@example.invalid>
+Date: Thu, 22 Oct 2026 07:28:39 +0000
+Subject: [PATCH 4/4] test: cover ARM quantization, shared budgets and CUDA
+ memory primitives
+
+Retain GPU parity checks, omitting only direct AVX-specific subtests on ARM. Include the fork model-free CUDA probe, mapped handshake and cache tests; add 64 GiB budget cases and remove the newer pool task test x86-only skip on ARM. CUDA tests have not been run in this environment.
+---
+ CMakeLists.txt                                |  30 ++++
+ src/core/expert_cache_memory_test.cpp         |  43 ++++++
+ src/core/pinned_fallback_test.cpp             |  43 ++++++
+ src/kernels/cpu/expert_multi_test.cpp         |   3 +-
+ src/kernels/cpu/expert_parity.cpp             |   3 +-
+ src/kernels/cpu/pool_stress.cpp               |   3 +-
+ src/kernels/cpu/pool_tasks_test.cpp           |   3 +-
+ src/kernels/cpu/pool_test.cpp                 |   3 +-
+ .../cpu/q2_portable_reference_test.cpp        |  57 ++++++++
+ src/kernels/cpu/q8_oracle_contract_test.cpp   |  46 +++++++
+ src/kernels/cpu/router_dot_parity.cpp         |   2 +
+ src/kernels/native_expert_parity.cpp          |   9 ++
+ src/kernels/quantize_act_parity.cpp           |   6 +-
+ src/platform/shared_memory_budget_test.cpp    |  31 +++++
+ tests/core/file_expert_source_test.cpp        |   7 +
+ tools/cuda_memory_selftest.cu                 | 128 ++++++++++++++++++
+ tools/cuda_platform_probe.cpp                 |  76 +++++++++++
+ 17 files changed, 487 insertions(+), 6 deletions(-)
+ create mode 100644 src/core/expert_cache_memory_test.cpp
+ create mode 100644 src/core/pinned_fallback_test.cpp
+ create mode 100644 src/kernels/cpu/q2_portable_reference_test.cpp
+ create mode 100644 src/kernels/cpu/q8_oracle_contract_test.cpp
+ create mode 100644 src/platform/shared_memory_budget_test.cpp
+ create mode 100644 tools/cuda_memory_selftest.cu
+ create mode 100644 tools/cuda_platform_probe.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0e7461b2..e85f9dcd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1930,6 +1930,36 @@ if(STRATA_BUILD_TESTS)
+     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+   endif()
+ 
++  add_executable(shared_memory_budget_test src/platform/shared_memory_budget_test.cpp)
++  target_include_directories(shared_memory_budget_test PRIVATE include)
++  add_test(NAME shared_memory_budget_test COMMAND shared_memory_budget_test)
++  add_executable(q2_portable_reference_test src/kernels/cpu/q2_portable_reference_test.cpp)
++  target_link_libraries(q2_portable_reference_test PRIVATE strata_kernels_cpu)
++  add_test(NAME q2_portable_reference_test COMMAND q2_portable_reference_test)
++  set_tests_properties(q2_portable_reference_test PROPERTIES SKIP_RETURN_CODE 77)
++  if(STRATA_NATIVE_EXPERTS)
++    add_executable(q8_oracle_contract_test src/kernels/cpu/q8_oracle_contract_test.cpp)
++    target_link_libraries(q8_oracle_contract_test PRIVATE strata_kernels_cpu)
++    add_test(NAME q8_oracle_contract_test COMMAND q8_oracle_contract_test)
++    set_tests_properties(q8_oracle_contract_test PROPERTIES SKIP_RETURN_CODE 77)
++  endif()
++  if(STRATA_ENABLE_CUDA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    add_executable(expert_cache_memory_test src/core/expert_cache_memory_test.cpp)
++    target_link_libraries(expert_cache_memory_test PRIVATE strata_engine CUDA::cudart)
++    add_test(NAME expert_cache_memory_test COMMAND expert_cache_memory_test)
++    set_tests_properties(expert_cache_memory_test PROPERTIES ENVIRONMENT "STRATA_UMA_HEADROOM_GIB=0" TIMEOUT 60)
++    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
++      add_test(NAME expert_cache_memory_refusal COMMAND expert_cache_memory_test --refusal)
++      set_tests_properties(expert_cache_memory_refusal PROPERTIES
++        ENVIRONMENT "STRATA_UMA_HEADROOM_GIB=1024" SKIP_RETURN_CODE 77 TIMEOUT 60)
++    endif()
++    add_executable(pinned_fallback_test src/core/pinned_fallback_test.cpp)
++    target_link_libraries(pinned_fallback_test PRIVATE strata_core CUDA::cudart)
++    target_link_options(pinned_fallback_test PRIVATE "LINKER:--wrap=cudaHostRegister")
++    add_test(NAME pinned_fallback_test COMMAND pinned_fallback_test)
++    set_tests_properties(pinned_fallback_test PROPERTIES TIMEOUT 60)
++  endif()
++
+   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+   add_test(NAME expert_multi_test COMMAND expert_multi_test)
+diff --git a/src/core/expert_cache_memory_test.cpp b/src/core/expert_cache_memory_test.cpp
+new file mode 100644
+index 00000000..f3aa4b1d
+--- /dev/null
++++ b/src/core/expert_cache_memory_test.cpp
+@@ -0,0 +1,43 @@
++// Model-free allocation and address-stability checks for the actual expert cache.
++#include "strata/core/expert_cache.hpp"
++#include "strata/core/device.hpp"
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++int main(int argc, char** argv) {
++    using strata::core::ExpertCache;
++    std::string err;
++    ExpertCache cache;
++    if (argc == 2 && std::strcmp(argv[1], "--refusal") == 0) {
++        // An integrated device with headroom above physical capacity must refuse
++        // even a tiny cache before allocating. This is a separate process so the
++        // cached headroom setting is read afresh.
++        if (!strata::core::device_info(0).integrated) return 77;
++        if (cache.open(1, 1, 1, 4096, err) || cache.valid() || err.empty()) return 1;
++        std::printf("budget refusal: %s\n", err.c_str());
++        return 0;
++    }
++    constexpr int64_t segment = 2ll << 20;
++    cache.set_segment_bytes(segment);
++    if (!cache.open(4, 1, 4, segment, err)) {
++        std::fprintf(stderr, "segmented open: %s\n", err.c_str()); return 1;
++    }
++    if (!cache.segmented() || cache.slots() != 4) return 1;
++    auto* address = cache.device_slot(0);
++    const int value = 0x12345678;
++    if (cudaMemcpy(address, &value, sizeof(value), cudaMemcpyHostToDevice) != cudaSuccess) return 1;
++    if (!cache.shrink(segment, err) || cache.slots() != 1 || cache.mapped_bytes() != segment) return 1;
++    if (!cache.grow(4 * segment, err) || cache.slots() != 4 || cache.device_slot(0) != address) return 1;
++    int restored = 0;
++    if (cudaMemcpy(&restored, address, sizeof(restored), cudaMemcpyDeviceToHost) != cudaSuccess || restored != value)
++        return 1;
++    cache.close();
++    cache.set_segment_bytes(0);
++    ExpertCache::set_vmm(false);
++    if (!cache.open_sized({4096, 8192}, 1, 2, err) || cache.segmented() || cache.slots() != 2) return 1;
++    cache.close();
++    std::puts("expert cache VMM shrink/grow, stable address, retained data and cudaMalloc path: PASS");
++    return 0;
++}
+diff --git a/src/core/pinned_fallback_test.cpp b/src/core/pinned_fallback_test.cpp
+new file mode 100644
+index 00000000..1a750fa6
+--- /dev/null
++++ b/src/core/pinned_fallback_test.cpp
+@@ -0,0 +1,43 @@
++// Exercise registration failure without exhausting the machine's shared RAM.
++// GNU ld wraps only this test's cudaHostRegister references.
++#include "strata/core/pinned.hpp"
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++extern "C" cudaError_t __real_cudaHostRegister(void*, size_t, unsigned int);
++static int refused = 0;
++extern "C" cudaError_t __wrap_cudaHostRegister(void*, size_t, unsigned int) {
++    ++refused;
++    // Seed an actual runtime error; the fallback must consume it before the
++    // next engine operation. No large allocation or driver resource is needed.
++    (void) __real_cudaHostRegister(nullptr, 4096, cudaHostRegisterMapped);
++    return cudaErrorMemoryAllocation;
++}
++
++int main() {
++    constexpr size_t bytes = 64u << 10;
++    int failures = 0;
++    for (bool sliced : {false, true}) {
++        const std::vector<uint64_t> bounds = sliced ? std::vector<uint64_t>{0, bytes / 2, bytes}
++                                                    : std::vector<uint64_t>{};
++        strata::core::PinnedArena arena(bytes, bounds);
++        if (!arena.valid() || arena.registered_bytes != 0 || arena.registered_slices != 0 ||
++            arena.note.find("FAILED") == std::string::npos || cudaGetLastError() != cudaSuccess) {
++            std::fprintf(stderr, "fallback state: %s\n", arena.note.c_str()); ++failures; continue;
++        }
++        std::memset(arena.data(), 0x87, bytes);
++        void* device = nullptr;
++        std::vector<unsigned char> restored(bytes);
++        if (cudaMalloc(&device, bytes) != cudaSuccess) return 2;
++        const bool copied = cudaMemcpyAsync(device, arena.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
++                            cudaDeviceSynchronize() == cudaSuccess &&
++                            cudaMemcpy(restored.data(), device, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
++        cudaFree(device);
++        if (!copied || std::memcmp(restored.data(), arena.data(), bytes) != 0) ++failures;
++    }
++    if (refused != 3) ++failures; // whole arena; whole arena then first slice
++    std::printf("pinned registration refusal, sliced refusal, error cleanup, pageable copy: %d failures\n", failures);
++    return failures ? 1 : 0;
++}
+diff --git a/src/kernels/cpu/expert_multi_test.cpp b/src/kernels/cpu/expert_multi_test.cpp
+index c4ec7b81..46a2381f 100644
+--- a/src/kernels/cpu/expert_multi_test.cpp
++++ b/src/kernels/cpu/expert_multi_test.cpp
+@@ -7,6 +7,7 @@
+ // The bench measures the speculation model's `extra_use_cost`: the CPU time of each extra token routed to an
+ // expert, as a fraction of reading the expert once (tools/spec_economics.py assumes 0.2).
+ #include "strata/kernels/cpu/expert.hpp"
++#include "strata/platform/cpu_arch.hpp"
+ 
+ #include <chrono>
+ #include <cstdio>
+@@ -46,7 +47,7 @@ double now_ms() {
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+-    if (const c::CpuFeatures feat = c::cpu_features(); !feat.usable()) {   // the AVX-512 kernel: nothing to test here
++    if (const c::CpuFeatures feat = c::cpu_features(); STRATA_CPU_X86 && !feat.usable()) {
+         std::printf("expert_multi_test: CPU lacks %s: SKIPPED\n", feat.reason());
+         return 77;
+     }
+diff --git a/src/kernels/cpu/expert_parity.cpp b/src/kernels/cpu/expert_parity.cpp
+index 39f24a1c..7a58137b 100644
+--- a/src/kernels/cpu/expert_parity.cpp
++++ b/src/kernels/cpu/expert_parity.cpp
+@@ -1,3 +1,4 @@
++#include "strata/platform/cpu_arch.hpp"
+ // src/kernels/cpu/expert_parity.cpp - P2.S3's test for the CPU expert path.
+ //
+ // WHAT IS BEING CHECKED, and the two tolerances are different questions:
+@@ -98,7 +99,7 @@ int main(int argc, char** argv) {
+     const cpu::CpuFeatures feat = cpu::cpu_features();
+     std::printf("  %-44s %s\n", "AVX512 F/BW/VL/VNNI/VBMI",
+                 feat.usable() ? "all present" : feat.reason());
+-    if (!feat.usable()) {
++    if (STRATA_CPU_X86 && !feat.usable()) {
+         std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
+         std::printf("      P2.S3's kernel check is SKIPPED, not passed.\n");
+         std::printf("\nexpert_parity: 0 failures, 1 SKIPPED\n");
+diff --git a/src/kernels/cpu/pool_stress.cpp b/src/kernels/cpu/pool_stress.cpp
+index 2c9fca54..1df12537 100644
+--- a/src/kernels/cpu/pool_stress.cpp
++++ b/src/kernels/cpu/pool_stress.cpp
+@@ -1,3 +1,4 @@
++#include "strata/platform/cpu_arch.hpp"
+ // src/kernels/cpu/pool_stress.cpp - issue #29: the expert pool under the load a big-VRAM card gives it.
+ //
+ // With most experts resident on the GPU, many layers hand the pool nothing, the workers go to sleep in the middle
+@@ -25,7 +26,7 @@ namespace cpu = strata::kernels::cpu;
+ int main(int argc, char** argv) {
+     const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
+     const cpu::CpuFeatures feat = cpu::cpu_features();
+-    if (!feat.usable()) {
++    if (STRATA_CPU_X86 && !feat.usable()) {
+         std::printf("CPU lacks %s: pool_stress SKIPPED\n", feat.reason());
+         return 0;
+     }
+diff --git a/src/kernels/cpu/pool_tasks_test.cpp b/src/kernels/cpu/pool_tasks_test.cpp
+index dbb5e754..2b89b72a 100644
+--- a/src/kernels/cpu/pool_tasks_test.cpp
++++ b/src/kernels/cpu/pool_tasks_test.cpp
+@@ -1,5 +1,6 @@
+ // CPU-only task partition parity. Optional real expert: pool_tasks_test GU_TYPE DOWN_TYPE BLOB_FILE
+ #include "strata/kernels/cpu/pool.hpp"
++#include "strata/platform/cpu_arch.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "ggml.h"
+ 
+@@ -17,7 +18,7 @@ namespace cpu = strata::kernels::cpu;
+ int main(int argc, char** argv) {
+     if (argc != 1 && argc != 4) return 2;
+     // its activation quantiser is the AVX one at least (act_quant_any): a CPU without AVX (Westmere) would stop on an illegal instruction
+-    if (!cpu::cpu_avx1_ok()) { std::printf("pool_tasks_test: no AVX on this CPU, skipped\n"); return 0; }
++    if (STRATA_CPU_X86 && !cpu::cpu_avx1_ok()) { std::printf("pool_tasks_test: no AVX on this CPU, skipped\n"); return 0; }
+     cpu::NativeFmt f;
+     std::string err;
+     if (!cpu::native_fmt(argc == 4 ? std::atoi(argv[1]) : GGML_TYPE_Q4_0,
+diff --git a/src/kernels/cpu/pool_test.cpp b/src/kernels/cpu/pool_test.cpp
+index dbc7288a..69506180 100644
+--- a/src/kernels/cpu/pool_test.cpp
++++ b/src/kernels/cpu/pool_test.cpp
+@@ -1,3 +1,4 @@
++#include "strata/platform/cpu_arch.hpp"
+ // src/kernels/cpu/pool_test.cpp - P2.S3's test for the expert pool.
+ //
+ // The pool's correctness claims are small and specific, so they are checked directly rather than through a
+@@ -64,7 +65,7 @@ int main(int argc, char** argv) {
+     }
+ 
+     const cpu::CpuFeatures feat = cpu::cpu_features();
+-    if (!feat.usable()) {
++    if (STRATA_CPU_X86 && !feat.usable()) {
+         std::printf("  CPU lacks %s - the VNNI path cannot run here; pool test SKIPPED, not passed.\n",
+                     feat.reason());
+         std::printf("\npool: 0 failures, 1 SKIPPED\n");
+diff --git a/src/kernels/cpu/q2_portable_reference_test.cpp b/src/kernels/cpu/q2_portable_reference_test.cpp
+new file mode 100644
+index 00000000..a56a86e0
+--- /dev/null
++++ b/src/kernels/cpu/q2_portable_reference_test.cpp
+@@ -0,0 +1,57 @@
++// Independent FP64 dequantized reference for the Q2_0 GGUF row path.
++#include "strata/kernels/cpu/expert.hpp"
++#include "strata/platform/cpu_arch.hpp"
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <vector>
++namespace c = strata::kernels::cpu;
++int main() {
++    if (STRATA_CPU_X86 && !c::cpu_features().usable()) {
++        std::puts("Q2_0 AVX512 row implementation unavailable on this x86 CPU");
++        return 77;
++    }
++    c::cpu_require_expert_support();
++    std::mt19937 rng(87126);
++    constexpr int rows = 7;
++    int failures = 0;
++    // Odd block counts exercise the short SIMD tail as well as the ARM loop.
++    for (int blocks : {1, 3, 10, 40}) {
++        const int n = blocks * 64;
++        std::vector<unsigned char> weights(rows * blocks * 18);
++        for (int r = 0; r < rows; ++r) for (int b = 0; b < blocks; ++b) {
++            auto* p = weights.data() + (r * blocks + b) * 18;
++            const uint16_t half = 0x2400; // exactly 1/64
++            std::memcpy(p, &half, 2);
++            for (int j = 0; j < 16; ++j) p[2 + j] = static_cast<unsigned char>(rng());
++        }
++        c::ActQ acts[c::MAXT];
++        const c::ActQ* input[c::MAXT];
++        float output[c::MAXT][rows];
++        float* dst[c::MAXT];
++        std::vector<float> x(n);
++        for (int t = 0; t < c::MAXT; ++t) {
++            for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 317;
++            c::act_quant_q8_1(x.data(), n, acts[t]);
++            input[t] = &acts[t]; dst[t] = output[t];
++        }
++        for (int nt = 1; nt <= c::MAXT; ++nt) {
++            c::q2_0_gguf_rows_multi(weights.data(), blocks * 18, blocks, input, nt, dst, 0, rows);
++            for (int t = 0; t < nt; ++t) for (int r = 0; r < rows; ++r) {
++                double reference = 0, absolute_sum = 0;
++                for (int i = 0; i < n; ++i) {
++                    const auto* p = weights.data() + (r * blocks + i / 64) * 18 + 2;
++                    const int code = (p[(i % 64) / 4] >> (2 * (i % 4))) & 3;
++                    const double term = (code - 1) / 64.0 * acts[t].q[i] * double(acts[t].scale[i / 32]);
++                    reference += term; absolute_sum += std::abs(term);
++                }
++                // Bound FP32 accumulation error by its absolute terms, avoiding
++                // relative-error spikes when signed contributions cancel.
++                if (!std::isfinite(output[t][r]) || std::abs(output[t][r] - reference) > 1e-5 * (1 + absolute_sum)) ++failures;
++            }
++        }
++    }
++    std::printf("Q2_0 rows vs FP64 dequantized reference: %d failures\n", failures);
++    return failures ? 1 : 0;
++}
+diff --git a/src/kernels/cpu/q8_oracle_contract_test.cpp b/src/kernels/cpu/q8_oracle_contract_test.cpp
+new file mode 100644
+index 00000000..92674588
+--- /dev/null
++++ b/src/kernels/cpu/q8_oracle_contract_test.cpp
+@@ -0,0 +1,46 @@
++// Compare the optional packed-Q2 activation contract with pinned ggml's
++// actual CPU quantizer, including zeros, small scales and rounding ties.
++#include "strata/kernels/cpu/expert.hpp"
++#include "strata/platform/cpu_arch.hpp"
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <vector>
++namespace c = strata::kernels::cpu;
++int main() {
++    if (STRATA_CPU_X86 && !c::cpu_features().usable()) return 77;
++    ggml_cpu_init();
++    c::expert_set_oracle_q8_0(true);
++    const auto* trait = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
++    std::mt19937 rng(87126);
++    c::ActQ actual;
++    std::vector<float> x(c::H);
++    std::vector<unsigned char> expected(c::H / 32 * 34);
++    int failures = 0;
++    for (int trial = 0; trial < 64; ++trial) {
++        for (int i = 0; i < c::H; ++i) {
++            const int block = i / 32;
++            if (trial == 0) x[i] = 0;
++            else if (trial == 1) x[i] = (i % 32 == 31) ? 127.f : float(i % 31 - 15) + 0.5f;
++            else x[i] = float(int(rng() % 20001) - 10000) * std::ldexp(1.f / 317.f, block % 16 - 12);
++        }
++        trait->from_float(x.data(), expected.data(), c::H);
++        c::act_quant_q8_1(x.data(), c::H, actual);
++        for (int b = 0; b < c::H / 32; ++b) {
++            uint16_t half;
++            std::memcpy(&half, expected.data() + b * 34, 2);
++            const float scale = ggml_fp16_to_fp32(half);
++            const auto* codes = reinterpret_cast<const int8_t*>(expected.data() + b * 34 + 2);
++            int sum = 0;
++            for (int j = 0; j < 32; ++j) sum += codes[j];
++            if (std::memcmp(codes, actual.q + b * 32, 32) != 0 || scale != actual.scale[b] ||
++                sum != actual.sum[b] || scale * float(sum) != actual.hx[b]) ++failures;
++        }
++    }
++    c::expert_set_oracle_q8_0(false);
++    std::printf("Q8_0 activation contract vs pinned ggml CPU: %d mismatched blocks\n", failures);
++    return failures ? 1 : 0;
++}
+diff --git a/src/kernels/cpu/router_dot_parity.cpp b/src/kernels/cpu/router_dot_parity.cpp
+index bd1341b9..ad60b519 100644
+--- a/src/kernels/cpu/router_dot_parity.cpp
++++ b/src/kernels/cpu/router_dot_parity.cpp
+@@ -1,3 +1,4 @@
++#include "strata/platform/cpu_arch.hpp"
+ // src/kernels/cpu/router_dot_parity.cpp - the router lookahead's BF16 dot on each rung this CPU has: the AVX2 kernel
+ // (kq_avx2.cpp) and the AVX1 one for older CPUs (kq_avx1.cpp), against a double-precision reference, plus the time
+ // of one layer's router.  No GPU, no model: random BF16 rows of the model's router shape [512 x 2560], 1..8 tokens.
+@@ -63,6 +64,7 @@ int main() {
+     };
+     std::printf("router_dot_parity: %s (avx2 %d, avx %d)\n", cpu::cpu_name().c_str(), (int) cpu::cpu_avx2_ok(),
+                 (int) cpu::cpu_avx1_ok());
++    if (!STRATA_CPU_X86) run("ARM", cpu::bf16_rows_dot_multi);
+     if (cpu::cpu_avx2_ok()) run("avx2", cpu::bf16_rows_dot_multi);
+     if (cpu::cpu_avx1_ok()) run("avx", cpu::bf16_rows_dot_multi_avx1);
+     std::printf("router_dot_parity: %d failures\n", failures);
+diff --git a/src/kernels/native_expert_parity.cpp b/src/kernels/native_expert_parity.cpp
+index bbb1551a..da587050 100644
+--- a/src/kernels/native_expert_parity.cpp
++++ b/src/kernels/native_expert_parity.cpp
+@@ -1,3 +1,4 @@
++#include "strata/platform/cpu_arch.hpp"
+ // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
+ //
+ //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
+@@ -100,6 +101,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+             a[k] = act[k].data();
+             ffp[k] = ff[k].data();
+         }
++#if STRATA_CPU_X86
+         if ((f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22) && cpu::cpu_avx2_ok() && !cpu::cpu_avx512_ok()) {
+             const auto dot = ggml_get_type_traits_cpu((ggml_type) f.gu_type)->vec_dot;
+             size_t differ = 0;
+@@ -119,9 +121,11 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+                         label.c_str(), differ, (long long) (NT * FF));
+             if (differ) ++failures;
+         }
++#endif
+         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+         // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
+         // iq512_supported alone - that would leave the format untested on every CPU.
++#if STRATA_CPU_X86
+         if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
+             // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
+             // (float-order differences only)
+@@ -175,6 +179,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+             if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
+             if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);   // no AVX2: ggml-cpu only
+         }
++#endif
+         for (int k = 0; k < NT; ++k) {
+             cpu::native_quant_h(f, ff[k].data(), hq[k].data());
+             hp[k] = hq[k].data();
+@@ -204,6 +209,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+         }
+         // UD-Q4_K_XL's formats: the multi-token AVX2 kernels (kq_avx2.cpp) against ggml-cpu's vec_dot per token,
+         // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
++#if STRATA_CPU_X86
+         for (int role = 0; role < 2; ++role) {
+             const int type = role == 0 ? f.gu_type : f.d_type;
+             if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
+@@ -249,6 +255,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+                         role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
+             if (differ) ++failures;
+         }
++#endif
+         if (cpu::q2_native_kernels(f.d_type)) {
+             // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
+             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
+@@ -266,6 +273,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
+                         cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
+         }
++#if STRATA_CPU_X86
+         if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
+             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
+             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
+@@ -301,6 +309,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
+                         NT, usn, (double) (f.bytes - f.down_off) / usn / 1e3, usg,
+                         (double) (f.bytes - f.down_off) / usg / 1e3);
+         }
++#endif
+     }
+     // (c) the GPU: one group holding the NT entries
+     {
+diff --git a/src/kernels/quantize_act_parity.cpp b/src/kernels/quantize_act_parity.cpp
+index b2cd7ee4..466914f9 100644
+--- a/src/kernels/quantize_act_parity.cpp
++++ b/src/kernels/quantize_act_parity.cpp
+@@ -160,7 +160,11 @@ void reference_q8_K(const float* x, long long n, std::vector<uint8_t>& blocks, s
+         const float iscale = scale_num / max;              // -127 by default; -128 is the rival reading
+         int8_t* qs = (int8_t*) (out + 4);
+         for (int j = 0; j < QK; ++j) {
+-            const int v = nearest_int_host(iscale * xb[j]);
++            // The contract rounds the FP32 multiply before nearest_int's
++            // magic-number addition. ARM can otherwise contract both into
++            // an FMA when this helper is inlined, changing exact tie cases.
++            volatile float product = iscale * xb[j];
++            const int v = nearest_int_host(product);
+             qs[j] = (int8_t) std::min(127, v);
+         }
+         int16_t* bsums = (int16_t*) (out + 4 + QK);
+diff --git a/src/platform/shared_memory_budget_test.cpp b/src/platform/shared_memory_budget_test.cpp
+new file mode 100644
+index 00000000..f9edc3cd
+--- /dev/null
++++ b/src/platform/shared_memory_budget_test.cpp
+@@ -0,0 +1,31 @@
++#include "strata/platform/shared_memory_budget.hpp"
++#include <cstdio>
++#include <limits>
++
++int main() {
++    using strata::platform::shared_allocation_budget;
++    constexpr uint64_t GiB = 1ull << 30;
++    struct Case { uint64_t available, total, headroom, expected; };
++    const Case cases[] = {
++        {32 * GiB, 32 * GiB, 6 * GiB, 26 * GiB},
++        {64 * GiB, 64 * GiB, 6 * GiB, 58 * GiB},
++        {12 * GiB, 64 * GiB, 6 * GiB, 6 * GiB},
++        {2 * GiB, 32 * GiB, 6 * GiB, 0},
++        {6 * GiB, 32 * GiB, 6 * GiB, 0},
++        {0, 32 * GiB, 0, 0},
++        {32 * GiB, 16 * GiB, 6 * GiB, 16 * GiB},
++        {8 * GiB, 32 * GiB, 6 * GiB, 2 * GiB}, // cgroup-bounded availability
++        {32 * GiB, 0, 6 * GiB, 0},
++        {32 * GiB, 32 * GiB, 0, 32 * GiB},
++        {std::numeric_limits<uint64_t>::max(), 32 * GiB, 6 * GiB, 32 * GiB},
++        {32 * GiB, 32 * GiB, std::numeric_limits<uint64_t>::max(), 0},
++    };
++    for (const auto& c : cases) {
++        if (shared_allocation_budget(c.available, c.total, c.headroom) != c.expected) {
++            std::fprintf(stderr, "shared memory budget mismatch\n");
++            return 1;
++        }
++    }
++    std::puts("shared memory budget: PASS (12 cases)");
++    return 0;
++}
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index c4586c87..f7218250 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -555,6 +555,13 @@ void test_host_memory() {
+         require(m.commit == ~0ull, "Linux memory probe retained a commit limit");
+         return ok;
+     };
++    // Zero available RAM is a known exhausted pool, distinct from a missing
++    // reading. Jetson cache planning must refuse allocation in either case.
++    put("meminfo", "MemTotal: 33554432 kB\nMemAvailable: 0 kB\n");
++    require(probe("") && m.available == 0, "zero MemAvailable treated as unknown");
++    put("meminfo", "MemTotal: 33554432 kB\n");
++    require(!probe(""), "missing MemAvailable accepted");
++    put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");
+     // no cgroup line at all: MemAvailable alone (before #633: "cannot determine")
+     require(probe("") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup: MemAvailable alone");
+     // v2, a 48 GiB limit with 16 GiB charged, 4 GiB of it clean cache
+diff --git a/tools/cuda_memory_selftest.cu b/tools/cuda_memory_selftest.cu
+new file mode 100644
+index 00000000..c77160e3
+--- /dev/null
++++ b/tools/cuda_memory_selftest.cu
+@@ -0,0 +1,128 @@
++// Small, model-free tests of the memory primitives used by the engine on Orin.
++#include <cuda_runtime.h>
++#include <cuda.h>
++#include "strata/platform/cpu_relax.hpp"
++#include "strata/platform/mapped_memory.hpp"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++static bool ck(cudaError_t e, const char* what) {
++    if (e == cudaSuccess) return true;
++    std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
++    return false;
++}
++__global__ void increment(int* p) { if (threadIdx.x == 0) ++*p; }
++
++struct Doorbell { uint32_t seq, flag, gpu_value, cpu_value, result; };
++__global__ void exchange(volatile Doorbell* p, unsigned long long timeout) {
++    const auto start = clock64();
++    for (uint32_t i = 1; i <= 512; ++i) {
++        p->gpu_value = i * 3;
++        __threadfence_system();
++        p->seq = i;
++        __threadfence_system();
++        while (p->flag < i) {
++            if (clock64() - start > timeout) { p->result = 1; return; }
++        }
++        __threadfence_system();
++        if (p->cpu_value != i * 7) { p->result = 2; return; }
++    }
++    __threadfence_system();
++}
++
++int main() {
++    cudaDeviceProp prop{};
++    if (!ck(cudaGetDeviceProperties(&prop, 0), "device properties")) return 1;
++    // Managed allocations are tested with synchronization at every ownership
++    // transition. concurrentManagedAccess=0 forbids the doorbell use case.
++    int* managed = nullptr;
++    if (!ck(cudaMallocManaged(&managed, 4096), "managed allocation")) return 1;
++    *managed = 41;
++    increment<<<1, 1>>>(managed);
++    bool ok = ck(cudaGetLastError(), "managed launch") && ck(cudaDeviceSynchronize(), "managed sync");
++    ok = ok && *managed == 42;
++    cudaFree(managed);
++    if (!ok) return 1;
++    std::puts("managed sequential CPU/GPU ownership: PASS");
++
++    // The large host expert arena uses registration, not managed memory.
++    int* registered = (int*) std::aligned_alloc(4096, 4096);
++    if (!registered) return 1;
++    *registered = 41;
++    if (!ck(cudaHostRegister(registered, 4096, cudaHostRegisterMapped), "host registration")) {
++        std::free(registered); return 1;
++    }
++    int* alias = nullptr;
++    ok = ck(cudaHostGetDevicePointer(&alias, registered, 0), "registered alias");
++    if (ok) {
++        increment<<<1, 1>>>(alias);
++        ok = ck(cudaGetLastError(), "registered launch") && ck(cudaDeviceSynchronize(), "registered sync");
++        ok = ok && *registered == 42;
++    }
++    cudaHostUnregister(registered);
++    std::free(registered);
++    if (!ok) return 1;
++    std::puts("host registration and mapped access: PASS");
++
++    Doorbell* host = nullptr;
++    Doorbell* device = nullptr;
++    if (!ck(cudaHostAlloc(&host, sizeof(Doorbell), cudaHostAllocMapped), "mapped allocation")) return 1;
++    *host = {};
++    if (!ck(cudaHostGetDevicePointer(&device, host, 0), "mapped alias")) { cudaFreeHost(host); return 1; }
++    strata::platform::mapped_memory_release();
++    exchange<<<1, 1>>>(device, (unsigned long long) prop.clockRate * 10000); // 10 seconds
++    ok = ck(cudaGetLastError(), "doorbell launch");
++    volatile Doorbell* poll = host;
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
++    for (uint32_t i = 1; ok && i <= 512; ++i) {
++        while (poll->seq < i && poll->result == 0 && std::chrono::steady_clock::now() < deadline)
++            strata::platform::cpu_relax();
++        strata::platform::mapped_memory_acquire();
++        if (poll->seq < i || poll->result != 0 || poll->gpu_value != i * 3) { ok = false; break; }
++        poll->cpu_value = i * 7;
++        strata::platform::mapped_memory_release();
++        poll->flag = i;
++    }
++    ok = ck(cudaDeviceSynchronize(), "doorbell sync") && ok && host->result == 0;
++    cudaFreeHost(host);
++    if (!ok) { std::fprintf(stderr, "mapped doorbell exchange failed\n"); return 1; }
++    std::puts("512 mapped CPU/GPU publication round trips: PASS");
++
++    CUdevice dev;
++    int supported = 0;
++    if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&dev, 0) != CUDA_SUCCESS ||
++        cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev) != CUDA_SUCCESS)
++        return 1;
++    if (!supported) { std::puts("VMM unsupported: fallback required"); return 0; }
++    CUmemAllocationProp alloc{};
++    alloc.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++    alloc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    alloc.location.id = dev;
++    size_t granularity = 0;
++    if (cuMemGetAllocationGranularity(&granularity, &alloc, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) return 1;
++    CUdeviceptr address = 0;
++    CUmemGenericAllocationHandle handle = 0;
++    bool reserved = false, created = false, mapped = false;
++    reserved = cuMemAddressReserve(&address, granularity, granularity, 0, 0) == CUDA_SUCCESS;
++    created = reserved && cuMemCreate(&handle, granularity, &alloc, 0) == CUDA_SUCCESS;
++    mapped = created && cuMemMap(address, granularity, 0, handle, 0) == CUDA_SUCCESS;
++    CUmemAccessDesc access{};
++    access.location = alloc.location;
++    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    ok = mapped && cuMemSetAccess(address, granularity, &access, 1) == CUDA_SUCCESS;
++    int value = 41;
++    if (ok) {
++        int* p = (int*) address;
++        ok = ck(cudaMemcpy(p, &value, sizeof value, cudaMemcpyHostToDevice), "VMM upload");
++        if (ok) increment<<<1, 1>>>(p);
++        ok = ck(cudaGetLastError(), "VMM launch") && ck(cudaDeviceSynchronize(), "VMM sync") && ok;
++        ok = ck(cudaMemcpy(&value, p, sizeof value, cudaMemcpyDeviceToHost), "VMM download") && ok && value == 42;
++    }
++    if (mapped) cuMemUnmap(address, granularity);
++    if (created) cuMemRelease(handle);
++    if (reserved) cuMemAddressFree(address, granularity);
++    if (!ok) { std::fprintf(stderr, "VMM allocation/map/access test failed\n"); return 1; }
++    std::printf("VMM reserve/create/map/access/unmap (%zu bytes): PASS\n", granularity);
++    return 0;
++}
+diff --git a/tools/cuda_platform_probe.cpp b/tools/cuda_platform_probe.cpp
+new file mode 100644
+index 00000000..cf73a609
+--- /dev/null
++++ b/tools/cuda_platform_probe.cpp
+@@ -0,0 +1,76 @@
++// No model or large allocations: collect facts before choosing a UMA policy.
++#include <cuda_runtime.h>
++#include <cuda.h>
++#include "strata/platform/memory.hpp"
++#include "strata/platform/cpu_relax.hpp"
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++static bool checked(cudaError_t e, const char* operation) {
++    if (e == cudaSuccess) return true;
++    std::fprintf(stderr, "%s: %s\n", operation, cudaGetErrorString(e));
++    return false;
++}
++
++static std::string json_string(const char* text) {
++    std::string result = "\"";
++    for (const unsigned char* p = (const unsigned char*) text; *p; ++p) {
++        if (*p == '"' || *p == '\\') result += '\\';
++        if (*p < 32) {
++            char escaped[7];
++            std::snprintf(escaped, sizeof escaped, "\\u%04x", *p);
++            result += escaped;
++        } else result += (char) *p;
++    }
++    return result + '"';
++}
++
++int main(int argc, char** argv) {
++    const bool json = argc == 2 && std::strcmp(argv[1], "--json") == 0;
++    if (argc > 1 && !json) { std::fprintf(stderr, "usage: strata-cuda-probe [--json]\n"); return 2; }
++    strata::platform::cpu_relax();
++    int count = 0, driver = 0, runtime = 0;
++    if (!checked(cudaGetDeviceCount(&count), "cudaGetDeviceCount") ||
++        !checked(cudaDriverGetVersion(&driver), "cudaDriverGetVersion") ||
++        !checked(cudaRuntimeGetVersion(&runtime), "cudaRuntimeGetVersion")) return 1;
++    if (count == 0) { std::fprintf(stderr, "No CUDA devices\n"); return 1; }
++    if (cuInit(0) != CUDA_SUCCESS) { std::fprintf(stderr, "cuInit failed\n"); return 1; }
++    std::printf(json ? "{\"driver_version\":%d,\"runtime_version\":%d,\"host_physical_bytes\":%llu,\"devices\":["
++                     : "driver_version=%d runtime_version=%d host_physical_bytes=%llu\n", driver, runtime,
++                (unsigned long long) strata::platform::total_physical_memory());
++    for (int i = 0; i < count; ++i) {
++        cudaDeviceProp p{};
++        size_t free = 0, total = 0;
++        if (!checked(cudaSetDevice(i), "cudaSetDevice") ||
++            !checked(cudaGetDeviceProperties(&p, i), "cudaGetDeviceProperties") ||
++            !checked(cudaMemGetInfo(&free, &total), "cudaMemGetInfo")) return 1;
++        int vmm = 0, registration = 0;
++        CUdevice device;
++        if (cuDeviceGet(&device, i) != CUDA_SUCCESS ||
++            cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device) != CUDA_SUCCESS) {
++            std::fprintf(stderr, "VMM attribute query failed for device %d\n", i);
++            return 1;
++        }
++        if (!checked(cudaDeviceGetAttribute(&registration, cudaDevAttrHostRegisterSupported, i), "host registration attribute")) return 1;
++        if (json) {
++            std::printf("%s{\"device\":%d,\"name\":%s,\"sm\":%d,\"integrated\":%d,\"unified_addressing\":%d,"
++                        "\"cuda_total_bytes\":%llu,\"cuda_free_bytes\":%llu,\"managed_memory\":%d,"
++                        "\"concurrent_managed_access\":%d,\"pageable_memory_access\":%d,"
++                        "\"can_map_host_memory\":%d,\"host_register_supported\":%d,\"vmm_supported\":%d}",
++                        i ? "," : "", i, json_string(p.name).c_str(), p.major * 10 + p.minor, p.integrated,
++                        p.unifiedAddressing, (unsigned long long) total, (unsigned long long) free,
++                        p.managedMemory, p.concurrentManagedAccess, p.pageableMemoryAccess,
++                        p.canMapHostMemory, registration, vmm);
++        } else std::printf("device=%d name=%s sm=%d%d integrated=%d unified_addressing=%d\n"
++                    "  cuda_total_bytes=%llu cuda_free_bytes=%llu\n"
++                    "  managed_memory=%d concurrent_managed_access=%d pageable_memory_access=%d\n"
++                    "  can_map_host_memory=%d host_register_supported=%d vmm_supported=%d\n",
++                    i, p.name, p.major, p.minor, p.integrated, p.unifiedAddressing,
++                    (unsigned long long) total, (unsigned long long) free,
++                    p.managedMemory, p.concurrentManagedAccess, p.pageableMemoryAccess,
++                    p.canMapHostMemory, registration, vmm);
++    }
++    if (json) std::printf("]}\n");
++    return 0;
++}

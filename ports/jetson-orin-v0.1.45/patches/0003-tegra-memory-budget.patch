@@ -1,0 +1,284 @@
+From 5e62fd22daf2bf1fd8df4e3b8143141331b778b7 Mon Sep 17 00:00:00 2001
+From: Strata Orin Port <orin-port@example.invalid>
+Date: Thu, 22 Oct 2026 07:19:14 +0000
+Subject: [PATCH 3/4] memory: budget ARM integrated CUDA allocations from
+ shared physical RAM
+
+Use cgroup-bounded MemAvailable minus headroom, limited by CUDA total, for aarch64 integrated GPUs. Keep other devices on their v0.1.45 accounting. Apply the same budget to Qwen3.6 placement/chunk queries: that path did not exist in the fork. Keep cudaMalloc, pinned mapping and v0.1.45 model loading and kernel dispatch.
+---
+ include/strata/core/device.hpp                |  3 ++
+ .../strata/platform/shared_memory_budget.hpp  | 26 ++++++++++++
+ src/core/device.cu                            |  6 +++
+ src/core/device_main.cpp                      |  4 ++
+ src/core/expert_cache.cpp                     | 40 +++++++++++++++----
+ src/core/expert_source.cpp                    |  5 ++-
+ src/qwen35/q36_engine.cu                      | 29 +++++++++++---
+ 7 files changed, 98 insertions(+), 15 deletions(-)
+ create mode 100644 include/strata/platform/shared_memory_budget.hpp
+
+diff --git a/include/strata/core/device.hpp b/include/strata/core/device.hpp
+index 1745f8f2..e6ef6f3f 100644
+--- a/include/strata/core/device.hpp
++++ b/include/strata/core/device.hpp
+@@ -26,6 +26,9 @@ struct DeviceInfo {
+     uint64_t free_bytes = 0;
+     int driver_version = 0, runtime_version = 0;
+     int multi_processor_count = 0;
++    bool integrated = false;     // GPU allocations and host allocations share physical RAM
++    bool managed_memory = false, concurrent_managed_access = false;
++    bool can_map_host_memory = false;
+     std::string arch;              // HIP: gcnArchName without its feature suffix ("gfx1201"); empty on CUDA
+ };
+ 
+diff --git a/include/strata/platform/shared_memory_budget.hpp b/include/strata/platform/shared_memory_budget.hpp
+new file mode 100644
+index 00000000..72883cf9
+--- /dev/null
++++ b/include/strata/platform/shared_memory_budget.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++namespace strata::platform {
++inline uint64_t uma_headroom_bytes() {
++    static const uint64_t head = []() -> uint64_t {
++        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
++        if (h == nullptr) return 6ull << 30;
++        char* end = nullptr;
++        const long v = std::strtol(h, &end, 10);
++        if (end != h && *end == '\0' && v >= 0 && v <= 1024) return uint64_t(v) << 30;
++        std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
++        return 6ull << 30;
++    }();
++    return head;
++}
++// available is a fresh OS snapshot, already bounded by cgroup limits. CUDA's
++// total is an allocation ceiling, not a second memory pool to add to it.
++inline uint64_t shared_allocation_budget(uint64_t available, uint64_t cuda_total, uint64_t headroom) {
++    const uint64_t usable = available > headroom ? available - headroom : 0;
++    return std::min(usable, cuda_total);
++}
++}  // namespace strata::platform
+diff --git a/src/core/device.cu b/src/core/device.cu
+index 5c59554b..39827285 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -278,6 +278,12 @@ DeviceInfo device_info(int ordinal) {
+     d.cc_major = p.major;
+     d.cc_minor = p.minor;
+     d.multi_processor_count = p.multiProcessorCount;
++#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++    d.integrated = p.integrated != 0;
++    d.managed_memory = p.managedMemory != 0;
++    d.concurrent_managed_access = p.concurrentManagedAccess != 0;
++    d.can_map_host_memory = p.canMapHostMemory != 0;
++#endif
+ 
+     size_t free_b = 0, total_b = 0;
+     check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+diff --git a/src/core/device_main.cpp b/src/core/device_main.cpp
+index c6872afc..43623195 100644
+--- a/src/core/device_main.cpp
++++ b/src/core/device_main.cpp
+@@ -65,6 +65,10 @@ int main(int argc, char** argv) {
+     try {
+         const strata::core::DeviceInfo d = strata::core::device_info(0);
+         std::printf("device %d: %s\n", d.ordinal, d.name.c_str());
++        if (d.integrated)
++            std::printf("  shared physical RAM (CUDA memory is not extra capacity beside host RAM)\n"
++                        "  managed memory %d, concurrent managed access %d, mapped host memory %d\n",
++                        d.managed_memory, d.concurrent_managed_access, d.can_map_host_memory);
+ #if defined(STRATA_USE_HIP)
+         std::printf("  HIP arch            %s wave32 (compiled for %s)\n", d.arch.c_str(),
+                     strata::core::compiled_gpu_archs());
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index bd98ad71..cf2aad4c 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -1,5 +1,7 @@
+ // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
+ #include "strata/core/expert_cache.hpp"
++#include "strata/core/expert_source.hpp"
++#include "strata/platform/shared_memory_budget.hpp"
+ 
+ // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
+ // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
+@@ -46,13 +48,23 @@ size_t device_free_bytes() {
+         }
+     }
+     if (unified_memory) {
++#if defined(__aarch64__)
++        // Host availability already includes reclaimable file cache and applies
++        // cgroup limits. Subtract headroom even when cudaMemGetInfo reports more:
++        // both CPU and GPU allocations spend this same physical memory.
++        const uint64_t head = strata::platform::uma_headroom_bytes();
++        detail::HostMemory memory;
++        const bool known = detail::host_available_memory(memory);
++        free_b = (size_t) strata::platform::shared_allocation_budget(
++            known ? memory.available : 0, total_b, head);
++#else
++        // Preserve v0.1.45 accounting outside the native ARM port.
+         if (FILE* m = std::fopen("/proc/meminfo", "r")) {
+             char line[256];
+             unsigned long long kb = 0;
+             while (std::fgets(line, sizeof line, m))
+                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+             std::fclose(m);
+-            // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
+             static const long gib = [] {
+                 const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
+                 if (h == nullptr) return 6L;
+@@ -66,6 +78,7 @@ size_t device_free_bytes() {
+             const unsigned long long avail = kb << 10;
+             if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
+         }
++#endif
+     }
+ #endif
+     return free_b;
+@@ -493,12 +506,25 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
+         free_b = device_free_bytes();   // unified memory: what the OS can give back counts (see the header)
+         if ((uint64_t) free_b < want) {
+             char buf[320];
+-            std::snprintf(buf, sizeof buf,
+-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+-                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
+-                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
+-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
+-                          (double) total_b / 1073741824.0);
++            bool shared = false;
++#if defined(__linux__) && defined(__aarch64__) && !defined(STRATA_EC_NO_VMM)
++            int device = 0, integrated = 0;
++            shared = cudaGetDevice(&device) == cudaSuccess &&
++                     cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess && integrated;
++#endif
++            if (shared) {
++                std::snprintf(buf, sizeof buf,
++                              "ExpertCache: %.2f GiB requested, but the shared RAM allocation budget is %.2f GiB "
++                              "after physical RAM headroom. Lower --expert-cache.",
++                              (double) want / 1073741824.0, (double) free_b / 1073741824.0);
++            } else {
++                std::snprintf(buf, sizeof buf,
++                              "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
++                              "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
++                              (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
++                              (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
++                              (double) total_b / 1073741824.0);
++            }
+             err = buf;
+             return false;
+         }
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d3fefeef..ffabf43b 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -342,14 +342,15 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
+     std::ifstream info(meminfo);
+     std::string line;
+     uint64_t bytes = 0;
++    bool found = false;
+     while (std::getline(info, line)) {
+         std::istringstream fields(line);
+         std::string key, unit;
+         uint64_t value = 0;
+         if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
+-            value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
++            value <= std::numeric_limits<uint64_t>::max() / 1024) { bytes = value * 1024; found = true; }
+     }
+-    if (bytes == 0) return false;
++    if (!found) return false;
+     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
+     // This is a point-in-time guard, not a reservation against concurrent allocations.
+     std::ifstream groups(self_cgroup);
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index b0d7e75c..a7703f12 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -18,6 +18,7 @@
+ // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+ #include "strata/artifact/gguf_reader.hpp"
+ #include "strata/core/family_layout.hpp"
++#include "strata/core/expert_cache.hpp"
+ #include "strata/kernels/fused_gdn.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
+ #include "strata/kernels/native_mmvq.hpp"
+@@ -73,6 +74,22 @@ namespace MMQ = strata::prefill::mmq;
+         }                                                                                                              \
+     } while (0)
+ 
++// Qwen3.6 has its own placement/chunk planner: it must use the same physical
++// RAM headroom as the other engine on Tegra, not cudaMemGetInfo's UMA estimate.
++// Leave discrete CUDA and HIP accounting unchanged.
++cudaError_t memory_info(size_t* free_bytes, size_t* total_bytes) {
++    const cudaError_t e = cudaMemGetInfo(free_bytes, total_bytes);
++#if defined(__linux__) && defined(__aarch64__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
++    if (e != cudaSuccess) return e;
++    int device = 0, integrated = 0;
++    cudaError_t q = cudaGetDevice(&device);
++    if (q == cudaSuccess) q = cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device);
++    if (q != cudaSuccess) return q;
++    if (integrated) *free_bytes = strata::core::device_free_bytes();
++#endif
++    return e;
++}
++
+ using Clock = std::chrono::steady_clock;
+ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+ 
+@@ -1456,7 +1473,7 @@ struct Engine {
+             const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
+                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+             size_t fr0 = 0, tot0 = 0;
+-            CK(cudaMemGetInfo(&fr0, &tot0));
++            CK(memory_info(&fr0, &tot0));
+             if (n_sess > 1)
+                 std::fprintf(stderr, "strata-q36: %d sessions (--batch): %.2f GiB of VRAM each at a context of %d (%.2f GiB in "
+                              "all), %.2f GiB free before them\n", n_sess, (double) per / (1 << 30), ctx,
+@@ -1504,7 +1521,7 @@ struct Engine {
+         load_cur();
+         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
+         size_t fr = 0, tot = 0;
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(memory_info(&fr, &tot));
+         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
+                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+     }
+@@ -2804,7 +2821,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         max_layer = std::max(max_layer, L->stride * (size_t) ne);
+     }
+     size_t fr = 0, tot = 0;
+-    CK(cudaMemGetInfo(&fr, &tot));
++    CK(memory_info(&fr, &tot));
+     const size_t reserve = (size_t) 768 << 20;
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                         : (fr > reserve ? fr - reserve : 0);
+@@ -2828,7 +2845,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         }
+         m.packed.clear();
+         E.reset_graphs();
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(memory_info(&fr, &tot));
+         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
+                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
+                      (double) packed_bytes / (1 << 30));
+@@ -2850,7 +2867,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+             mtp_only = true;
+         } else if (total_main + ((size_t) 64 << 20) <= room) {
+             E.shrink_att((size_t) 16 << 20);
+-            CK(cudaMemGetInfo(&fr, &tot));
++            CK(memory_info(&fr, &tot));
+             budget2 = fr > small_reserve ? fr - small_reserve : 0;
+             mtp_only = total_main + ((size_t) 64 << 20) <= budget2;
+             std::fprintf(stderr, "strata-q36: the experts nearly fit: the attention scores buffer at 64 MB and the VRAM "
+@@ -3817,7 +3834,7 @@ int strata::qwen35::run(int argc, char** argv) {
+         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
+         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
+         size_t fr = 0, tot = 0, experts = 0;
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(memory_info(&fr, &tot));
+         for (const Layer& L : m.layers) experts += L.stride * (size_t) m.g.n_expert;
+         const size_t fr_raw = fr;   // before the packed Q8_0 copies count as given back
+         // (the MTP block's experts can go to the CPU, the packed Q8_0 copies can be given back: see place_experts)

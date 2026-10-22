@@ -1,5 +1,14 @@
 <h1 align="center">Strata</h1>
 
+<!-- Strata-Orin v0.1.45:begin -->
+> **Strata-Orin: Jetson AGX Orin 64 GB development port of Strata v0.1.45.**
+> ARM64 · CUDA SM87 · JetPack 6.2 / CUDA 12.6.
+> **[Jetson port guide](ports/jetson-orin-v0.1.45/README.md)** ·
+> [Native build at `/mnt/ssd/Strata-Orin`](ports/jetson-orin-v0.1.45/BUILD.md) ·
+> [Local validation and limits](ports/jetson-orin-v0.1.45/VALIDATION.md).
+> **Not yet tested on Orin.** Follow the native build guide, not the upstream installer or updater below.
+<!-- Strata-Orin v0.1.45:end -->
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>

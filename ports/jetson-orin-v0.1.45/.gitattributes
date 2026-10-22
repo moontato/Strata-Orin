@@ -1,0 +1,3 @@
+# Empty unified-diff context lines contain one space. Keep the mail patches intact.
+# This does not relax whitespace checks for the applied source files.
+patches/*.patch whitespace=-blank-at-eol

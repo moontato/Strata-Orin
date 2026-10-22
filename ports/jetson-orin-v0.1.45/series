@@ -1,0 +1,4 @@
+patches/0001-arm64-build.patch
+patches/0002-mapped-memory-ordering.patch
+patches/0003-tegra-memory-budget.patch
+patches/0004-portability-tests.patch
