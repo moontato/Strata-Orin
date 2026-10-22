@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/platform/cpu_arch.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -3194,7 +3195,7 @@ int main(int argc, char** argv) {
     o.mmap_experts = true;   // ... experts included: no resident copy of them (the GGUF shards in place)
     if (false) {
 #else
-    if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
+    if (STRATA_CPU_X86 && !strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
 #endif
         std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
                              "CPU expert kernels need; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer. "
@@ -3360,7 +3361,7 @@ int main(int argc, char** argv) {
         // kernels).  This refusal is the canonical Q2_0 pack's, reached when the --pack folder has no
         // native_experts.txt - a hand-written config pointing --pack at the wrong folder reads as "this CPU is too
         // old".  Say so before the refusal, and where the file is when it sits one level down (a pack/ subfolder).
-        if (!strata::kernels::cpu::cpu_features().usable()) {
+        if (STRATA_CPU_X86 && !strata::kernels::cpu::cpu_features().usable()) {
             std::error_code ec;
             const std::filesystem::path pk(o.pack);
             std::fprintf(stderr, "strata generate: %s has no native_experts.txt, so it is read as the canonical Q2_0 "
@@ -3375,7 +3376,9 @@ int main(int argc, char** argv) {
                                      "(setup writes it; run setup again).\n");
         }
         strata::kernels::cpu::cpu_require_expert_support();
-    } else if (!strata::kernels::cpu::cpu_avx512_ok())
+    } else if (!STRATA_CPU_X86)
+        std::fprintf(stderr, "strata generate: ARM CPU experts use ggml-cpu's native kernels (GPU paths unchanged)\n");
+    else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      !strata::kernels::cpu::cpu_avx2_ok()
