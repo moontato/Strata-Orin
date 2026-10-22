@@ -68,7 +68,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <immintrin.h>
+#include "strata/platform/cpu_relax.hpp"
+#include "strata/platform/mapped_memory.hpp"
 
 #if defined(STRATA_GPU_METAL)
 // The Metal backend's decode window (metal/src/engine/window.cpp): this file's init/run/commit hand over to it.
@@ -471,7 +472,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    _mm_sfence();
+    strata::platform::mapped_memory_release();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
@@ -2529,7 +2530,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
     if (hdrop_h_ != nullptr) *(volatile uint32_t*) hdrop_h_ = (g_test_drop > 0 && windows + 1 == g_test_drop) ? 1u : 0u;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    _mm_sfence();
+    strata::platform::mapped_memory_release();
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
@@ -2590,7 +2591,7 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     uint32_t spins = 0;
     while (adapt_gate_->reached() < layer) {
-        _mm_pause();
+        strata::platform::cpu_relax();
         if ((++spins & 1023u) != 0) continue;
         if (Clock::now() - t0 > std::chrono::seconds(20)) {
             err = "verify: the adaptive tier's copies for layer " + std::to_string(layer) + " never landed" +
@@ -2755,7 +2756,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
+            strata::platform::mapped_memory_release();
             *flag = 1;
             ms_host += ms_since(tp);
         } else {
@@ -2771,7 +2772,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            _mm_pause();
+            strata::platform::cpu_relax();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -2807,6 +2808,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 return false;
             }
         }
+        strata::platform::mapped_memory_acquire();
         const Clock::time_point b = Clock::now();
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
@@ -2827,7 +2829,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                               (int64_t) ms_since(b));   // aux: ms the CPU experts took
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         if (h_bal_ != nullptr) {   // set_pcie_balance: the step's plan, its CPU and its PCIe experts
             const size_t bi = (size_t) ((k / G) * 2 + grp);
             bal_ok_[bi] = *(volatile uint32_t*) h_flagA_ == want;
@@ -2842,6 +2844,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata::platform::mapped_memory_arm_release();
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
@@ -2853,7 +2856,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
+            strata::platform::mapped_memory_release();
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
@@ -3018,8 +3021,9 @@ void Verifier::set_plan_slot(int grp) {
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
-    volatile long* f = (volatile long*) flag;
+    strata::platform::mapped_memory_arm_release();
 #if defined(_WIN32)
+    volatile long* f = (volatile long*) flag;
     long cur = *f;
     while ((uint32_t) cur < value) {
         const long prev = _InterlockedCompareExchange(f, (long) value, cur);
@@ -3065,7 +3069,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    _mm_sfence();
+    strata::platform::mapped_memory_release();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
@@ -3156,6 +3160,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata::platform::mapped_memory_arm_release();
         // STRATA_COMMIT_TIMING=1 (measurement only): the commit graph's GPU time, from an event pair around it (read at the
         // next commit, when the pair has long completed); printed every 300 commits
         static struct CommitTiming {
@@ -3523,6 +3528,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata::platform::mapped_memory_arm_release();
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
@@ -3563,7 +3569,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (ar_on()) {
         if (ss_->ple.ready() && ple_stage()) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
+            strata::platform::mapped_memory_release();
             *flag = 1;
         }
         const cudaError_t se = cudaStreamSynchronize(cs_);
@@ -3587,7 +3593,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         uint32_t spins = 0;
         progress_at("verify batch: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            _mm_pause();
+            strata::platform::cpu_relax();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -3604,6 +3610,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                 return false;
             }
         }
+        strata::platform::mapped_memory_acquire();
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
@@ -3615,7 +3622,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -3623,6 +3630,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata::platform::mapped_memory_arm_release();
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
@@ -3672,6 +3680,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata::platform::mapped_memory_arm_release();
     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
@@ -3740,7 +3749,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
     // run_slot_rows makes).  Per-window (ar_on): with a loan in flight the doorbell graph needs the per-layer service.
     if (ar_on() && ss_->ple.ready() && ple_stage()) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         *h_flag_ = 1;
     }
     for (;;) {
@@ -3751,6 +3760,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         if (ar_on() || k >= b_steps_) break;
         const uint32_t want = (uint32_t) (k + 1);
         if (*seq < want) return 0;
+        strata::platform::mapped_memory_acquire();
         const int S = last_t_;
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
@@ -3760,7 +3770,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -3768,6 +3778,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata::platform::mapped_memory_arm_release();
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
@@ -4015,6 +4026,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     fl_prof_ = prof_on_ && G == 1 && prof_pin_ != nullptr;
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata::platform::mapped_memory_arm_release();
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
@@ -4050,7 +4062,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point tp = Clock::now();
         if (!ss.ple.table->gather_batch(pl_ple_rows_.data(), (size_t) T, h_ple_, err)) return false;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         ms_host += ms_since(tp);
         return true;
     };
@@ -4087,6 +4099,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             }
             return 0;
         }
+        strata::platform::mapped_memory_acquire();
         const Clock::time_point b = Clock::now();
         ms_wait += now_ms() - fl_since_ms_;
         const int grp = (int) (fl_k_ % G);
@@ -4101,7 +4114,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
                               (int64_t) ms_since(b));
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata::platform::mapped_memory_release();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -4109,6 +4122,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata::platform::mapped_memory_arm_release();
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
@@ -4175,13 +4189,14 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;
-        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) _mm_pause();
+        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) strata::platform::cpu_relax();
         if (q != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(q); return false; }
     }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata::platform::mapped_memory_arm_release();
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
