@@ -18,6 +18,7 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -72,6 +73,22 @@ namespace MMQ = strata::prefill::mmq;
             std::exit(1);                                                                                              \
         }                                                                                                              \
     } while (0)
+
+// Qwen3.6 has its own placement/chunk planner: it must use the same physical
+// RAM headroom as the other engine on Tegra, not cudaMemGetInfo's UMA estimate.
+// Leave discrete CUDA and HIP accounting unchanged.
+cudaError_t memory_info(size_t* free_bytes, size_t* total_bytes) {
+    const cudaError_t e = cudaMemGetInfo(free_bytes, total_bytes);
+#if defined(__linux__) && defined(__aarch64__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    if (e != cudaSuccess) return e;
+    int device = 0, integrated = 0;
+    cudaError_t q = cudaGetDevice(&device);
+    if (q == cudaSuccess) q = cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device);
+    if (q != cudaSuccess) return q;
+    if (integrated) *free_bytes = strata::core::device_free_bytes();
+#endif
+    return e;
+}
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -1456,7 +1473,7 @@ struct Engine {
             const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             size_t fr0 = 0, tot0 = 0;
-            CK(cudaMemGetInfo(&fr0, &tot0));
+            CK(memory_info(&fr0, &tot0));
             if (n_sess > 1)
                 std::fprintf(stderr, "strata-q36: %d sessions (--batch): %.2f GiB of VRAM each at a context of %d (%.2f GiB in "
                              "all), %.2f GiB free before them\n", n_sess, (double) per / (1 << 30), ctx,
@@ -1504,7 +1521,7 @@ struct Engine {
         load_cur();
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
+        CK(memory_info(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
     }
@@ -2804,7 +2821,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
     size_t fr = 0, tot = 0;
-    CK(cudaMemGetInfo(&fr, &tot));
+    CK(memory_info(&fr, &tot));
     const size_t reserve = (size_t) 768 << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
@@ -2828,7 +2845,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
         m.packed.clear();
         E.reset_graphs();
-        CK(cudaMemGetInfo(&fr, &tot));
+        CK(memory_info(&fr, &tot));
         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
                      (double) packed_bytes / (1 << 30));
@@ -2850,7 +2867,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             mtp_only = true;
         } else if (total_main + ((size_t) 64 << 20) <= room) {
             E.shrink_att((size_t) 16 << 20);
-            CK(cudaMemGetInfo(&fr, &tot));
+            CK(memory_info(&fr, &tot));
             budget2 = fr > small_reserve ? fr - small_reserve : 0;
             mtp_only = total_main + ((size_t) 64 << 20) <= budget2;
             std::fprintf(stderr, "strata-q36: the experts nearly fit: the attention scores buffer at 64 MB and the VRAM "
@@ -3817,7 +3834,7 @@ int strata::qwen35::run(int argc, char** argv) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
         size_t fr = 0, tot = 0, experts = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
+        CK(memory_info(&fr, &tot));
         for (const Layer& L : m.layers) experts += L.stride * (size_t) m.g.n_expert;
         const size_t fr_raw = fr;   // before the packed Q8_0 copies count as given back
         // (the MTP block's experts can go to the CPU, the packed Q8_0 copies can be given back: see place_experts)

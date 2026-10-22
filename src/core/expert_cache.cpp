@@ -1,5 +1,7 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/platform/shared_memory_budget.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -46,13 +48,23 @@ size_t device_free_bytes() {
         }
     }
     if (unified_memory) {
+#if defined(__aarch64__)
+        // Host availability already includes reclaimable file cache and applies
+        // cgroup limits. Subtract headroom even when cudaMemGetInfo reports more:
+        // both CPU and GPU allocations spend this same physical memory.
+        const uint64_t head = strata::platform::uma_headroom_bytes();
+        detail::HostMemory memory;
+        const bool known = detail::host_available_memory(memory);
+        free_b = (size_t) strata::platform::shared_allocation_budget(
+            known ? memory.available : 0, total_b, head);
+#else
+        // Preserve v0.1.45 accounting outside the native ARM port.
         if (FILE* m = std::fopen("/proc/meminfo", "r")) {
             char line[256];
             unsigned long long kb = 0;
             while (std::fgets(line, sizeof line, m))
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
             std::fclose(m);
-            // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
             static const long gib = [] {
                 const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
                 if (h == nullptr) return 6L;
@@ -66,6 +78,7 @@ size_t device_free_bytes() {
             const unsigned long long avail = kb << 10;
             if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
         }
+#endif
     }
 #endif
     return free_b;
@@ -493,12 +506,25 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         free_b = device_free_bytes();   // unified memory: what the OS can give back counts (see the header)
         if ((uint64_t) free_b < want) {
             char buf[320];
-            std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
-                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
-                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
-                          (double) total_b / 1073741824.0);
+            bool shared = false;
+#if defined(__linux__) && defined(__aarch64__) && !defined(STRATA_EC_NO_VMM)
+            int device = 0, integrated = 0;
+            shared = cudaGetDevice(&device) == cudaSuccess &&
+                     cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess && integrated;
+#endif
+            if (shared) {
+                std::snprintf(buf, sizeof buf,
+                              "ExpertCache: %.2f GiB requested, but the shared RAM allocation budget is %.2f GiB "
+                              "after physical RAM headroom. Lower --expert-cache.",
+                              (double) want / 1073741824.0, (double) free_b / 1073741824.0);
+            } else {
+                std::snprintf(buf, sizeof buf,
+                              "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+                              "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
+                              (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
+                              (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
+                              (double) total_b / 1073741824.0);
+            }
             err = buf;
             return false;
         }
