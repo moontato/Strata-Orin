@@ -32,6 +32,7 @@
 #include "q36_kernels.cuh"
 #include "q36_kv_int8.cuh"
 #include "strata/core/q36_prefix_checkpoint.hpp"
+#include "strata/core/q36_sampled_mtp.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1215,6 +1216,7 @@ struct Engine {
     __half* x16 = nullptr;
     bool use_graph = true;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
+    bool mtp_sampled = false;  // opt-in experimental sampled verification (sequential text GEN only)
 
     // ---- sessions: the conversation states.  One for a single-request engine; --batch N keeps N, each with its own
     // recurrent state and KV cache, so N requests run at once: their rows share one decode window (forward_rows).  The
@@ -2975,15 +2977,11 @@ struct Engine {
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
-    /// One speculative step with D MTP drafts (greedy): `x` is the next token (decided, not processed); `fix` the
-    /// tokens of the rows the block must redo first (the drafts the last window accepted, seeded by hmain rows
-    /// 0 .. fix.size() - 1 of that window).  Drafts d1 .. dD, then the window [x, d1 .. dD] through the main model;
-    /// returns the accepted count a and writes the picks of rows 0 .. a (row a's pick is the token after them).
-    /// `cancel`: a stop asked for before the state moves keeps only x (the caller then emits no draft), so that a request
-    /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
-    /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
-    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+    /// Run the MTP proposal chain and the main model's verify window. Returns the
+    /// possibly hybrid-reduced D. The T = D + 1 row picks are already in
+    /// hpin[2 .. 2 + T); commit is left to the caller so greedy and sampled
+    /// verification share the same GPU sequence.
+    int spec_window(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         kv_ensure(cur, (uint64_t) pos + D + 1);
@@ -3033,16 +3031,46 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        return D;
+    }
+
+    /// Commit the first `rows` verify-window rows, exactly as the old speculative step did.
+    void spec_commit(int rows) {
+        const int N = (int) m->g.n_embd;
+        commit(rows);
+        CK(cudaMemcpyAsync(hlast, hmain + (size_t) (rows - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        pos += rows;
+        after_rows(rows);
+        kv_progress(cur, (uint64_t) pos);
+    }
+
+    /// The original greedy verify path, split without changing its GPU sequence.
+    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
+                  const std::atomic<bool>* cancel = nullptr) {
+        D = spec_window(x_tok, fix, D, drafts);
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
-        commit(a + 1);
-        CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        pos += a + 1;
-        after_rows(a + 1);
-        kv_progress(cur, (uint64_t) pos);
+        spec_commit(a + 1);
         return a;
+    }
+
+    /// Experimental sampled verify path: keep the same greedy proposals, but ask
+    /// the main model's target sampler for every row. A proposal advances only on
+    /// an equality hit; the first sampled mismatch is returned instead. `hist`
+    /// contains x; accepted proposals are appended by the host verifier.
+    strata::core::SampledSpecResult spec_step_sampled(int x_tok, const std::vector<int32_t>& fix, int D,
+                                                      std::vector<int32_t>& drafts, const Sampling& smp,
+                                                      std::vector<int32_t>& hist, std::mt19937_64& rng,
+                                                      long long produced, long long max_new,
+                                                      const std::atomic<bool>* cancel = nullptr) {
+        D = spec_window(x_tok, fix, D, drafts);
+        const auto result = strata::core::q36_sample_verify_window(
+            drafts, smp, hist, rng, produced, max_new,
+            [&](int row, std::vector<float>& lg) { host_logits_row(row, lg); }, cancel);
+        spec_commit(result.accepted + 1);
+        return result;
     }
 
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
@@ -3317,51 +3345,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
-
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
-}
+using strata::core::Sampling;
+using strata::core::q36_sample;
+inline bool is_eos(int t) { return strata::core::q36_is_eos(t); }
 
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
@@ -3376,8 +3362,6 @@ std::vector<int32_t> parse_ids(const char* s) {
     }
     return v;
 }
-
-bool is_eos(int t) { return t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ pictures
 constexpr int32_t kImagePad = 248056;   // <|image_pad|>
@@ -3495,6 +3479,8 @@ struct Serve {
     int n_active = 0;
     std::vector<bool> kv_batch_lease;
     std::vector<float> lg;
+    // Native focused regression only: record the sequential request's emitted IDs.
+    std::vector<int32_t>* request_log = nullptr;
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
@@ -3584,7 +3570,7 @@ struct Serve {
             int y0 = E.rows_pick[r0];
             if (sl.smp.needs_logits()) {
                 E.host_logits_row(r0, lg);
-                y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                y0 = q36_sample(lg, sl.smp, sl.hist, sl.rng);
             }
             bool two = n == 2 && y0 == sl.draft && !is_eos(y0) && !sl.stop && sl.produced + 2 <= sl.max_new &&
                        ss.pos + 3 <= E.ctx;   // (ss.pos: the position of the slot's next token: the window did not move it)
@@ -3710,7 +3696,7 @@ struct Serve {
             int y;
             if (sl.smp.needs_logits()) {
                 E.host_logits_row((int) r, lg);
-                y = sample(lg, sl.smp, sl.hist, sl.rng);
+                y = q36_sample(lg, sl.smp, sl.hist, sl.rng);
             } else {
                 y = E.rows_pick[r];
             }
@@ -3816,6 +3802,7 @@ struct Serve {
             }
         }
         const long long max_new = std::strtoll(p, &p, 10);
+        if (request_log) request_log->clear();
         Sampling smp;
         uint64_t kv_generation = 0, kv_epoch = UINT64_MAX;
         bool kv_resume = false;
@@ -3838,6 +3825,7 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "sampled_mtp") smp.sampled_mtp = std::atoi(v) != 0;
             else if (key == "kv_generation") kv_generation = std::strtoull(v, nullptr, 10);
             else if (key == "kv_epoch") kv_epoch = std::strtoull(v, nullptr, 10);
             else if (key == "kv_resume") kv_resume = std::string(v) == "1";
@@ -4003,15 +3991,18 @@ struct Serve {
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones, and requests beside others, one token at a time
+        // text); sampled ones, and requests beside others, one token at a time.  --mtp-sampled opts in to sampled verify;
+        // sampled_mtp=0 turns it off per request so one engine can measure both arms.
         const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        const bool sampled_spec = E.mtp_d > 0 && E.mtp_sampled && smp.needs_logits() && smp.sampled_mtp &&
+                                  !adm && !geni && ir.imgs.empty() && ss.imgs.empty();
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                nx = q36_sample(lg, smp, hist, rng);
             }
             std::printf("T %d\n", nx);
             ++produced;
@@ -4048,13 +4039,14 @@ struct Serve {
         for (;;) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                nx = q36_sample(lg, smp, hist, rng);
             }
-            auto emit = [&](int t) {   // false: the answer ends here
+            auto emit = [&](int t, bool hist_already_contains_token = false) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
+                if (request_log) request_log->push_back(t);
                 ++produced;
-                hist.push_back(t);
+                if (!hist_already_contains_token) hist.push_back(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -4062,6 +4054,26 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
+            if (sampled_spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
+                const int D = E.kv_pool ? (int) std::min<int64_t>(E.mtp_d, max_new - produced) : E.mtp_d;
+                if (D > 0) {
+                    const auto res = E.spec_step_sampled(nx, fix, D, drafts, smp, hist, rng, produced, max_new, &stop);
+                    offered += D;
+                    accepted += res.accepted;
+                    // Accepted proposals are already in `hist` and are processed in the window. The returned mismatch/bonus
+                    // target sample is not: it is emitted and processed by the ordinary path on the next loop.
+                    ss.live.push_back(nx);
+                    for (int i = 0; i < res.accepted; ++i) ss.live.push_back(drafts[(size_t) i]);
+                    fix.assign(drafts.begin(), drafts.begin() + res.accepted);
+                    bool ended = false;
+                    for (int i = 0; i < res.accepted && !ended; ++i)
+                        if (!emit(drafts[(size_t) i], true)) ended = true;
+                    if (ended) break;
+                    if (res.next < 0) { finish = stop.load() ? "cancel" : finish; break; }
+                    nx = res.next;
+                    continue;
+                }
+            }
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int D = E.kv_pool ? (int) std::min<int64_t>(E.mtp_d, max_new - produced) : E.mtp_d;
                 const int a = E.spec_step(nx, fix, D, drafts, picks, &stop);
@@ -4230,6 +4242,183 @@ int checkpoint_regression(Engine& E,const std::string& file) {
     return 0;
 }
 
+struct SampledMtpRun {
+    std::vector<int32_t> emitted, hist, live, continued;
+    std::vector<float> logits, continued_logits;
+    std::mt19937_64 rng;
+    int64_t pos = 0;
+    int offered = 0, accepted = 0;
+};
+
+/// Developer-only native gate. It uses the same sampled verifier, speculative
+/// window, state commit and sampler as serve. The first check is the full request
+/// text; the second forces both arms to stop after a common processed prefix so
+/// committed state and continuation can be compared.
+int sampled_mtp_regression(Engine& E, const std::string& file) {
+    if (!E.mtp_sampled || E.mtp_d < 2 || E.m->hybrid)
+        throw std::runtime_error("sampled-MTP test needs --mtp-sampled, --mtp 2 or more and full-GPU experts");
+    std::ifstream input(file);
+    std::string line;
+    if (!std::getline(input, line)) throw std::runtime_error("sampled-MTP fixture needs one CSV token line");
+    const auto ids = parse_ids(line.c_str());
+    constexpr int target = 16, continuation = 8;
+    if (ids.empty() || ids.size() + (size_t) target + (size_t) continuation + 32 > (size_t) E.ctx)
+        throw std::runtime_error("fixture is empty or leaves no room for sampled speculative windows");
+    auto require = [](bool ok, const char* why) { if (!ok) throw std::runtime_error(why); };
+    auto reset_all = [&] {
+        E.reset();
+        for (int s = 0; s < E.n_sess; ++s) {
+            auto& ss = E.sess[(size_t) s];
+            ss.live.clear();
+            ss.imgs.clear();
+            ss.checkpoints.clear();
+            ss.pos = 0;
+            ss.active = false;
+            if (E.kv_pool) {
+                strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t) s], E.kv_ids[(size_t) s]));
+                E.kv_required[(size_t) s] = 0;
+            }
+        }
+    };
+    Sampling smp;
+    smp.temperature = 1.0f; smp.top_p = 0.95f; smp.top_k = 20; smp.last_n = 64;
+    smp.present = 1.5f; smp.seed = 1234; smp.sampled_mtp = true;
+
+    auto run_direct = [&](bool spec) {
+        reset_all();
+        require(E.kv_pool == nullptr || E.kv_pool->session(0).state == strata::core::KvResidency::empty,
+                "sampled-MTP gate requires a clean session before begin");
+        E.kv_begin(0, ids.size() + (uint64_t) target + (uint64_t) continuation + 16, false);
+        auto& ss = E.sess[0];
+        ss.live = ids;
+        E.process(ids.data(), (int64_t) ids.size(), [](int64_t) {});
+        ss.pos = E.pos;
+        std::vector<int32_t> hist = ids, fix, drafts;
+        int offered = 0, accepted = 0;
+        SampledMtpRun out;
+        std::vector<float> lg;
+        E.host_logits(lg);
+        out.rng.seed(smp.seed);
+        int x = q36_sample(lg, smp, hist, out.rng);
+        while ((int) out.emitted.size() < target && E.pos < (int64_t) ids.size() + target) {
+            require(!is_eos(x), "fixture sampled EOS before the common checkpoint");
+            out.emitted.push_back(x);
+            hist.push_back(x);
+            if (E.pos >= (int64_t) ids.size() + target) break;
+            bool used_spec = false;
+            if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
+                const int remaining = (int) ((int64_t) ids.size() + target - E.pos);
+                const int D = std::min(E.mtp_d, remaining - 1);
+                if (D > 0) {
+                    const auto res = E.spec_step_sampled(x, fix, D, drafts, smp, hist, out.rng,
+                                                         (long long) out.emitted.size(), (long long) target, nullptr);
+                    offered += D;
+                    accepted += res.accepted;
+                    require(res.next >= 0, "sampled verifier stopped before the common checkpoint");
+                    require(!res.accepted_finish, "sampled verifier ended before the common checkpoint");
+                    ss.live.push_back(x);
+                    for (int i = 0; i < res.accepted; ++i) {
+                        require(!is_eos(drafts[(size_t) i]), "fixture accepted EOS before the common checkpoint");
+                        ss.live.push_back(drafts[(size_t) i]);
+                        out.emitted.push_back(drafts[(size_t) i]);
+                    }
+                    fix.assign(drafts.begin(), drafts.begin() + res.accepted);
+                    x = res.next;
+                    used_spec = true;
+                }
+            }
+            if (!used_spec) {
+                require(E.pos + 1 <= E.ctx, "fixture ran out of context before the common checkpoint");
+                const int32_t one = x;
+                E.process(&one, 1, [](int64_t) {});
+                ss.live.push_back(one);
+                fix.clear();
+                if (E.pos >= (int64_t) ids.size() + target) break;
+                E.host_logits(lg);
+                x = q36_sample(lg, smp, hist, out.rng);
+            }
+        }
+        require((int) out.emitted.size() == target, "sampled sequence did not reach the common checkpoint");
+        require(E.pos == (int64_t) ids.size() + target, "speculative state did not commit the common prefix exactly");
+        ss.pos = E.pos;
+        out.hist = std::move(hist);
+        out.live = ss.live;
+        out.pos = E.pos;
+        E.host_logits(out.logits);
+
+        // Continuation from the committed state: use the unchanged one-token sampled path, never speculation.
+        auto cont_rng = out.rng;
+        std::vector<float> cur = out.logits;
+        for (int i = 0; i < continuation; ++i) {
+            const int y = q36_sample(cur, smp, out.hist, cont_rng);
+            require(!is_eos(y), "fixture continuation sampled EOS too early");
+            out.continued.push_back(y);
+            out.hist.push_back(y);
+            const int32_t one = y;
+            E.process(&one, 1, [](int64_t) {});
+            ss.live.push_back(one);
+            if (i + 1 < continuation) E.host_logits(cur);
+        }
+        out.continued_logits = std::move(cur);
+        out.accepted = accepted; out.offered = offered;
+        E.kv_end(0);
+        reset_all();
+        return out;
+    };
+
+    const auto sequential = run_direct(false);
+    const auto speculative = run_direct(true);
+    require(sequential.emitted == speculative.emitted, "sampled speculative text differs from sequential sampling");
+    require(sequential.hist == speculative.hist, "sampled speculative history differs from sequential sampling");
+    require(sequential.pos == speculative.pos && speculative.pos == (int64_t) ids.size() + target,
+            "committed state position differs");
+    require(sequential.live.size() == speculative.live.size() &&
+            std::equal(sequential.live.begin(), sequential.live.end(), speculative.live.begin()),
+            "committed live tokens differ at the common checkpoint");
+    require(sequential.continued == speculative.continued, "committed state continues differently");
+    require(sequential.rng == speculative.rng, "speculative path consumed a different RNG amount");
+    require(sequential.logits.size() == speculative.logits.size() &&
+            sequential.continued_logits.size() == speculative.continued_logits.size(),
+            "logit shapes differ");
+    double max_common = 0, max_continued = 0;
+    for (size_t i = 0; i < speculative.logits.size(); ++i) {
+        require(std::isfinite(sequential.logits[i]) && std::isfinite(speculative.logits[i]), "nonfinite common logits");
+        max_common = std::max(max_common, std::abs((double) sequential.logits[i] - (double) speculative.logits[i]));
+    }
+    for (size_t i = 0; i < speculative.continued_logits.size(); ++i) {
+        require(std::isfinite(sequential.continued_logits[i]) && std::isfinite(speculative.continued_logits[i]),
+                "nonfinite continuation logits");
+        max_continued = std::max(max_continued, std::abs((double) sequential.continued_logits[i] -
+                                                          (double) speculative.continued_logits[i]));
+    }
+    require(max_common <= 1e-4 && max_continued <= 1e-4, "sampled speculative logits differ materially");
+    const bool byte_common = std::memcmp(sequential.logits.data(), speculative.logits.data(),
+                                         speculative.logits.size() * 4) == 0;
+    const bool byte_cont = std::memcmp(sequential.continued_logits.data(), speculative.continued_logits.data(),
+                                       speculative.continued_logits.size() * 4) == 0;
+
+    // Request-path check: exercise the native key and exact text emitted by Serve.
+    const std::string ids_csv = [&] { std::string s; for (size_t i = 0; i < ids.size(); ++i) { if (i) s += ','; s += std::to_string(ids[i]); } return s; }();
+    const std::string sampling = " temperature=1.0 top_p=0.95 top_k=20 penalty_present=1.5 penalty_last_n=64 seed=1234";
+    Serve sv(E);
+    auto run_request = [&](bool spec) {
+        std::vector<int32_t> emitted;
+        reset_all();
+        sv.request_log = &emitted;
+        sv.request_body("GEN 32" + sampling + " sampled_mtp=" + (spec ? "1" : "0") + " " + ids_csv);
+        sv.request_log = nullptr;
+        reset_all();
+        return emitted;
+    };
+    const auto request_seq = run_request(false), request_spec = run_request(true);
+    require(request_seq == request_spec, "sampled MTP request text differs from sequential request text");
+    std::printf("SAMPLED_MTP_TEST PASS sampled_tokens=%d continuation=%d request_tokens=%zu accepted=%d/%d "
+                "max_common_logit_abs=%.9g max_continuation_logit_abs=%.9g common_bytes=%d continuation_bytes=%d\n",
+                target, continuation, request_seq.size(), speculative.accepted, speculative.offered,
+                max_common, max_continued, byte_common ? 1 : 0, byte_cont ? 1 : 0);
+    return 0;
+}
+
 int serve(Engine& E) {
     Serve sv(E);
     return sv.run();
@@ -4238,12 +4427,12 @@ int serve(Engine& E) {
 }  // namespace
 
 static int q36_run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file, checkpoint_test;
+    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
-    bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false;
+    bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false, mtp_sampled = false;
     uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX, checkpoint_budget = 0, checkpoint_interval = 1024;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4277,6 +4466,8 @@ static int q36_run(int argc, char** argv) {
             else std::fprintf(stderr, "strata-q36: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
                                       "drafts)\n", v.c_str());
         }
+        else if (a == "--mtp-sampled") mtp_sampled = true;
+        else if (a == "--mtp-sampled-test") sampled_mtp_test = next();
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
@@ -4308,7 +4499,8 @@ static int q36_run(int argc, char** argv) {
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
-                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n");
+                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
+                         "       [--mtp-sampled [--mtp-sampled-test FILE]]\n");
             return 2;
         }
     }
@@ -4323,6 +4515,9 @@ static int q36_run(int argc, char** argv) {
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (mtp_sampled && mtp_d < 2) throw std::invalid_argument("--mtp-sampled needs --mtp 2 or more");
+    if (!sampled_mtp_test.empty() && (!mtp_sampled || mtp_d < 2))
+        throw std::invalid_argument("--mtp-sampled-test needs --mtp-sampled and --mtp 2 or more");
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     if (kv_pool_tokens && (batch < 0 || batch > Engine::kVerify))
         throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
@@ -4412,12 +4607,14 @@ static int q36_run(int argc, char** argv) {
     } report{E};
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
+    E.mtp_sampled = mtp_sampled && E.mtp_d >= 2;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
     if (warm) E.warmup();
     if (!checkpoint_test.empty()) return checkpoint_regression(E,checkpoint_test);
+    if (!sampled_mtp_test.empty()) return sampled_mtp_regression(E,sampled_mtp_test);
     if (serve_mode) return serve(E);
     E.kv_begin(0, std::min<uint64_t>(ctx, kv_pool_tokens ? kv_pool_tokens : (uint64_t) ctx), false);
     if (bench_pp > 0 || bench_tg > 0) {

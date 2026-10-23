@@ -100,6 +100,11 @@ tokens in the window. Same prompts, 5 interleaved pairs, R9700:
 
 The text is the same with and without it (every slot equal to its solo tokens).
 
+Sampled requests still take the unchanged one-token path. A separate experimental
+[Qwen3.6 sampled-MTP path](Q36_SAMPLED_MTP.md) adds opt-in `--mtp-sampled`: it verifies greedy
+proposals with the main model's target sampler. Its correctness gates and throughput questions are
+reported there; no speedup is claimed on this page until the same-workload Orin A/B has been measured.
+
 **What a slot costs.** Each slot keeps its own cache in VRAM: 1.5 GB at a context of 32K (fp32 keys and values of the 10 attention layers
 and the MTP block, 45 KB per token) and 0.07 GB of recurrent state. Setup writes the context for one conversation, so N slots take N times
 that from the room the experts would have: on a card that does not hold every expert (12 and 16 GB, the hybrid mode) that is room the

@@ -125,7 +125,9 @@ Qwen3.6 (its MTP argument is a number of drafts). The default remains FP32;
 `--kv int8` selects the [INT8 cache path and native smoke gates](Q36_INT8_KV.md).
 For changed text inside an earlier system-message prefix, the separate opt-in
 [Qwen3.6 prefix checkpoint path](Q36_PREFIX_CHECKPOINTS.md) restores bounded recurrent snapshots.
-Baseline configuration (checkpoints off):
+The experimental [Qwen3.6 sampled-MTP path](Q36_SAMPLED_MTP.md) is an isolated A/B feature
+(`--mtp-sampled`, `sampled_mtp=0|1`); it is not part of the baseline below.
+Baseline configuration (checkpoints and sampled MTP off):
 
 ```bash
 build-orin/strata-q36 --model "$MODEL" --serve \

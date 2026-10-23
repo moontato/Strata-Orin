@@ -1224,6 +1224,11 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # sampled MTP for this request only: 1 asks the engine (when it was started with --mtp-sampled) to
+            # verify greedy MTP proposals with target samples, 0 forces the unchanged one-token sampled path.
+            sm = tune.get("sampled_mtp")
+            if isinstance(sm, bool) or (isinstance(sm, (int, float)) and sm in (0, 1)):
+                keys += f" sampled_mtp={int(sm)}"
             # a layer split's prompt chunks (--prefill-pipe): 0 off, 1 evened out, > 1 the rig's b/a in tokens
             v = tune.get("prefill_pipe")
             if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 262144.0:
