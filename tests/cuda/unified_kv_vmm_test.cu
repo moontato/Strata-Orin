@@ -70,6 +70,15 @@ int main() {
                 cuda_check(cudaMemset(heads[s] + stride, 0x59, 2048 * 1024));
                 kv_require(pool.end(ids[s], 2048));
             }
+            // Qwen3.6's real slot-copy path uses a pitched copy across large
+            // unmapped gaps between head prefixes. Validate the CUDA copy API,
+            // not only kernels that happen to read an individual mapped head.
+            kv_require(pool.begin(ids[0], context)); kv_require(pool.begin(ids[1], context));
+            cuda_check(cudaMemset(heads[1], 0x11, 2048 * 1024));
+            cuda_check(cudaMemset(heads[1] + stride, 0x11, 2048 * 1024));
+            cuda_check(cudaMemcpy2D(heads[1], stride, heads[0], stride, 2048 * 1024, 2, cudaMemcpyDeviceToDevice));
+            pattern(heads[1], 2048 * 1024, 0x37); pattern(heads[1] + stride, 2048 * 1024, 0x59);
+            kv_require(pool.end(ids[1], 2048)); kv_require(pool.end(ids[0], 2048));
             // A captured pointer to head 1 survives growth, eviction, replay.
             cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
             uint8_t* output = nullptr;
