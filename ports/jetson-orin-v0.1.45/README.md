@@ -6,6 +6,8 @@ Branch: **`jetson-orin-v0.1.45`**, based directly on upstream **v0.1.45** (`477a
 
 Start with the [native build guide](BUILD.md) for **`/mnt/ssd/Strata-Orin`**, then follow the [hardware verification gates](VERIFY.md). [Local validation](VALIDATION.md) records this integration's commits, changed files, checks and untested areas. [`check_preservation.py`](check_preservation.py) checks release-source preservation, including the additive notice in the root README. The rest of the upstream documentation is unchanged; its installer/update instructions are **not qualified for Jetson**.
 
+Unified-KV development is separate, on **`feature/unified-kv`**: see the [configuration, allocator and replay contract](../../docs/UNIFIED_KV.md) and its [build/test record](UNIFIED_KV_VALIDATION.md). It is not part of the original four-patch port below; Orin model/parity/performance qualification is still required for this feature.
+
 The earlier fork analysis and test figures below came with the supplied patch bundle. They are retained as background, not presented as new measurements from this integration.
 
 ## 1. Establish the correct comparison
