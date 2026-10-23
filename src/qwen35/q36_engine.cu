@@ -31,6 +31,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.cuh"
 #include "q36_kv_int8.cuh"
+#include "strata/core/q36_prefix_checkpoint.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -52,6 +53,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -1227,7 +1229,12 @@ struct Engine {
         std::vector<ImgKey> imgs;           // the pictures among them
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
+        strata::core::Q36PrefixCheckpoints checkpoints;
+        std::vector<float*> checkpoint_data; // packed GDN/conv/hlast, owned by this slot's VMM adapter
     };
+    uint64_t checkpoint_budget = 0, checkpoint_interval = 1024, checkpoint_payload = 0;
+    uint64_t checkpoint_last_reused = 0; // focused native regression, not a scheduling hint
+    size_t checkpoint_count = 0;
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
     uint64_t use_clock = 0;
@@ -1392,6 +1399,10 @@ struct Engine {
             ss.vc.push_back(kv_int8 ? nullptr : attention());
         }
         ss.hlast = state((size_t) g.n_embd);
+        ss.checkpoints.interval = checkpoint_interval;
+        ss.checkpoints.points.resize(checkpoint_count);
+        for (size_t i=0;i<checkpoint_count;++i)
+            ss.checkpoint_data.push_back((float*) adapter->reserve({checkpoint_payload, UINT64_MAX, 1, 1, 0}));
     }
 
     /// The current session: `i`'s state, cache and position become the engine's (conv / S / kc / vc / pos / hlast).
@@ -1433,6 +1444,21 @@ struct Engine {
         const auto& g = m->g;
         if (kv_int8 && (g.head_dim != q36kv8::HD || g.n_head != q36kv8::GQA * g.n_head_kv))
             throw std::invalid_argument("Qwen3.6 INT8 KV requires head_dim=256 and GQA=8");
+        if (checkpoint_budget) {
+            if (!kv_pool) throw std::invalid_argument("--kv-checkpoint-mib requires --kv-pool-tokens");
+            const uint64_t conv_bytes = strata::core::kv_mul((uint64_t) g.ssm_conv_channels * (g.ssm_d_conv-1),4);
+            const uint64_t state_bytes = strata::core::kv_mul((uint64_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size,4);
+            checkpoint_payload = (uint64_t) g.n_embd * 4;
+            for (const Layer& L:m->layers) if (!L.attn)
+                checkpoint_payload = strata::core::kv_add(checkpoint_payload,strata::core::kv_add(conv_bytes,state_bytes));
+            checkpoint_count = strata::core::Q36PrefixCheckpoints::capacity(checkpoint_budget,checkpoint_payload,
+                                                                          strata::core::vmm_granularity(),(unsigned)n_sess);
+            const uint64_t rounded = strata::core::kv_mul(strata::core::kv_ceil(checkpoint_payload,strata::core::vmm_granularity()),strata::core::vmm_granularity());
+            std::fprintf(stderr,"Qwen3.6 prefix checkpoints: budget=%llu payload=%llu rounded=%llu per_slot=%zu slots=%d interval=%llu reserved_ceiling=%llu%s\n",
+                         (unsigned long long)checkpoint_budget,(unsigned long long)checkpoint_payload,(unsigned long long)rounded,
+                         checkpoint_count,n_sess,(unsigned long long)checkpoint_interval,
+                         (unsigned long long)(rounded*checkpoint_count*n_sess),checkpoint_count ? "" : " (budget too small; fresh prefill fallback)");
+        }
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -1572,6 +1598,7 @@ struct Engine {
                 a->invalidate = [this, s](std::string&) {
                     Sess& ss = sess[(size_t) s];
                     ss.live.clear(); ss.imgs.clear(); ss.pos = 0; ss.rdelta = 0;
+                    ss.checkpoints.clear();
                     if (cur == s) pos = 0;
                     // Every dependent device buffer belongs to this adapter and is
                     // unmapped. Graphs and batch tables keep stable VA, not freed pointers.
@@ -1646,6 +1673,7 @@ struct Engine {
 
     /// The recurrent state and the cache to a fresh sequence.
     void reset() {
+        sess[(size_t) cur].checkpoints.clear();
         if (kv_pool && !kv_adapters[(size_t) cur]->covers(1)) {
             pos = 0; sess[(size_t) cur].pos = 0; set_delta(0);
             return; // recurrence is zero-initialized when the first physical pages are committed
@@ -2580,7 +2608,7 @@ struct Engine {
     /// token's logits stay in `logits` (its greedy pick in `pick`), hlast its normed hidden.  With the MTP block the
     /// prompt also runs through it (its K / V for every position: row q reads h_{q-1} and token q).  on_chunk(done) runs
     /// after every chunk; false ends the read there (a cancelled request): the tokens processed are returned.
-    template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_) {
+    template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_, bool checkpoint_suffix = false) {
         const int N = (int) m->g.n_embd;
         auto on_chunk = [&](int64_t done) -> bool {   // a callback returning void never cancels
             if constexpr (std::is_void_v<decltype(on_chunk_(done))>) {
@@ -2590,7 +2618,9 @@ struct Engine {
                 return on_chunk_(done);
             }
         };
-        if (n == 1) {
+        // A restored one-token suffix is still PROMPT prefill: seed its MTP KV
+        // too, exactly as a final T=1 chunk of fresh multi-token prefill would.
+        if (n == 1 && !checkpoint_suffix) {
             kv_ensure(cur, (uint64_t) pos + 1);
             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
             hpin[0] = toks[0];
@@ -2808,6 +2838,92 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
     }
 
+    // Snapshot only persistent recurrence/conv/last-hidden. Activations, logits,
+    // graph arguments and verify scratch are regenerated by the nonempty suffix.
+    void checkpoint_transfer(Sess& ss, float* packed, bool restore) {
+        const auto& g=m->g;
+        size_t off=0;
+        auto plane=[&](float* p,size_t n) {
+            if(off>checkpoint_payload/4 || n>checkpoint_payload/4-off)
+                throw std::logic_error("checkpoint state exceeds its reserved payload");
+            CK(cudaMemcpyAsync(restore ? p : packed+off, restore ? packed+off : p,
+                               n*4,cudaMemcpyDeviceToDevice,st));
+            off+=n;
+        };
+        for(size_t l=0;l<ss.conv.size();++l) if(ss.conv[l]) {
+            plane(ss.conv[l],(size_t)g.ssm_conv_channels*(g.ssm_d_conv-1));
+            plane(ss.S[l],(size_t)g.ssm_v_heads*g.ssm_state_size*g.ssm_state_size);
+        }
+        plane(ss.hlast,(size_t)g.n_embd);
+        if(off*4!=checkpoint_payload) throw std::logic_error("checkpoint state layout mismatch");
+    }
+    bool checkpoint_available(int s,int index,bool leased=false) const {
+        const auto& ss=sess[(size_t)s];
+        if(index<0 || (size_t)index>=ss.checkpoints.points.size() || !ss.imgs.empty() || ss.active) return false;
+        const auto p=ss.checkpoints.points[(size_t)index];
+        const auto owner=kv_pool->session((uint32_t)s);
+        return p.pos && p.pos<=ss.live.size() && p.pos<=(uint64_t)ss.pos &&
+               p.generation==owner.id.generation && p.epoch==owner.epoch &&
+               (owner.state==strata::core::KvResidency::idle || (leased && owner.state==strata::core::KvResidency::active)) &&
+               kv_adapters[(size_t)s]->covers(p.pos);
+    }
+    int checkpoint_match(int s,const std::vector<int32_t>& ids) const {
+        if(!checkpoint_count) return -1;
+        const auto& ss=sess[(size_t)s];
+        size_t common=0;
+        while(common<ss.live.size() && common<ids.size() && ss.live[common]==ids[common]) ++common;
+        const auto owner=kv_pool->session((uint32_t)s);
+        const int i=ss.checkpoints.best(common,ids.size(),owner.id.generation,owner.epoch);
+        return checkpoint_available(s,i) ? i : -1;
+    }
+    void checkpoint_capture() {
+        if(!checkpoint_count) return;
+        auto& ss=sess[(size_t)cur];
+        const int i=ss.checkpoints.placement((uint64_t)pos);
+        if(i<0) return;
+        checkpoint_transfer(ss,ss.checkpoint_data[(size_t)i],false);
+        CK(cudaStreamSynchronize(st)); // publish metadata only after the entire state is copied
+        const auto owner=kv_pool->session((uint32_t)cur);
+        ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
+    }
+    bool checkpoint_restore(int src,int index,int dst) {
+        if(!checkpoint_available(src,index,src==dst)) return false;
+        const auto p=sess[(size_t)src].checkpoints.points[(size_t)index];
+        auto& a=sess[(size_t)src];auto& b=sess[(size_t)dst];
+        auto inherited=a.checkpoints.points;
+        for(auto& q:inherited) if(q.pos>p.pos || q.generation!=p.generation || q.epoch!=p.epoch) q={};
+        kv_ensure(dst,p.pos); // snapshots and every KV code/scale plane are charged to the adapter
+        select(dst);
+        checkpoint_transfer(b,a.checkpoint_data[(size_t)index],true);
+        if(src!=dst) {
+            const auto& g=m->g;
+            for(size_t l=0;l<a.kc.size();++l) {
+                if(kv_int8 && a.kv8[l].k) CK(q36kv8::copy_prefix(b.kv8[l],a.kv8[l],ctx,p.pos,g.n_head_kv,st));
+                if(a.kc[l]) for(int h=0;h<g.n_head_kv;++h) {
+                    const size_t offset=(size_t)h*ctx*g.head_dim, bytes=(size_t)p.pos*g.head_dim*4;
+                    CK(cudaMemcpyAsync(b.kc[l]+offset,a.kc[l]+offset,bytes,cudaMemcpyDeviceToDevice,st));
+                    CK(cudaMemcpyAsync(b.vc[l]+offset,a.vc[l]+offset,bytes,cudaMemcpyDeviceToDevice,st));
+                }
+            }
+            for(size_t i=0;i<inherited.size();++i) if(inherited[i].pos)
+                CK(cudaMemcpyAsync(b.checkpoint_data[i],a.checkpoint_data[i],checkpoint_payload,cudaMemcpyDeviceToDevice,st));
+            b.live.assign(a.live.begin(),a.live.begin()+(size_t)p.pos);
+        } else b.live.resize((size_t)p.pos);
+        CK(cudaStreamSynchronize(st));
+        strata::core::kv_require(kv_pool->replay_started(kv_ids[(size_t)dst]));
+        const auto owner=kv_pool->session((uint32_t)dst);
+        b.checkpoints.points=std::move(inherited);
+        b.checkpoints.rewind(p.pos,owner.id.generation,owner.epoch);
+        pos=b.pos=(int64_t)p.pos;
+        b.imgs.clear();clear_images(); // checkpoints are text-only; image requests never select them
+        kv_progress(dst,p.pos);
+        checkpoint_last_reused=p.pos;
+        if(kv_protocol) std::printf("KVREPLAY session=%d generation=%llu epoch=%llu tokens=%llu reason=prefix_checkpoint\n",dst,
+            (unsigned long long)owner.id.generation,(unsigned long long)owner.epoch,(unsigned long long)p.pos);
+        std::fprintf(stderr,"Qwen3.6 prefix checkpoint: source=%d session=%d restored_tokens=%llu\n",src,dst,(unsigned long long)p.pos);
+        return true;
+    }
+
     /// Session dst takes session src's state: the recurrent state, the cache's first src.pos cells, the position, the
     /// pictures' offset (for a conversation read in one session that continues in another).
     void copy_session(int src, int dst) {
@@ -2848,6 +2964,7 @@ struct Engine {
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
+        b.checkpoints.clear(); // its snapshots describe the previous slot contents, not the copied donor
         b.pos = a.pos;
         b.rdelta = a.rdelta;
         b.live = a.live;
@@ -3645,6 +3762,15 @@ struct Serve {
                 ? E.kv_pool->session((uint32_t) i).last_use < E.kv_pool->session((uint32_t) lru).last_use
                 : ss.used < E.sess[(size_t) lru].used)) lru = i;
         }
+        if (best < 0 && imgs.empty() && E.checkpoint_count) {
+            uint64_t longest=0;
+            for(int i=0;i<E.n_sess;++i) {
+                const int cp=E.checkpoint_match(i,ids);
+                if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>longest) {
+                    longest=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;best=i;
+                }
+            }
+        }
         return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
     }
 
@@ -3768,6 +3894,24 @@ struct Serve {
         }
         Engine::Sess& ss = E.sess[(size_t) s];
         size_t reuse = match_len(ss, ids, ir.imgs);
+        E.checkpoint_last_reused=0;
+        int cp_src=-1, cp_index=-1;
+        bool restored=false, full_donor=false;
+        std::unique_ptr<strata::core::KvIdlePin> cp_pin;
+        if (!reuse && !geni && E.checkpoint_count) {
+            // Prefer any full-state donor, exactly as before; checkpoint work is
+            // only for requests the existing exact-prefix path cannot serve.
+            if(adm) for(int i=0;i<E.n_sess;++i)
+                if(i!=s && !E.sess[(size_t)i].active && match_len(E.sess[(size_t)i],ids,ir.imgs)) full_donor=true;
+            if(!full_donor) for(int i=0;i<E.n_sess;++i) {
+                const int cp=E.checkpoint_match(i,ids);
+                if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>reuse) {
+                    reuse=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;cp_src=i;cp_index=cp;
+                }
+            }
+            // Protect a donor BEFORE admission/growth can reclaim idle owners.
+            if(cp_src>=0 && cp_src!=s) cp_pin=std::make_unique<strata::core::KvIdlePin>(E.kv_pool.get(),E.kv_ids[(size_t)cp_src]);
+        }
         if (E.kv_pool) {
             const auto before = E.kv_pool->session(s);
             if (kv_generation && kv_generation != before.id.generation)
@@ -3775,12 +3919,20 @@ struct Serve {
             if (kv_resume && (!kv_generation || !reuse || before.state == strata::core::KvResidency::evicted ||
                               kv_epoch == UINT64_MAX || kv_epoch != before.epoch))
                 throw strata::core::KvFailure({strata::core::KvCode::cache_miss, "full-history replay required"});
-            E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0);
+            E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0 || (cp_src>=0 && cp_src!=s));
+            if(cp_src>=0) {
+                restored=E.checkpoint_restore(cp_src,cp_index,s);
+                if(!restored) { // stale/unavailable record: never shorten a live recurrent sequence
+                    reuse=0;
+                    strata::core::kv_require(E.kv_pool->replay_started(E.kv_ids[(size_t)s]));
+                }
+                cp_pin.reset();
+            }
             const auto now = E.kv_pool->session(s);
             std::printf("KVCACHE session=%d generation=%llu epoch=%llu state=%s tokens=%llu bytes=%llu reserved_tokens=%llu result=%s replay=%d\n", s,
                         (unsigned long long) now.id.generation, (unsigned long long) now.epoch, strata::core::kv_residency_name(now.state),
                         (unsigned long long) now.tokens, (unsigned long long) now.bytes, (unsigned long long) now.reserved_tokens,
-                        reuse ? "hit" : before.state == strata::core::KvResidency::evicted ? "miss" : "new", reuse ? 0 : 1);
+                        restored ? "checkpoint" : reuse ? "hit" : before.state == strata::core::KvResidency::evicted ? "miss" : "new", reuse ? 0 : 1);
         }
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
             int src = -1;
@@ -3809,6 +3961,9 @@ struct Serve {
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+            // Only fresh/restored text-prefill lineage has a fully seeded MTP
+            // prefix. Preserve the exact-prefix decode fast path unchanged.
+            if(!geni && fresh>1 && (!reuse || restored)) E.checkpoint_capture();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
@@ -3821,7 +3976,7 @@ struct Serve {
             }
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
-        });
+        }, restored);
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -4002,6 +4157,79 @@ struct Serve {
     }
 };
 
+// Developer-only focused GPU/model gate, not a benchmark or an HTTP feature.
+// FILE is two CSV token lines: the original prompt, then its revised system suffix.
+int checkpoint_regression(Engine& E,const std::string& file) {
+    if(!E.checkpoint_count || E.n_sess!=4 || E.m->hybrid || E.mtp_d!=2)
+        throw std::runtime_error("checkpoint test needs four slots, sufficient checkpoint budget, full-GPU experts and MTP 2");
+    std::ifstream input(file);std::string original,revised;
+    if(!std::getline(input,original) || !std::getline(input,revised)) throw std::runtime_error("checkpoint fixture needs two CSV lines");
+    const auto a=parse_ids(original.c_str()),b=parse_ids(revised.c_str());
+    size_t common=0;while(common<a.size() && common<b.size() && a[common]==b[common]) ++common;
+    if(common<E.checkpoint_interval || common==a.size() || common==b.size() || b.size()+8>(size_t)E.ctx)
+        throw std::runtime_error("fixture must change a token after the first checkpoint, with space for MTP probes");
+    Serve sv(E);
+    auto require=[](bool ok,const char* why){if(!ok) throw std::runtime_error(why);};
+    sv.request_body("GEN 1 "+original);
+    const int source=E.cur, cp=E.checkpoint_match(source,b);
+    require(cp>=0,"no usable checkpoint before revised system tokens");
+    const auto expected=E.sess[(size_t)source].checkpoints.points[(size_t)cp].pos;
+    sv.request_body("GEN 1 "+revised);
+    require(E.checkpoint_last_reused==expected,"checkpoint restoration did not reuse the longest retained prefix");
+    std::vector<float> restored,fresh;E.host_logits(restored);
+    auto probe=[&]() {
+        std::vector<int> result;
+        if(E.mtp_d>0) {
+            const int s=E.cur;E.kv_begin(s,b.size()+8,false);
+            std::vector<int32_t> fix,drafts;int32_t picks[16]={};const int x=E.greedy();
+            const int accepted=E.spec_step(x,fix,E.mtp_d,drafts,picks);
+            result.push_back(x);result.push_back(accepted);
+            result.insert(result.end(),drafts.begin(),drafts.end());
+            result.insert(result.end(),picks,picks+accepted+1);
+            auto& ss=E.sess[(size_t)s];ss.live.push_back(x);
+            ss.live.insert(ss.live.end(),drafts.begin(),drafts.begin()+accepted);ss.pos=E.pos;E.kv_end(s);
+        }
+        return result;
+    };
+    const auto restored_probe=probe();
+    const auto old_id=E.kv_ids[(size_t)source];
+    strata::core::kv_require(E.kv_pool->reset(old_id,E.kv_ids[(size_t)source]));
+    E.kv_required[(size_t)source]=0;
+    require(E.checkpoint_match(source,b)<0,"checkpoint survived reset/generation change");
+    sv.request_body("GEN 1 "+revised);
+    require(!E.checkpoint_last_reused,"fresh reference unexpectedly restored a checkpoint");
+    E.host_logits(fresh);
+    require(restored.size()==fresh.size(),"logit shapes differ");
+    double max_error=0;
+    for(size_t i=0;i<fresh.size();++i) {
+        require(std::isfinite(restored[i]) && std::isfinite(fresh[i]),"nonfinite checkpoint/reference logits");
+        max_error=std::max(max_error,std::abs((double)restored[i]-fresh[i]));
+    }
+    require(std::memcmp(restored.data(),fresh.data(),fresh.size()*4)==0,"restored/fresh full logits are not byte-identical");
+    require(probe()==restored_probe,"restored/fresh MTP drafts, picks or acceptance differ");
+    // The same revised-prompt case in an explicitly different batch slot checks
+    // donor pinning, all FP32/INT8 KV planes, and inherited early checkpoints.
+    const int destination=(E.cur+1)%E.n_sess;
+    sv.request_body("BGEN "+std::to_string(destination)+" 1 "+revised);
+    require(E.cur==destination && E.checkpoint_last_reused>0,"batch checkpoint donor was not restored");
+    std::vector<float> cloned;E.host_logits(cloned);
+    require(cloned.size()==fresh.size() && std::memcmp(cloned.data(),fresh.data(),fresh.size()*4)==0,"cloned/fresh full logits differ");
+    require(probe()==restored_probe,"cloned/fresh MTP state differs");
+    const int current=E.cur;
+    E.kv_begin(current,b.size()+8,false);
+    require(E.checkpoint_match(current,b)<0,"active checkpoint owner was offered as an idle donor");
+    E.kv_end(current);
+    for(int s=0;s<E.n_sess;++s) {
+        strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t)s],E.kv_ids[(size_t)s]));
+        E.kv_required[(size_t)s]=0;
+        require(E.checkpoint_match(s,b)<0,"reset left a checkpoint available");
+    }
+    require(E.kv_pool->info().committed_bytes==0,"checkpoint/KV physical memory survived reset");
+    std::printf("PREFIX_CHECKPOINT_TEST PASS common_tokens=%zu reused_tokens=%llu max_logit_abs=%.9g mtp=%d slots=%d\n",
+                common,(unsigned long long)expected,max_error,E.mtp_d,E.n_sess);
+    return 0;
+}
+
 int serve(Engine& E) {
     Serve sv(E);
     return sv.run();
@@ -4010,13 +4238,13 @@ int serve(Engine& E) {
 }  // namespace
 
 static int q36_run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file;
+    std::string model, tokens, force, dump_full, emb_file, checkpoint_test;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false;
-    uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX;
+    uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX, checkpoint_budget = 0, checkpoint_interval = 1024;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4059,6 +4287,9 @@ static int q36_run(int argc, char** argv) {
         }
         else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
+        else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
+        else if (a == "--kv-checkpoint-interval") checkpoint_interval = strata::core::kv_parse_limit(next(), "--kv-checkpoint-interval");
+        else if (a == "--kv-checkpoint-test") checkpoint_test = next();
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -4076,7 +4307,8 @@ static int q36_run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n"
-                         "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n");
+                         "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
+                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n");
             return 2;
         }
     }
@@ -4096,6 +4328,12 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
     if (!kv_pool_tokens && kv_pool_bytes != UINT64_MAX)
         throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
+    if (checkpoint_budget && !kv_pool_tokens) throw std::invalid_argument("--kv-checkpoint-mib requires --kv-pool-tokens");
+    if (checkpoint_budget && checkpoint_interval > (uint64_t)ctx) throw std::invalid_argument("checkpoint interval exceeds context");
+    if (!checkpoint_test.empty() && (!checkpoint_budget || !kv_pool_tokens))
+        throw std::invalid_argument("--kv-checkpoint-test requires opt-in checkpoints and a unified pool");
+    if (checkpoint_budget && !serve_mode && checkpoint_test.empty())
+        throw std::invalid_argument("prefix checkpoints require --serve or --kv-checkpoint-test");
     Model m;
     std::string err;
     try {
@@ -4107,6 +4345,8 @@ static int q36_run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv_int8 = kv_int8;
+    E.checkpoint_budget = checkpoint_budget;
+    E.checkpoint_interval = checkpoint_interval;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -4177,6 +4417,7 @@ static int q36_run(int argc, char** argv) {
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
     if (warm) E.warmup();
+    if (!checkpoint_test.empty()) return checkpoint_regression(E,checkpoint_test);
     if (serve_mode) return serve(E);
     E.kv_begin(0, std::min<uint64_t>(ctx, kv_pool_tokens ? kv_pool_tokens : (uint64_t) ctx), false);
     if (bench_pp > 0 || bench_tg > 0) {

@@ -133,6 +133,11 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   # Test expressions include operations; do not compile them away in Release.
   target_compile_options(unified_kv_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
   add_test(NAME unified_kv_test COMMAND unified_kv_test)
+  add_executable(q36_prefix_checkpoint_test tests/core/q36_prefix_checkpoint_test.cpp)
+  target_include_directories(q36_prefix_checkpoint_test PRIVATE include)
+  target_link_libraries(q36_prefix_checkpoint_test PRIVATE Threads::Threads)
+  target_compile_options(q36_prefix_checkpoint_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+  add_test(NAME q36_prefix_checkpoint_test COMMAND q36_prefix_checkpoint_test)
 endif()
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
