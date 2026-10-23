@@ -202,6 +202,20 @@ int main() {
             const auto c = p.chunks(cells, gran);
             assert(std::vector<uint64_t>(oracle.begin(), oracle.end()) == c);
         }
+    // Qwen3.6 INT8: two code and two FP16-scale planes, both head-major.
+    // At 250K the two heads' scale prefixes initially SHARE a granule: price
+    // the union per array, not twice that granule or just the code bytes.
+    {
+        constexpr uint64_t ctx = 250000, gran = 2u << 20;
+        const KvPrefix code{256, 1, ctx, 2, ctx * 256}, scales{8, 1, ctx, 2, ctx * 8};
+        assert(code.chunks(0, gran).empty() && scales.chunks(0, gran).empty());
+        assert(code.chunks(1, gran).size() == 2 && scales.chunks(1, gran).size() == 1);
+        const auto bytes = [&](uint64_t n) { return (2 * code.chunks(n, gran).size() + 2 * scales.chunks(n, gran).size()) * gran; };
+        assert(bytes(1) == 6 * gran && bytes(ctx) == 128 * gran);
+        assert(2 * 2 * (256 + 8) == 1056); // K+V, two heads, scales included
+        assert(uint64_t{1056} * 11 * 500000 == 5808000000ULL);
+        assert(bytes(1) < bytes(ctx));
+    }
     // QSA formats: quantization-independent ownership, format-specific physical
     // arrays (FP16, INT8 + scales, Q4_0, K8V4). 2 heads, 256 dim, 64-cell pages.
     const std::vector<std::vector<uint64_t>> per_cell = {{1024,1024}, {512,512,16,16}, {288,288}, {512,16,288}};

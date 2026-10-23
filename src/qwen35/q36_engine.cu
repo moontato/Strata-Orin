@@ -30,6 +30,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.cuh"
+#include "q36_kv_int8.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1178,6 +1179,9 @@ struct Engine {
     float *pacc, *pm, *pl, *amv;
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
+    bool kv_int8 = false; // opt-in; the default FP32 kernels/storage stay unchanged
+    std::vector<q36kv8::Cache> kv8;
+    q36kv8::Cache* d_kv8_tab = nullptr;
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
@@ -1215,6 +1219,7 @@ struct Engine {
     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
     struct Sess {
         std::vector<float*> conv, S, kc, vc;
+        std::vector<q36kv8::Cache> kv8;
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -1356,13 +1361,22 @@ struct Engine {
                                                        (uint64_t) g.n_head_kv, (uint64_t) ctx * g.head_dim * 4})
                            : dalloc((size_t) g.n_head_kv * ctx * g.head_dim);
         };
+        auto attention8 = [&]() {
+            auto plane = [&](uint64_t per_cell) -> void* {
+                const strata::core::KvPrefix layout{per_cell, 1, (uint64_t) ctx, (uint64_t) g.n_head_kv, (uint64_t) ctx * per_cell};
+                return adapter ? adapter->reserve(layout) : (void*) dalloc_t<uint8_t>((size_t) layout.extent());
+            };
+            return q36kv8::Cache{(int8_t*) plane(g.head_dim), (int8_t*) plane(g.head_dim),
+                                 (__half*) plane((g.head_dim / 64) * 2), (__half*) plane((g.head_dim / 64) * 2)};
+        };
         const size_t C = (size_t) g.ssm_conv_channels;
         for (const Layer& L : m->layers) {
+            ss.kv8.push_back(kv_int8 && L.attn ? attention8() : q36kv8::Cache{});
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(attention());
-                ss.vc.push_back(attention());
+                ss.kc.push_back(kv_int8 ? nullptr : attention());
+                ss.vc.push_back(kv_int8 ? nullptr : attention());
             } else {
                 ss.conv.push_back(state(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(state((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -1373,8 +1387,9 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(attention());
-            ss.vc.push_back(attention());
+            ss.kv8.push_back(kv_int8 ? attention8() : q36kv8::Cache{});
+            ss.kc.push_back(kv_int8 ? nullptr : attention());
+            ss.vc.push_back(kv_int8 ? nullptr : attention());
         }
         ss.hlast = state((size_t) g.n_embd);
     }
@@ -1389,6 +1404,7 @@ struct Engine {
     void load_cur() {
         Sess& ss = sess[(size_t) cur];
         conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
+        kv8 = ss.kv8;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -1415,6 +1431,8 @@ struct Engine {
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
+        if (kv_int8 && (g.head_dim != q36kv8::HD || g.n_head != q36kv8::GQA * g.n_head_kv))
+            throw std::invalid_argument("Qwen3.6 INT8 KV requires head_dim=256 and GQA=8");
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -1525,7 +1543,9 @@ struct Engine {
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
+            const size_t cache_per_token = kv_int8 ? (size_t) g.n_head_kv * (g.head_dim + (g.head_dim / 64) * 2) * 2
+                                                    : (size_t) g.n_head_kv * g.head_dim * 2 * 4;
+            const size_t per = cache_per_token * (size_t) ctx * n_attn +
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             size_t fr0 = 0, tot0 = 0;
             CK(memory_info(&fr0, &tot0));
@@ -1565,7 +1585,7 @@ struct Engine {
         if (kv_pool) {
             uint64_t attention_layers = m->has_mtp ? 1 : 0;
             for (const auto& l : m->layers) attention_layers += l.attn;
-            const uint64_t per_token = (uint64_t) g.n_head_kv * g.head_dim * 8 * attention_layers;
+            const uint64_t per_token = (uint64_t) g.n_head_kv * (kv_int8 ? 2 * (g.head_dim + (g.head_dim / 64) * 2) : g.head_dim * 8) * attention_layers;
             std::fprintf(stderr, "Unified KV: enabled; model=Qwen3.6-35B-A3B slots=%d max_context=%d pool_tokens=%llu "
                          "kv_bytes_per_token=%llu logical_kv_bytes=%llu committed_bytes=0 vmm_granularity=%llu "
                          "(alignment/recurrent state charged separately; no eager pool commitment)\n",
@@ -1573,6 +1593,9 @@ struct Engine {
                          (unsigned long long) strata::core::kv_mul(pool_tokens, per_token),
                          (unsigned long long) strata::core::vmm_granularity());
         }
+        std::fprintf(stderr, "Qwen3.6 KV: format=%s K+V storage=%s; prefill=FP16-staged cuBLAS; graphs=%s\n",
+                     kv_int8 ? "int8" : "fp32", kv_int8 ? "signed INT8 + FP16 scales/64 values" : "FP32",
+                     use_graph ? "on" : "off");
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
             std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
@@ -1589,6 +1612,14 @@ struct Engine {
                 CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(float*)));
                 CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
                               cudaMemcpyHostToDevice));
+            }
+            if (kv_int8) {
+                std::vector<q36kv8::Cache> tables(ns * (size_t) n_sess);
+                for (size_t li = 0; li < ns; ++li)
+                    for (int s_ = 0; s_ < n_sess; ++s_)
+                        tables[li * n_sess + s_] = sess[(size_t) s_].kv8[li];
+                d_kv8_tab = dalloc_t<q36kv8::Cache>(tables.size());
+                CK(cudaMemcpy(d_kv8_tab, tables.data(), tables.size() * sizeof(q36kv8::Cache), cudaMemcpyHostToDevice));
             }
             d_rcell = dalloc_t<int32_t>(kVerify);
             d_rslot = dalloc_t<int32_t>(kVerify);
@@ -2043,9 +2074,16 @@ struct Engine {
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
             }
-            k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
-                                                              rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                                                              m->rope_base, m->eps, d_delta, mtab_now, rs);
+            const q36kv8::Rows rows8{rs.cell, rs.slot, rs.delta};
+            const auto cache8 = kv_int8 ? kv8[li] : q36kv8::Cache{};
+            const auto* table8 = kv_int8 && rows_mode ? d_kv8_tab + li * n_sess : nullptr;
+            if (kv_int8)
+                q36kv8::prepare<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, cache8, table8,
+                    H, HKV, m->n_rot, dpos, ctx, m->rope_base, m->eps, d_delta, mtab_now, rows8);
+            else
+                k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
+                                                                  rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
+                                                                  m->rope_base, m->eps, d_delta, mtab_now, rs);
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2055,7 +2093,10 @@ struct Engine {
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                if (kv_int8)
+                    q36kv8::stage_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(cache8, k16, v16, ctx, P, HKV);
+                else
+                    k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
@@ -2095,9 +2136,13 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
-                                                                         rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                                                         1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                    if (kv_int8)
+                        q36kv8::attention<<<dim3(HKV, nc, nt), kChunkCells, 0, st>>>(q, cache8, table8, dpos, t0, H, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rows8);
+                    else
+                        k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                                                                             rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                                                                             1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
                 }
             }
@@ -2779,6 +2824,8 @@ struct Engine {
                 CK(cudaMemcpyAsync(b.S[l], a.S[l], (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4,
                                    cudaMemcpyDeviceToDevice, st));
             }
+            if (kv_int8 && a.kv8[l].k && a.pos > 0)
+                CK(q36kv8::copy_prefix(b.kv8[l], a.kv8[l], (size_t) ctx, (size_t) a.pos, (size_t) g.n_head_kv, st));
             if (a.kc[l] && a.pos > 0) {
                 if (kv_pool) {
                     // Each head prefix is backed independently; the VA gap to
@@ -3900,7 +3947,8 @@ struct Serve {
 
     int run() {
         if (E.kv_pool) {
-            std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=0\n");
+            std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=0 kv_format=%s kv_scale_group=%d\n",
+                        E.kv_int8 ? "int8" : "fp32", E.kv_int8 ? 64 : 0);
             strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
         }
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
@@ -3967,7 +4015,7 @@ static int q36_run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
-    bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
+    bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false;
     uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4004,6 +4052,11 @@ static int q36_run(int argc, char** argv) {
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
+        else if (a == "--kv") {
+            const auto format = next();
+            if (format != "fp32" && format != "int8") throw std::invalid_argument("Qwen3.6 --kv takes fp32 or int8");
+            kv_int8 = format == "int8";
+        }
         else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
@@ -4023,7 +4076,7 @@ static int q36_run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n"
-                         "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --mtp 2 --batch-mtp]\n");
+                         "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n");
             return 2;
         }
     }
@@ -4053,6 +4106,7 @@ static int q36_run(int argc, char** argv) {
     }
     Engine E;
     E.use_graph = graph;
+    E.kv_int8 = kv_int8;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -4078,7 +4132,7 @@ static int q36_run(int argc, char** argv) {
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
             const int ns = std::max(1, batch);
-            const double kv_one = 45056.0, kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
+            const double kv_one = kv_int8 ? 11616.0 : 45056.0, kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
             const double sess_extra = std::max(0.0, (double) ctx * (kv_one * (kv_pool_tokens ? 0 : ns) + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})

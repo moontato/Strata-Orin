@@ -11,7 +11,7 @@ The pinned source at `ec8149d1` recognizes exactly two GGUF families
 
 | Family | Cache adapter |
 |---|---|
-| `qwen35moe`: Qwen3.6-35B-A3B and supported weight quantizations | FP32 K/V, `[kv_head][context][head_dim]`; GDN convolution/recurrence and last hidden state; the loaded MTP block's K/V |
+| `qwen35moe`: Qwen3.6-35B-A3B and supported weight quantizations | FP32 K/V by default, or opt-in INT8 K/V with FP16 scales per 64 values; head-major layout; GDN convolution/recurrence, last hidden and MTP state |
 | `qwen4exp`: Flash-Next, Coder, Swift and compatible fine-tunes/pruned/quantized variants | Paged QSA K/V, FP16, INT8 with FP16 scales, rotated Q4_0 or K8V4; indexer, GDN and PLE state; optional streamed host backing and MTP cache/ring |
 
 Weight quantization does not choose a different KV layout. Unknown architectures
@@ -121,7 +121,8 @@ and verify placement logs for controlled performance comparisons.
 
 ## Configuration
 
-Qwen3.6 (its MTP argument is a number of drafts):
+Qwen3.6 (its MTP argument is a number of drafts). The default remains FP32;
+`--kv int8` selects the [INT8 cache path and native smoke gates](Q36_INT8_KV.md):
 
 ```bash
 build-orin/strata-q36 --model "$MODEL" --serve \
