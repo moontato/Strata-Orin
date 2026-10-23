@@ -2780,10 +2780,23 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
-                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
+                if (kv_pool) {
+                    // Each head prefix is backed independently; the VA gap to
+                    // the next head can be unmapped. A head stride is not a
+                    // cuMemAllocPitch pitch: CUDA 2D D2D copies may reject it.
+                    // Enqueue only the mapped prefixes on the existing stream.
+                    const size_t prefix = (size_t) a.pos * g.head_dim * 4;
+                    for (size_t h = 0; h < (size_t) g.n_head_kv; ++h) {
+                        const size_t offset = h * (size_t) ctx * g.head_dim;
+                        CK(cudaMemcpyAsync(b.kc[l] + offset, a.kc[l] + offset, prefix, cudaMemcpyDeviceToDevice, st));
+                        CK(cudaMemcpyAsync(b.vc[l] + offset, a.vc[l] + offset, prefix, cudaMemcpyDeviceToDevice, st));
+                    }
+                } else {
+                    CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
+                                         cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
+                                         cudaMemcpyDeviceToDevice, st));
+                }
             }
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
