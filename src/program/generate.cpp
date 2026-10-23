@@ -37,6 +37,9 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/unified_kv_vmm.hpp"
+#include "strata/core/unified_kv_binding.hpp"
+#include "strata/core/unified_kv_protocol.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -475,6 +478,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX;
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -812,6 +816,9 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --kv-pool-tokens N   opt-in shared resident-token ceiling, dynamic commitment, idle-only LRU\n"
+                 "                       one CUDA device; --serve [--batch 4]. Not a physical memory guarantee\n"
+                 "  --kv-pool-mib N      optional rounded physical KV byte ceiling (MiB); requires the token pool\n"
                  "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
@@ -2183,7 +2190,7 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
-int main(int argc, char** argv) {
+static int strata_main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -2336,6 +2343,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-pool-tokens") o.kv_pool_tokens = strata::core::kv_parse_limit(next("--kv-pool-tokens"), "--kv-pool-tokens");
+        else if (a == "--kv-pool-mib") o.kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next("--kv-pool-mib"), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -3725,6 +3734,26 @@ int main(int argc, char** argv) {
     }
 
     strata::core::SessionState ss;
+    std::unique_ptr<strata::core::UnifiedKvPool> unified_pool;
+    std::vector<std::unique_ptr<strata::core::UnifiedKvVmm>> unified_adapters;
+    std::vector<strata::core::KvIdentity> unified_ids;
+    uint64_t unified_fixed_bytes = 0;
+    if (o.kv_pool_tokens && (o.max_context <= 0 || o.max_context > INT32_MAX - 64)) {
+        std::fprintf(stderr, "unified KV: --max-context exceeds position indexing range\n"); return 2;
+    }
+    const int64_t unified_cells = o.max_context + (o.kv_pool_tokens ? 64 : 0); // speculative padding, not logical context
+    auto unified_owner = [&](size_t s) -> strata::core::UnifiedKvVmm* {
+        return unified_pool ? unified_adapters.at(s).get() : nullptr;
+    };
+    auto unified_ensure = [&](size_t s, uint64_t cells) -> bool {
+        if (!unified_pool || unified_adapters.at(s)->covers(cells)) return true;
+        if (cells > (uint64_t) unified_cells) { err = "kv_context_limit: write beyond physical cache extent"; return false; }
+        const uint64_t target = std::min<uint64_t>((cells + 255) / 256 * 256, (uint64_t) unified_cells);
+        const auto r = unified_pool->grow(unified_ids.at(s), target, [] { return strata::core::unified_kv_available(); });
+        strata::core::kv_print_events(*unified_pool);
+        if (!r) err = std::string(strata::core::kv_code_name(r.code)) + ": " + r.message;
+        return bool(r);
+    };
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
@@ -4944,6 +4973,30 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        if (!o.kv_pool_tokens && o.kv_pool_bytes != UINT64_MAX) {
+            std::fprintf(stderr, "--kv-pool-mib requires --kv-pool-tokens\n"); return 2;
+        }
+        if (o.kv_pool_tokens) {
+            if (!o.serve || multi_gpu || split_same || o.batch < 0 || o.batch == 1 || o.batch > 8 ||
+                o.kv_grow || o.vram_elastic || o.peer_device >= 0 || !strata::core::vmm_available()) {
+                std::fprintf(stderr, "unified KV requires --serve, one CUDA VMM device, --batch 0 or 2..8; "
+                                     "not --kv-grow, --vram-elastic, --peer-device or a layer split\n"); return 2;
+            }
+            unified_pool = std::make_unique<strata::core::UnifiedKvPool>((uint64_t) o.max_context, o.kv_pool_tokens, o.kv_pool_bytes);
+            for (int b = 0; b <= o.batch; ++b) {
+                auto a = std::make_unique<strata::core::UnifiedKvVmm>((uint64_t) unified_cells);
+                unified_ids.push_back(unified_pool->add(*a)); unified_adapters.push_back(std::move(a));
+            }
+            strata::core::unified_qsa_enabled = true;
+            // Untracked full KV snapshots would defeat physical-pool accounting.
+            // Token history remains the caller's; existing recurrent checkpoints stay available.
+            o.conversation_cache_mib = 0;
+            std::fprintf(stderr, "Unified KV: enabled; model=Qwen3.8-Flash-Next slots=%d max_context=%lld "
+                         "pool_tokens=%llu vmm_granularity=%llu; main workspace=0, batch session=b+1; "
+                         "whole-KV RAM parking disabled\n", o.batch, (long long) o.max_context,
+                         (unsigned long long) o.kv_pool_tokens, (unsigned long long) strata::core::vmm_granularity());
+        }
+        const strata::core::UnifiedKvBinding main_binding(unified_owner(0));
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -4951,7 +5004,7 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
-            const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
+            const bool on = asked && !unified_pool && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
@@ -4963,11 +5016,12 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, unified_cells, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (unified_pool) unified_fixed_bytes += strata::core::session_bytes(g, unified_cells, K, 0, hi0);
+        if (strata::core::session_init(g, unified_cells, K, sbuf, ss, 0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -5136,12 +5190,14 @@ int main(int argc, char** argv) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const uint64_t bytes = strata::core::session_bytes(g, unified_cells, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                const strata::core::UnifiedKvBinding slot_binding(unified_owner((size_t) b + 1));
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, unified_cells, K, buf, *u, lo, hi) == 0) {
+                    if (unified_pool) { std::fprintf(stderr, "unified KV: fixed slot state allocation failed (slots are not silently reduced)\n"); return 1; }
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -5153,6 +5209,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
+                if (unified_pool) unified_fixed_bytes += bytes;
                 bslot_ss[k].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -5193,6 +5250,7 @@ int main(int argc, char** argv) {
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
     if (!o.mtp.empty()) {
+        const strata::core::UnifiedKvBinding mtp_binding(unified_owner(0));
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
             o.mtp.clear();
@@ -5218,6 +5276,7 @@ int main(int argc, char** argv) {
             // runs on the first stage, as for the solo drafter (`mtp.set_ple_session(&ss)` above).
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
+                const strata::core::UnifiedKvBinding draft_binding(unified_owner((size_t) b + 1));
                 if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
@@ -5236,6 +5295,18 @@ int main(int argc, char** argv) {
                              (double) fb / 1073741824.0);
             }
         }
+    }
+    if (unified_pool) {
+        const auto& state = ss.qsa_states[ss.qsa_primary()];
+        const auto shapes = strata::core::qsa_shapes(g);
+        uint64_t per_token = (uint64_t) g.n_qsa_layers() * strata::kernels::kv_block_bytes(shapes, strata::core::qsa_kv_format(state)) / shapes.page_size;
+        if (!o.mtp.empty()) per_token += strata::kernels::kv_block_bytes(strata::core::qsa_shapes(draft_geometry),
+                                        strata::core::qsa_kv_format(mtp.kv_state())) / shapes.page_size;
+        std::fprintf(stderr, "Unified KV: format=%s authoritative_bytes_per_token=%llu logical_kv_bytes=%llu "
+                     "fixed_session_arena_bytes=%llu committed_kv_bytes=0; streamed GPU working sets, alignment "
+                     "and speculative padding charged at growth\n", o.kv.c_str(), (unsigned long long) per_token,
+                     (unsigned long long) strata::core::kv_mul(o.kv_pool_tokens, per_token),
+                     (unsigned long long) unified_fixed_bytes);
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
@@ -8781,6 +8852,13 @@ int main(int argc, char** argv) {
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env());
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+        if (unified_pool) {
+            unified_adapters[0]->invalidate = [&](std::string&) {
+                live.clear(); live_imgs.clear(); live_ok = false; checks.clear(); tail_ckpt_len = -1;
+                if (use_mtp) mtp.set_prompt_len(0);
+                return true; // recurrent/indexer buffers are invalid and zeroed on replay, never reused alone
+            };
+        }
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
         ConvCheckpoint::PromptPlan seg_plan;
@@ -10546,6 +10624,11 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        if (unified_pool) {
+            std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=1 fixed_session_bytes=%llu\n",
+                        (unsigned long long) unified_fixed_bytes);
+            strata::core::kv_print_status(*unified_pool, (unsigned) unified_ids.size());
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -10714,6 +10797,13 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        if (unified_pool)
+            for (size_t b = 0; b < bs.size(); ++b)
+                unified_adapters[b + 1]->invalidate = [&, b](std::string&) {
+                    bs[b] = BSlot{};
+                    if (batch_mtp) slot_mtp[b]->set_prompt_len(0);
+                    return true;
+                };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -10782,8 +10872,16 @@ int main(int argc, char** argv) {
             return true;
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            if (unified_pool) {
+                const auto r = unified_pool->begin(unified_ids[(size_t) b + 1], 0, true);
+                strata::core::kv_print_events(*unified_pool);
+                if (!r || !unified_ensure((size_t) b + 1, ids.size() + 64)) {
+                    e = !r ? std::string(strata::core::kv_code_name(r.code)) + ": " + r.message : err;
+                    return false;
+                }
+            }
             const int64_t upto = (int64_t) ids.size();
-            if (slot_copy_direct) {
+            if (slot_copy_direct || unified_pool) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -10812,12 +10910,16 @@ int main(int argc, char** argv) {
                 // kernel launch there.
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
-                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                if (unified_pool) {
+                    if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                        !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(),
                                                            draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
-                    return false;
+                        cudaDeviceSynchronize() != cudaSuccess) return false;
+                } else if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                           !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                           !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                                                                draft_geometry, upto, false, e) ||
+                           cudaDeviceSynchronize() != cudaSuccess) return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
             return true;
@@ -10826,9 +10928,10 @@ int main(int argc, char** argv) {
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            const strata::core::KvIdlePin source_pin(unified_pool.get(), unified_pool ? unified_ids[(size_t) b + 1] : strata::core::KvIdentity{});
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
-            if (slot_copy_direct && at == nullptr) {
+            if ((slot_copy_direct || unified_pool) && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -10860,12 +10963,16 @@ int main(int argc, char** argv) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
-                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
-                                                        draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
-                    return false;
+                if (unified_pool) {
+                    if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                        !strata::core::conversation_kv_copy(slot_mtp[(size_t) b]->kv_state(), mtp.kv_state(),
+                                                           draft_geometry, upto, false, e) ||
+                        cudaDeviceSynchronize() != cudaSuccess) return false;
+                } else if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                           !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                                                             draft_geometry, upto, false, e) ||
+                           !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                           cudaDeviceSynchronize() != cudaSuccess) return false;
                 mtp.set_prompt_len(upto);
             }
             return true;
@@ -10905,6 +11012,12 @@ int main(int argc, char** argv) {
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
+            if (unified_pool)
+                for (int a = 0; a < A; ++a)
+                    if (!unified_ensure((size_t) active[a] + 1, (uint64_t) bs[(size_t) active[a]].p + 64)) {
+                        std::printf("ERR %s (batch session=%d)\n", err.c_str(), active[a] + 1);
+                        std::fflush(stdout); return false;
+                    }
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -11030,6 +11143,14 @@ int main(int argc, char** argv) {
                     sl.draft_ready = true;
                 }
             }
+            if (unified_pool)
+                for (int a = 0; a < A; ++a) {
+                    const int b = active[a];
+                    if (!bs[(size_t) b].active)
+                        strata::core::kv_require(unified_pool->end(unified_ids[(size_t) b + 1], bs[(size_t) b].ids.size()));
+                    else
+                        strata::core::kv_require(unified_pool->progress(unified_ids[(size_t) b + 1], bs[(size_t) b].ids.size()));
+                }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
             if (adapt_run.th.joinable()) {
@@ -11304,6 +11425,11 @@ int main(int argc, char** argv) {
                 }
             } else if (!next_line(line)) {
                 break;
+            }
+            if (unified_pool && strata::core::kv_control(*unified_pool, unified_ids, line)) continue;
+            if (unified_pool && (line.rfind("SAVE", 0) == 0 || line.rfind("RESTORE", 0) == 0)) {
+                std::printf("ERR kv_unsupported: disk KV operations are not part of unified KV; replay full history\n");
+                std::fflush(stdout); continue;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -11637,6 +11763,8 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;
             bool req_bias_present = false;
+            uint64_t req_kv_generation = 0, req_kv_epoch = UINT64_MAX;
+            bool req_kv_resume = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -11683,6 +11811,9 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "kv_generation") req_kv_generation = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "kv_epoch") req_kv_epoch = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "kv_resume") req_kv_resume = tok.substr(eq + 1) == "1";
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
@@ -11723,6 +11854,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            const strata::core::KvAbandon unified_request_guard(unified_pool.get(), unified_pool ? &unified_ids[0] : nullptr);
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -11818,7 +11950,8 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            const int64_t requested_output = unified_pool && admit_slot >= 0 ? admit_max_new : max_new;
+            if (n > o.max_context || requested_output > o.max_context - n - (unified_pool ? 0 : 8)) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
@@ -11826,6 +11959,36 @@ int main(int argc, char** argv) {
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+            if (unified_pool) {
+                const size_t logical = admit_slot >= 0 ? (size_t) admit_slot + 1 : 0;
+                const auto before = unified_pool->session((uint32_t) logical);
+                if (req_kv_generation && req_kv_generation != before.id.generation) {
+                    std::printf("ERR kv_stale_generation: query KVSTATUS\n"); std::fflush(stdout); continue;
+                }
+                if (req_kv_resume && (req_kv_epoch == UINT64_MAX || req_kv_epoch != before.epoch ||
+                    before.state == strata::core::KvResidency::empty || before.state == strata::core::KvResidency::evicted)) {
+                    std::printf("ERR kv_cache_miss: full-history replay required\n"); std::fflush(stdout); continue;
+                }
+                const auto main_state = unified_pool->session(0);
+                const auto r = unified_pool->begin(unified_ids[0], (uint64_t) n + requested_output,
+                                                   main_state.state == strata::core::KvResidency::evicted);
+                strata::core::kv_print_events(*unified_pool);
+                if (!r) {
+                    std::printf("ERR %s %s\n", strata::core::kv_code_name(r.code), r.message.c_str()); std::fflush(stdout);
+                    if (r.code == strata::core::KvCode::backend) return 1;
+                    continue;
+                }
+                if (!unified_ensure(0, (uint64_t) n + 64)) {
+                    std::printf("ERR %s\n", err.c_str()); std::fflush(stdout);
+                    strata::core::kv_require(unified_pool->end(unified_ids[0], 0));
+                    strata::core::kv_require(unified_pool->reset(unified_ids[0], unified_ids[0]));
+                    continue;
+                }
+                const auto now = unified_pool->session((uint32_t) logical);
+                std::printf("KVCACHE session=%zu generation=%llu epoch=%llu result=%s full_history=1\n", logical,
+                            (unsigned long long) now.id.generation, (unsigned long long) now.epoch,
+                            now.state == strata::core::KvResidency::evicted ? "miss" : "resident_or_new");
+            }
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
@@ -11963,7 +12126,7 @@ int main(int argc, char** argv) {
                     const bool idle_source = !sl.active && sl.cached;
                     // (an active slot only where the drafter's rows come along or are not drafted from: the copy
                     // takes the main layers' cells, so the main drafter would keep another conversation's below it)
-                    const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                    const bool active_source = !unified_pool && sl.active && !sl.tainted && slot_ckpt_move_env() &&
                                                (!use_mtp || batch_mtp || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
                     if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
@@ -12281,6 +12444,16 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                if (unified_pool) {
+                    if (req_kv_resume) {
+                        std::printf("ERR kv_cache_miss: requested prefix is no longer resident; replay full history\n");
+                        std::fflush(stdout); continue;
+                    }
+                    strata::core::kv_require(unified_pool->replay_started(unified_ids[0]));
+                    const auto i = unified_pool->session(0);
+                    std::printf("KVREPLAY session=0 generation=%llu epoch=%llu tokens=0\n",
+                                (unsigned long long) i.id.generation, (unsigned long long) i.epoch);
+                }
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
@@ -12823,7 +12996,7 @@ int main(int argc, char** argv) {
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    const bool can = !unified_pool && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;
@@ -14199,6 +14372,9 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                if (unified_pool && !unified_ensure(0, std::min<uint64_t>((uint64_t) unified_cells, (uint64_t) p + 64))) {
+                    std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1;
+                }
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -14233,11 +14409,21 @@ int main(int argc, char** argv) {
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                 }
-                const int T_mtp = T;
+                int T_mtp = T;
                 T += chain_n;
+                if (unified_pool) {
+                    // Do not commit accepted-but-unemitted speculative history
+                    // beyond this request's logical reservation.
+                    const int64_t left = max_new - produced_n + (merged ? merge_T - 1 : 0);
+                    T = (int) std::min<int64_t>(T, left);
+                    T_mtp = std::min(T_mtp, T); chain_n = T - T_mtp;
+                }
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
-                if (p + T > o.max_context) break;
+                if (p + T > o.max_context) {
+                    if (unified_pool) { std::printf("ERR kv_context_limit: speculative write exceeds context\n"); std::fflush(stdout); return 1; }
+                    break;
+                }
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
@@ -14441,6 +14627,7 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                if (unified_pool) strata::core::kv_require(unified_pool->progress(unified_ids[0], (uint64_t) p));
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -14620,6 +14807,7 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            auto print_done = [&] {
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",
                         (long long) produced_n,
@@ -14630,12 +14818,15 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            };
+            if (!unified_pool) print_done();
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                    if (unified_pool) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
                 }
@@ -14720,6 +14911,19 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
+                if (unified_pool) {
+                    if (cont) {
+                        const uint64_t tokens = bs[(size_t) admit_slot].ids.size();
+                        strata::core::kv_require(unified_pool->handoff(unified_ids[0], unified_ids[(size_t) admit_slot + 1], tokens));
+                        std::printf("KVMOVE from=0 session=%d generation=%llu epoch=%llu tokens=%llu\n", admit_slot + 1,
+                            (unsigned long long) unified_ids[(size_t) admit_slot + 1].generation,
+                            (unsigned long long) unified_pool->session((uint32_t) admit_slot + 1).epoch,
+                            (unsigned long long) tokens);
+                    } else {
+                        strata::core::kv_require(unified_pool->end(unified_ids[0], live.size()));
+                    }
+                    print_done();
+                }
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
@@ -14728,6 +14932,9 @@ int main(int argc, char** argv) {
                 adm_drain_ms = 0.0;
                 std::fflush(stdout);
                 admit_slot = -1;
+            } else if (unified_pool) {
+                strata::core::kv_require(unified_pool->end(unified_ids[0], live.size()));
+                print_done();
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
@@ -16001,4 +16208,13 @@ int main(int argc, char** argv) {
     cudaFree(sbuf);
     cudaFree(arena);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try { return strata_main(argc, argv); }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "strata: %s\n", error.what());
+        std::printf("ERR %s\n", error.what()); std::fflush(stdout);
+        return 1;
+    }
 }

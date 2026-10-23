@@ -239,6 +239,9 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    // Non-owning construction binding; the unified adapter owns every dynamic pool.
+    // Kept opaque here so other GPU backends do not depend on CUDA VMM headers.
+    void* kv_unified_owner = nullptr;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)

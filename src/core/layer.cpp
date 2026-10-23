@@ -1,6 +1,8 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/unified_kv_binding.hpp"
+#include "strata/core/unified_kv_vmm.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -721,7 +723,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (!unified_qsa_enabled && !(g_kv_elastic && p.mode == 0))   // dynamic pools have their own virtual ranges
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
@@ -757,7 +759,39 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    st.kv_unified_owner = nullptr;
+    if (unified_qsa_enabled) {
+        if (!unified_qsa_owner) throw std::runtime_error("unified QSA cache has no session owner");
+        st.kv_unified_owner = unified_qsa_owner;
+        // Each format retains its exact byte layout. Streamed/ring GPU slots
+        // commit as a fixed working set on first use; authoritative host pages
+        // grow with the sequence, and remain host memory on discrete GPUs too.
+        auto pools = [&](int64_t slots, bool host) {
+            const uint64_t r = (uint64_t) s.n_head_kv * s.page_size;
+            auto take = [&](uint64_t per_page) -> uint8_t* {
+                const bool fixed = !host && p.mode != 0;
+                return (uint8_t*) unified_qsa_owner->reserve({fixed ? per_page * (uint64_t) slots : per_page,
+                    fixed ? UINT64_MAX : (uint64_t) s.page_size, fixed ? 1 : (uint64_t) slots, 1, 0}, host);
+            };
+            strata::kernels::KvHostPools out;
+            if (st.kv_hybrid) {
+                out.k_q = (int8_t*) take(r * s.head_dim);
+                out.k_scale = (uint16_t*) take(r * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+                out.v_q4 = take(r * q4_row);
+            } else if (st.kv_q4) { out.k_q4 = take(r * q4_row); out.v_q4 = take(r * q4_row); }
+            else if (st.kv_int8) {
+                out.k_q = (int8_t*) take(r * s.head_dim); out.v_q = (int8_t*) take(r * s.head_dim);
+                out.k_scale = (uint16_t*) take(r * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+                out.v_scale = (uint16_t*) take(r * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+            } else { out.k_pool = (uint16_t*) take(r * s.head_dim * 2); out.v_pool = (uint16_t*) take(r * s.head_dim * 2); }
+            return out;
+        };
+        const auto gpu = pools(p.slots, false);
+        st.k_pool = gpu.k_pool; st.v_pool = gpu.v_pool;
+        st.k_q = gpu.k_q; st.v_q = gpu.v_q; st.k_scale = gpu.k_scale; st.v_scale = gpu.v_scale;
+        st.k_q4 = gpu.k_q4; st.v_q4 = gpu.v_q4;
+        st.host = p.mode != 0 ? pools(pages, true) : strata::kernels::KvHostPools{};
+    } else if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -847,8 +881,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
-    st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    if (!unified_qsa_enabled) st.host = strata::kernels::KvHostPools{};
+    if (p.mode != 0 && !unified_qsa_enabled) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
@@ -914,8 +948,14 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    if (st.kv_unified_owner) {
+        const auto* owner = static_cast<const UnifiedKvVmm*>(st.kv_unified_owner);
+        live_slots = owner->mapped_cells() == 0 ? 0 : st.kv_mode != 0 ? st.n_slots :
+            std::min<int64_t>(st.n_slots, (int64_t) kv_ceil(owner->mapped_cells(), (uint64_t) s.page_size));
+    }
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
+    if (rows != 0) {
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
@@ -932,6 +972,8 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
     }
+    }
+    if (st.kv_unified_owner) cudaMemsetAsync(st.idx_block_pos, 0, sizeof(int32_t), cs);
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
