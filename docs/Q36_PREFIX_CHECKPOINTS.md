@@ -23,7 +23,7 @@ Requires `--kv-pool-tokens` and `--serve` (or the developer regression below). D
 
 Creation is limited to fresh/restored multi-token prompt prefill, not decode, speculative windows or the existing full-state exact-prefix fast path. Checkpoints are at natural prompt chunk ends, with at least the requested token interval between rolling captures. With `--chunk 512 --kv-checkpoint-interval 1024`, the first anchor is at 1,024 tokens, even inside a long system message. A mismatch before the first anchor safely prefills from zero.
 
-The metadata must match the slot's current generation/epoch, live token prefix, position and physical VMM coverage. Active/faulted/evicted owners are not donors. Pool discard/reset/replay and ordinary slot replacement invalidate snapshots. Restoring an earlier prefix advances the validity epoch and drops later points. An explicit batch-slot admission may copy a matching idle donor's prefix and snapshots: the donor is pinned **before admission**, both physical copies are charged, and copies complete before publication. Exact whole-state copies invalidate the destination's previous checkpoint metadata.
+The metadata must match the slot's current generation/epoch, live token prefix, position and physical VMM coverage. Actively decoding, faulted, evicted and unrelated active owners are not donors. A restore may read the active lease held by its own exact donor pin (same pool, slot and generation), or its own admitted destination; discovery remains idle-only. Pool discard/reset/replay and ordinary slot replacement invalidate snapshots. Restoring an earlier prefix advances the validity epoch and drops later points. An explicit batch-slot admission may copy a matching idle donor's prefix and snapshots: the donor is pinned **before admission**, both physical copies are charged, and copies complete before publication. Exact whole-state copies invalidate the destination's previous checkpoint metadata.
 
 ## Explicit memory bound and retention
 
@@ -47,6 +47,7 @@ Snapshot buffers are fixed-state VMM ranges within their session's existing adap
 Actually run locally (x86_64, CUDA 12.6.85, SM87 target; **not Orin**):
 
 * New CPU CTest: token-prefix/suffix equivalence using a causal **toy** recurrence/conv/attention/MTP model; pinned-anchor retention, longest-point selection, rounded memory budgets, generation/epoch mismatch, real unified-pool reset/replay/eviction callbacks. Passed, including ASan/UBSan with a non-PIE executable.
+* CPU donor-lease regression uses the same eligibility function as the engine and real `UnifiedKvPool`/`KvIdlePin` with mock backing: idle → pin → destination admission → eligible restoration → release. Unrelated active owners, decoding, wrong pool/generation, stale epochs and missing backing remain excluded.
 * Worktree Qwen3.6 CUDA source compiled and linked against the unchanged previously built native/MMQ/core libraries. This is targeted compile/link validation, not a clean full build or GPU execution.
 * All 66 CUDA kernel text sections match the `feature/unified-kv` INT8 baseline, normalizing only anonymous-namespace source-path hashes. No compute kernels were added or changed.
 * Fixture generation dry-run with the byte tokenizer only. The real GGUF tokenizer/model are unavailable here.

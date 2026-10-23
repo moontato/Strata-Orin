@@ -95,6 +95,11 @@ public:
             if (!r) std::fprintf(stderr, "unified KV: source pin release failed: %s\n", r.message.c_str());
         }
     }
+    // Read-only lease witness. A pin for another pool, slot or generation
+    // cannot authorize an otherwise-active checkpoint donor.
+    bool holds(const UnifiedKvPool* pool, KvIdentity id) const {
+        return pool_ && pool_ == pool && id_.slot == id.slot && id_.generation == id.generation;
+    }
     KvIdlePin(const KvIdlePin&) = delete;
     KvIdlePin& operator=(const KvIdlePin&) = delete;
 };

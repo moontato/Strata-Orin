@@ -33,7 +33,80 @@ struct Adapter:KvAdapter {
     bool quiesce(std::string&) override {return true;}
     bool discard(std::string&) override {bytes=0;cp.clear();return true;}
 };
+static void donor_lease_regression() {
+    Adapter owners[4];UnifiedKvPool pool(8192,16384);KvIdentity ids[4];
+    for(int s=0;s<4;++s) ids[s]=pool.add(owners[s]);
+    for(int s:{0,2}) {
+        assert(pool.begin(ids[s],4096));
+        assert(pool.grow(ids[s],4096,[]{return UINT64_MAX;}));
+        const auto info=pool.session(s);
+        owners[s].cp.points={{1024,info.id.generation,info.epoch}};
+        assert(pool.end(ids[s],4096));
+    }
+    // Arrange real session metadata/mock backing, then call the SAME eligibility
+    // function as Engine::checkpoint_available. Do not copy its predicate here.
+    auto eligible=[&](int s,const KvIdlePin* pin=nullptr,const KvIdentity* destination=nullptr) {
+        const auto p=owners[s].cp.points[0];
+        return Q36PrefixCheckpoints::available(p,pool.session(s),4096,4096,false,false,
+            owners[s].committed_bytes()>=owners[s].bytes_for(p.pos),&pool,pin,destination);
+    };
+    assert(eligible(0));
+    const auto point=owners[0].cp.points[0];
+    assert(owners[0].cp.best(3200,8192,point.generation,point.epoch)==0);
+    assert(owners[0].cp.best(point.pos-1,8192,point.generation,point.epoch)<0);
+    assert(pool.begin(ids[2],4096)); // unrelated active owner, not a donor lease
+    assert(!eligible(2));
+    {
+        KvIdlePin pin(&pool,ids[0]);
+        assert(pool.session(0).state==KvResidency::active);
+        assert(!eligible(0)); // discovery must STILL reject active owners
+        assert(eligible(0,&pin));
+        assert(pool.begin(ids[1],8192,true)); // actual destination admission
+        assert(pool.grow(ids[1],4096,[]{return UINT64_MAX;}));
+        const auto destination=pool.session(1);
+        owners[1].cp.points={{1024,destination.id.generation,destination.epoch}};
+        assert(pool.session(0).state==KvResidency::active);
+        assert(eligible(0,&pin,&ids[1])); // restoration keeps its pinned donor
+        assert(!eligible(0,nullptr,&ids[1]));
+        assert(!eligible(2,&pin,&ids[1])); // not every active owner is authorized
+        assert(!eligible(1,&pin)); // donor pin cannot authorize another slot
+        assert(eligible(1,nullptr,&ids[1])); // same-slot admitted restoration
+
+        const auto owner=pool.session(0);
+        auto check=[&](Q36PrefixCheckpoints::Point p,KvSessionInfo info,uint64_t live,uint64_t pos,
+                       bool images,bool decoding,bool backed) {
+            return Q36PrefixCheckpoints::available(p,info,live,pos,images,decoding,backed,&pool,&pin,&ids[1]);
+        };
+        assert(!check(point,owner,4096,4096,false,true,true)); // decoding never allowed, even with pin
+        assert(!check(point,owner,4096,4096,true,false,true));
+        assert(!check(point,owner,4096,4096,false,false,false));
+        assert(!check(point,owner,point.pos-1,4096,false,false,true));
+        assert(!check(point,owner,4096,point.pos-1,false,false,true));
+        auto stale=point;++stale.generation;assert(!check(stale,owner,4096,4096,false,false,true));
+        stale=point;++stale.epoch;assert(!check(stale,owner,4096,4096,false,false,true));
+        auto different_generation=owner;++different_generation.id.generation;
+        stale=point;stale.generation=different_generation.id.generation;
+        assert(!check(stale,different_generation,4096,4096,false,false,true)); // pin's generation differs
+        for(auto state:{KvResidency::empty,KvResidency::evicted,KvResidency::faulted}) {
+            auto unavailable=owner;unavailable.state=state;
+            assert(!check(point,unavailable,4096,4096,false,false,true));
+        }
+        // A live pin with the SAME slot/generation in ANOTHER pool is not ours.
+        Adapter foreign_owner;UnifiedKvPool foreign_pool(8192,8192);
+        const auto foreign_id=foreign_pool.add(foreign_owner);
+        assert(foreign_id.slot==ids[0].slot && foreign_id.generation==ids[0].generation);
+        assert(foreign_pool.begin(foreign_id,4096));assert(foreign_pool.end(foreign_id,4096));
+        const KvIdlePin foreign_pin(&foreign_pool,foreign_id);
+        assert(!eligible(0,&foreign_pin,&ids[1]));
+    }
+    assert(pool.session(0).state==KvResidency::idle);
+    assert(pool.session(0).tokens==4096 && eligible(0)); // pin release retains original state
+    assert(pool.session(2).state==KvResidency::active && !eligible(2));
+    assert(pool.end(ids[1],4096));assert(pool.end(ids[2],4096));
+}
+
 int main() {
+    donor_lease_regression();
     constexpr uint64_t gran=2u<<20,payload=123u<<20,rounded=124u<<20;
     const KvPrefix snapshot{payload,UINT64_MAX,1,1,0};
     assert(snapshot.chunks(0,gran).empty());
@@ -92,5 +165,5 @@ int main() {
     assert(!owners[1].cp.points[0].pos);
     assert(pool.begin(ids[2],4096,true));assert(!owners[2].cp.points[0].pos);
     assert(pool.end(ids[2],0));
-    std::cout<<"Q36 checkpoint prefix/suffix equivalence (toy), retention, budgets, generations, replay and eviction passed\n";
+    std::cout<<"Q36 checkpoint donor leases, prefix/suffix equivalence (toy), retention, budgets, generations, replay and eviction passed\n";
 }

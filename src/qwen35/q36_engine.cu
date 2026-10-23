@@ -2857,15 +2857,14 @@ struct Engine {
         plane(ss.hlast,(size_t)g.n_embd);
         if(off*4!=checkpoint_payload) throw std::logic_error("checkpoint state layout mismatch");
     }
-    bool checkpoint_available(int s,int index,bool leased=false) const {
+    bool checkpoint_available(int s,int index,const strata::core::KvIdlePin* donor_pin=nullptr,
+                              const strata::core::KvIdentity* destination_lease=nullptr) const {
         const auto& ss=sess[(size_t)s];
-        if(index<0 || (size_t)index>=ss.checkpoints.points.size() || !ss.imgs.empty() || ss.active) return false;
+        if(index<0 || (size_t)index>=ss.checkpoints.points.size()) return false;
         const auto p=ss.checkpoints.points[(size_t)index];
         const auto owner=kv_pool->session((uint32_t)s);
-        return p.pos && p.pos<=ss.live.size() && p.pos<=(uint64_t)ss.pos &&
-               p.generation==owner.id.generation && p.epoch==owner.epoch &&
-               (owner.state==strata::core::KvResidency::idle || (leased && owner.state==strata::core::KvResidency::active)) &&
-               kv_adapters[(size_t)s]->covers(p.pos);
+        return strata::core::Q36PrefixCheckpoints::available(p,owner,ss.live.size(),(uint64_t)ss.pos,
+            !ss.imgs.empty(),ss.active,kv_adapters[(size_t)s]->covers(p.pos),kv_pool.get(),donor_pin,destination_lease);
     }
     int checkpoint_match(int s,const std::vector<int32_t>& ids) const {
         if(!checkpoint_count) return -1;
@@ -2886,8 +2885,9 @@ struct Engine {
         const auto owner=kv_pool->session((uint32_t)cur);
         ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
     }
-    bool checkpoint_restore(int src,int index,int dst) {
-        if(!checkpoint_available(src,index,src==dst)) return false;
+    bool checkpoint_restore(int src,int index,int dst,const strata::core::KvIdlePin* donor_pin) {
+        const auto* destination_lease=src==dst ? &kv_ids[(size_t)dst] : nullptr;
+        if(!checkpoint_available(src,index,donor_pin,destination_lease)) return false;
         const auto p=sess[(size_t)src].checkpoints.points[(size_t)index];
         auto& a=sess[(size_t)src];auto& b=sess[(size_t)dst];
         auto inherited=a.checkpoints.points;
@@ -3921,7 +3921,7 @@ struct Serve {
                 throw strata::core::KvFailure({strata::core::KvCode::cache_miss, "full-history replay required"});
             E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0 || (cp_src>=0 && cp_src!=s));
             if(cp_src>=0) {
-                restored=E.checkpoint_restore(cp_src,cp_index,s);
+                restored=E.checkpoint_restore(cp_src,cp_index,s,cp_pin.get());
                 if(!restored) { // stale/unavailable record: never shorten a live recurrent sequence
                     reuse=0;
                     strata::core::kv_require(E.kv_pool->replay_started(E.kv_ids[(size_t)s]));
