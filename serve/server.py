@@ -62,6 +62,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.unified_kv import KvStatus  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -802,6 +803,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self.unified_kv = KvStatus()      # native residency/events only; reset on engine restart
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -863,6 +865,7 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            self._kv_line(line)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -972,6 +975,22 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _kv_line(self, line):
+        status = getattr(self, "unified_kv", None)
+        if status is None:
+            return False
+        handled, session = status.consume(line)
+        if session is not None and hasattr(self, "slot_cv"):
+            offset = int(self.info.get("batch_session_offset", 0))
+            slot = session - offset
+            with self.slot_cv:
+                if 0 <= slot < len(self.slot_held):
+                    # This is only a scheduling hint. Never erase the caller's
+                    # conversation/history, nor release an active slot's ownership.
+                    self.slot_held[slot] = []
+                self.slot_cv.notify_all()
+        return handled
+
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
@@ -989,7 +1008,9 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
+            if self.proc is proc and self._kv_line(line):
+                continue
+            if line.startswith(("BT ", "BDONE ", "BERR ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -1358,6 +1379,8 @@ class StrataEngine:
                 return None
             if line is None:
                 return None
+            if line.startswith("BERR "):
+                raise ValueError(line.split(" ", 2)[-1].strip())
             if line.startswith("BDONE "):
                 return line
         return None
@@ -1392,6 +1415,9 @@ class StrataEngine:
                         tail.append(int(line.split()[2]))
                     except (IndexError, ValueError):
                         tail = []
+                if line.startswith("BERR "):
+                    tail = []
+                    break
                 if line.startswith("BDONE "):
                     if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                         tail = []
@@ -1772,6 +1798,10 @@ class StrataEngine:
                                                                                   embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
+                    elif line.startswith("BERR "):
+                        phase = "none"
+                        self.slot_held[slot] = []
+                        raise ValueError(line.split(" ", 2)[-1].strip())
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
@@ -3783,6 +3813,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        if getattr(self.engine, "unified_kv", None) is not None and engine.get("unified_kv"):
+            engine["kv_status"] = self.engine.unified_kv.snapshot()
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
