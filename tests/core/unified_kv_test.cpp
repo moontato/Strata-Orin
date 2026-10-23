@@ -1,5 +1,6 @@
 #include "strata/core/unified_kv.hpp"
 #include "strata/core/unified_kv_layout.hpp"
+#include "strata/core/unified_kv_protocol.hpp"
 #include <atomic>
 #include <cassert>
 #include <iostream>
@@ -123,6 +124,41 @@ int main() {
         for (auto& t : threads) t.join();
         assert(winners == 1 && pool.info().evictions == 0);
     }
+    {
+        // Flash-Next's workspace-to-slot migration: double physical backing is
+        // charged during the copy; tokens are never double-counted or dropped.
+        UnifiedKvPool pool(100, 100, 4096);
+        Adapter main, slot; const auto a = pool.add(main), b = pool.add(slot);
+        assert(pool.begin(a, 100)); assert(pool.grow(a, 50, unlimited));
+        assert(pool.begin(b, 0, true)); assert(pool.grow(b, 50, unlimited));
+        assert(pool.info().reserved_tokens == 100 && pool.info().committed_bytes == 1024);
+        assert(pool.handoff(a, b, 50));
+        assert(pool.info().reserved_tokens == 100 && pool.info().committed_bytes == 512);
+        assert(pool.session(a.slot).state == KvResidency::empty && !main.valid);
+        assert(pool.session(b.slot).state == KvResidency::active && slot.valid);
+        assert(pool.end(b, 50));
+        // A read/copy pins an idle donor until its asynchronous work is drained.
+        {
+            KvIdlePin pin(&pool, b);
+            assert(pool.begin(a, 51).code == KvCode::pool_full);
+        }
+        assert(pool.begin(a, 51)); // now the donor is eligible for LRU
+        assert(pool.session(b.slot).state == KvResidency::evicted);
+        assert(pool.end(a, 0));
+        const auto stale = a;
+        KvIdentity next;
+        assert(pool.reset(a, next));
+        assert(pool.begin(stale, 1).code == KvCode::stale);
+    }
+    {
+        for (const char* value : {"", "0", "-1", "+2", "123x", "18446744073709551616"}) {
+            bool rejected = false;
+            try { (void) kv_parse_limit(value, "--kv-pool-tokens"); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            assert(rejected);
+        }
+        assert(kv_parse_limit("500000", "--kv-pool-tokens") == 500000);
+    }
     // Layout/accounting oracle: every byte in every required head prefix must be
     // covered, and no granule counted twice at an unaligned head boundary.
     for (uint64_t gran : {64u, 128u, 2048u})
@@ -134,6 +170,20 @@ int main() {
             const auto c = p.chunks(cells, gran);
             assert(std::vector<uint64_t>(oracle.begin(), oracle.end()) == c);
         }
+    // QSA formats: quantization-independent ownership, format-specific physical
+    // arrays (FP16, INT8 + scales, Q4_0, K8V4). 2 heads, 256 dim, 64-cell pages.
+    const std::vector<std::vector<uint64_t>> per_cell = {{1024,1024}, {512,512,16,16}, {288,288}, {512,16,288}};
+    const uint64_t expected[] = {2048, 1056, 576, 816};
+    for (size_t fmt = 0; fmt < per_cell.size(); ++fmt) {
+        uint64_t raw = 0, physical = 0;
+        for (const auto bytes : per_cell[fmt]) {
+            raw += bytes;
+            KvPrefix p{bytes * 64, 64, 4096, 1, 0};
+            physical += p.chunks(250000, 2u << 20).size() * (2u << 20);
+        }
+        assert(raw == expected[fmt]);
+        assert(physical >= expected[fmt] * 250000);
+    }
     bool overflow = false;
     try { (void) kv_mul(UINT64_MAX, 2); } catch (const std::overflow_error&) { overflow = true; }
     assert(overflow);

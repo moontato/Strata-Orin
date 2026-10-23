@@ -83,29 +83,45 @@ VmmChunk vmm_chunk_new() {
     return (VmmChunk) h;
 }
 
-void vmm_chunk_free(VmmChunk h) {
-    if (h != 0 && api().ok) api().release((CUmemGenericAllocationHandle) h);
+bool vmm_chunk_release(VmmChunk h) {
+    return h == 0 || (api().ok && api().release((CUmemGenericAllocationHandle) h) == CUDA_SUCCESS);
 }
+void vmm_chunk_free(VmmChunk h) { (void) vmm_chunk_release(h); }
 
 bool VmmRange::reserve(uint64_t bytes) {
     release();
     const Api& a = api();
-    if (!a.ok || bytes == 0) return false;
+    if (base_ != 0 || !a.ok || bytes == 0 || bytes > UINT64_MAX - (a.gran - 1)) return false;
     const uint64_t n = (bytes + a.gran - 1) / a.gran;
     CUdeviceptr p = 0;
     if (a.reserve(&p, (size_t) (n * a.gran), 0, 0, 0) != CUDA_SUCCESS) return false;
     base_ = (unsigned long long) p;
     h_.assign((size_t) n, 0);
+    unreleased_.reserve((size_t) n);
     return true;
 }
 
 void VmmRange::release() {
     if (base_ == 0) return;
     const Api& a = api();
-    for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
-    a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * a.gran));
+    for (int64_t i = 0; i < chunks(); ++i) discard_handle(unmap(i));
+    // Failed unmapping is not permission to recycle a still-referenced address.
+    // Retain the reservation/handles; on a fatal driver failure prefer a leak.
+    if (!release_unmapped() || mapped_count() != 0) return;
+    if (a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * a.gran)) != CUDA_SUCCESS) return;
     base_ = 0;
     h_.clear();
+}
+
+void VmmRange::discard_handle(VmmChunk h) {
+    if (h && !vmm_chunk_release(h)) unreleased_.push_back(h);
+}
+bool VmmRange::release_unmapped() {
+    for (auto i = unreleased_.begin(); i != unreleased_.end();) {
+        if (!vmm_chunk_release(*i)) return false;
+        i = unreleased_.erase(i);
+    }
+    return true;
 }
 
 int64_t VmmRange::mapped_count() const {
@@ -136,7 +152,7 @@ bool VmmRange::set_access(int64_t lo, int64_t hi) {
 
 bool VmmRange::commit_run(int64_t lo, int64_t hi) {
     if (set_access(lo, hi)) return true;
-    for (int64_t c = lo; c < hi; ++c) vmm_chunk_free(unmap(c));
+    for (int64_t c = lo; c < hi; ++c) discard_handle(unmap(c));
     return false;
 }
 
@@ -158,8 +174,11 @@ bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
 void vmm_chunk_free(VmmChunk) {}
+bool vmm_chunk_release(VmmChunk h) { return h == 0; }
 bool VmmRange::reserve(uint64_t) { return false; }
 void VmmRange::release() {}
+void VmmRange::discard_handle(VmmChunk) {}
+bool VmmRange::release_unmapped() { return true; }
 int64_t VmmRange::mapped_count() const { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }

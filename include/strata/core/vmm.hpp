@@ -19,6 +19,8 @@ uint64_t vmm_granularity();
 /// A new physical chunk on the current device (0: out of memory), and its release.
 VmmChunk vmm_chunk_new();
 void vmm_chunk_free(VmmChunk h);
+/// Checked release for byte-authoritative owners (false: the handle is still owned).
+bool vmm_chunk_release(VmmChunk h);
 
 class VmmRange {
 public:
@@ -35,6 +37,9 @@ public:
     int64_t chunks() const { return (int64_t) h_.size(); }
     bool mapped(int64_t i) const { return i >= 0 && i < chunks() && h_[(std::size_t) i] != 0; }
     int64_t mapped_count() const;
+    int64_t physical_count() const { return mapped_count() + (int64_t) unreleased_.size(); }
+    /// Retry physical handles whose driver release failed (still charged to this range).
+    bool release_unmapped();
     /// Maps chunks [lo, hi) that are not mapped yet, each to `take()` or, when that returns 0, to a new chunk.
     /// Readable and writable when it returns; false: out of memory (what was mapped stays mapped).
     template <class Take> bool map_range(int64_t lo, int64_t hi, Take take);
@@ -42,6 +47,7 @@ public:
     VmmChunk unmap(int64_t i);
 
 private:
+    void discard_handle(VmmChunk h);
     bool map_one(int64_t i, VmmChunk h);
     bool set_access(int64_t lo, int64_t hi);
     /// Readable and writable [lo, hi) (all newly mapped); when that fails they are unmapped and freed again, so no
@@ -49,6 +55,7 @@ private:
     bool commit_run(int64_t lo, int64_t hi);
     unsigned long long base_ = 0;
     std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
+    std::vector<VmmChunk> unreleased_; // never lose ownership/accounting on a failed driver release
 };
 
 template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take) {
@@ -64,7 +71,7 @@ template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take
         VmmChunk h = take();
         if (h == 0) h = vmm_chunk_new();
         if (h == 0 || !map_one(i, h)) {
-            if (h != 0) vmm_chunk_free(h);
+            if (h != 0) discard_handle(h);
             if (run >= 0) commit_run(run, i);
             return false;
         }

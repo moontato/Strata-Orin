@@ -19,6 +19,8 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/unified_kv_vmm.hpp"
+#include "strata/core/unified_kv_protocol.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -1304,18 +1306,61 @@ struct Engine {
         }
     }
 
-    void alloc_session(Sess& ss) const {
+    std::unique_ptr<strata::core::UnifiedKvPool> kv_pool;
+    std::vector<std::unique_ptr<strata::core::UnifiedKvVmm>> kv_adapters;
+    std::vector<strata::core::KvIdentity> kv_ids;
+    std::vector<uint64_t> kv_required;
+    bool kv_protocol = false;
+
+    void kv_events() { if (kv_pool && kv_protocol) strata::core::kv_print_events(*kv_pool); }
+    void kv_begin(int s, uint64_t required, bool replay) {
+        if (!kv_pool) return;
+        const auto r = kv_pool->begin(kv_ids[(size_t) s], required, replay);
+        kv_events();
+        strata::core::kv_require(r);
+        kv_required[(size_t) s] = kv_pool->session((uint32_t) s).reserved_tokens;
+    }
+    void kv_ensure(int s, uint64_t cells) {
+        if (!kv_pool) return;
+        if (cells > kv_required[(size_t) s])
+            throw strata::core::KvFailure({strata::core::KvCode::context_limit, "write exceeds admitted logical capacity"});
+        if (kv_adapters[(size_t) s]->covers(cells)) return;
+        if (cells > (uint64_t) ctx) throw strata::core::KvFailure({strata::core::KvCode::context_limit, "KV write beyond context"});
+        const uint64_t target = std::min<uint64_t>((cells + 255) / 256 * 256, (uint64_t) ctx);
+        const auto r = kv_pool->grow(kv_ids[(size_t) s], target, [] { return strata::core::unified_kv_available(); });
+        kv_events();
+        strata::core::kv_require(r);
+    }
+    void kv_end(int s) {
+        if (!kv_pool) return;
+        strata::core::kv_require(kv_pool->end(kv_ids[(size_t) s], sess[(size_t) s].live.size()));
+        kv_required[(size_t) s] = 0;
+    }
+    void kv_progress(int s, uint64_t tokens) {
+        if (kv_pool) strata::core::kv_require(kv_pool->progress(kv_ids[(size_t) s], tokens));
+    }
+
+    void alloc_session(Sess& ss, int slot) {
         const auto& g = m->g;
+        strata::core::UnifiedKvVmm* adapter = kv_pool ? kv_adapters[(size_t) slot].get() : nullptr;
+        auto state = [&](size_t floats) -> float* {
+            return adapter ? (float*) adapter->reserve({floats * 4, UINT64_MAX, 1, 1, 0}) : dalloc(floats);
+        };
+        auto attention = [&]() -> float* {
+            return adapter ? (float*) adapter->reserve({(uint64_t) g.head_dim * 4, 1, (uint64_t) ctx,
+                                                       (uint64_t) g.n_head_kv, (uint64_t) ctx * g.head_dim * 4})
+                           : dalloc((size_t) g.n_head_kv * ctx * g.head_dim);
+        };
         const size_t C = (size_t) g.ssm_conv_channels;
         for (const Layer& L : m->layers) {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                ss.kc.push_back(attention());
+                ss.vc.push_back(attention());
             } else {
-                ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
-                ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
+                ss.conv.push_back(state(C * (g.ssm_d_conv - 1)));
+                ss.S.push_back(state((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
                 ss.kc.push_back(nullptr);
                 ss.vc.push_back(nullptr);
             }
@@ -1323,10 +1368,10 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            ss.kc.push_back(attention());
+            ss.vc.push_back(attention());
         }
-        ss.hlast = dalloc((size_t) g.n_embd);
+        ss.hlast = state((size_t) g.n_embd);
     }
 
     /// The current session: `i`'s state, cache and position become the engine's (conv / S / kc / vc / pos / hlast).
@@ -1353,9 +1398,14 @@ struct Engine {
         CK(cudaStreamSynchronize(st));   // (the pinned word is reused)
     }
 
-    void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
+    void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false,
+              uint64_t pool_tokens = 0, uint64_t pool_bytes = UINT64_MAX) {
         m = &model;
         ctx = ctx_;
+        if (pool_tokens) {
+            if (!strata::core::vmm_available()) throw std::runtime_error("unified KV requires CUDA VMM on the current device");
+            kv_pool = std::make_unique<strata::core::UnifiedKvPool>(ctx, pool_tokens, pool_bytes);
+        }
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
@@ -1466,7 +1516,7 @@ struct Engine {
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
-        {   // the sessions' caches: said before they fail (a slot's K / V at the context, fp32, for the attention layers and
+        if (!kv_pool) {   // the sessions' caches: said before they fail (a slot's K / V at the context, fp32, for the attention layers and
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
@@ -1485,7 +1535,39 @@ struct Engine {
                 std::exit(1);
             }
         }
-        for (Sess& ss : sess) alloc_session(ss);
+        if (kv_pool) {
+            kv_required.resize((size_t) n_sess, 0);
+            for (int s = 0; s < n_sess; ++s) {
+                auto a = std::make_unique<strata::core::UnifiedKvVmm>((uint64_t) ctx);
+                a->synchronize = [this](std::string& error) {
+                    const auto e = cudaStreamSynchronize(st);
+                    if (e == cudaSuccess) return true;
+                    error = cudaGetErrorString(e); return false;
+                };
+                a->invalidate = [this, s](std::string&) {
+                    Sess& ss = sess[(size_t) s];
+                    ss.live.clear(); ss.imgs.clear(); ss.pos = 0; ss.rdelta = 0;
+                    if (cur == s) pos = 0;
+                    // Every dependent device buffer belongs to this adapter and is
+                    // unmapped. Graphs and batch tables keep stable VA, not freed pointers.
+                    return true;
+                };
+                kv_ids.push_back(kv_pool->add(*a));
+                kv_adapters.push_back(std::move(a));
+            }
+        }
+        for (int s = 0; s < n_sess; ++s) alloc_session(sess[(size_t) s], s);
+        if (kv_pool) {
+            uint64_t attention_layers = m->has_mtp ? 1 : 0;
+            for (const auto& l : m->layers) attention_layers += l.attn;
+            const uint64_t per_token = (uint64_t) g.n_head_kv * g.head_dim * 8 * attention_layers;
+            std::fprintf(stderr, "Unified KV: enabled; model=Qwen3.6-35B-A3B slots=%d max_context=%d pool_tokens=%llu "
+                         "kv_bytes_per_token=%llu logical_kv_bytes=%llu committed_bytes=0 vmm_granularity=%llu "
+                         "(alignment/recurrent state charged separately; no eager pool commitment)\n",
+                         n_sess, ctx, (unsigned long long) pool_tokens, (unsigned long long) per_token,
+                         (unsigned long long) strata::core::kv_mul(pool_tokens, per_token),
+                         (unsigned long long) strata::core::vmm_granularity());
+        }
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
             std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
@@ -1528,6 +1610,10 @@ struct Engine {
 
     /// The recurrent state and the cache to a fresh sequence.
     void reset() {
+        if (kv_pool && !kv_adapters[(size_t) cur]->covers(1)) {
+            pos = 0; sess[(size_t) cur].pos = 0; set_delta(0);
+            return; // recurrence is zero-initialized when the first physical pages are committed
+        }
         const auto& g = m->g;
         for (size_t l = 0; l < conv.size(); ++l) {
             if (conv[l]) CK(cudaMemsetAsync(conv[l], 0, (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4, st));
@@ -2455,6 +2541,7 @@ struct Engine {
             }
         };
         if (n == 1) {
+            kv_ensure(cur, (uint64_t) pos + 1);
             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
             hpin[0] = toks[0];
             hpin[1] = (int32_t) pos;
@@ -2471,11 +2558,13 @@ struct Engine {
             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += 1;
             after_rows(1);
+            kv_progress(cur, (uint64_t) pos);
             on_chunk(1);
             return 1;
         }
         for (int64_t i = 0; i < n; i += tmax) {
             const int T = (int) std::min<int64_t>(tmax, n - i);
+            kv_ensure(cur, (uint64_t) pos + T);
             CK(cudaStreamSynchronize(st));
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
@@ -2494,6 +2583,7 @@ struct Engine {
             CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += T;
             CK(cudaStreamSynchronize(st));
+            kv_progress(cur, (uint64_t) pos);
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
@@ -2524,6 +2614,8 @@ struct Engine {
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
     /// row's logits in `logits`.  Without verify the sessions' positions advance by their rows.
     void run_rows(const Group* gr, int G, bool verify) {
+        for (int g = 0; g < G; ++g)
+            kv_ensure(gr[g].slot, (uint64_t) sess[(size_t) gr[g].slot].pos + gr[g].n);
         sess[(size_t) cur].pos = pos;
         CK(cudaStreamSynchronize(st));   // the pinned staging is free again
         int64_t pmax = 0;
@@ -2563,6 +2655,8 @@ struct Engine {
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
         pos = sess[(size_t) cur].pos;
+        if (!verify)
+            for (int g = 0; g < G; ++g) kv_progress(gr[g].slot, (uint64_t) sess[(size_t) gr[g].slot].pos);
         rows_G_last = G;
         if (m->hybrid) {
             count_rows(T);
@@ -2598,7 +2692,10 @@ struct Engine {
         });
         rows_mode = false;
         CK(cudaStreamSynchronize(st));
-        for (int i = 0; i < G; ++i) sess[(size_t) gr[i].slot].pos += keep[i];
+        for (int i = 0; i < G; ++i) {
+            sess[(size_t) gr[i].slot].pos += keep[i];
+            kv_progress(gr[i].slot, (uint64_t) sess[(size_t) gr[i].slot].pos);
+        }
         pos = sess[(size_t) cur].pos;
     }
 
@@ -2610,6 +2707,7 @@ struct Engine {
     float* logits_mr = nullptr;
     int32_t* pick_mr = nullptr;
     void mtp_rows(const MtpRow* rows, int T) {
+        for (int r = 0; r < T; ++r) kv_ensure(rows[r].slot, (uint64_t) rows[r].cell + 1);
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         if (!logits_mr) {
@@ -2706,6 +2804,7 @@ struct Engine {
                   const std::atomic<bool>* cancel = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        kv_ensure(cur, (uint64_t) pos + D + 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -2760,6 +2859,7 @@ struct Engine {
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
+        kv_progress(cur, (uint64_t) pos);
         return a;
     }
 
@@ -2771,8 +2871,9 @@ struct Engine {
     void warmup() {
         const auto t0 = Clock::now();
         warming = true;
+        kv_begin(0, ctx, true);
         const int32_t filler = 198;   // a newline: any token works
-        std::vector<int32_t> toks((size_t) tmax, filler);
+        std::vector<int32_t> toks((size_t) (kv_pool ? std::min(tmax, ctx / 2) : tmax), filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
         if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
@@ -2787,6 +2888,10 @@ struct Engine {
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_cpu_ms = 0;
         reset();
+        if (kv_pool) {
+            strata::core::kv_require(kv_pool->end(kv_ids[0], 0));
+            strata::core::kv_require(kv_pool->reset(kv_ids[0], kv_ids[0]));
+        }
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
     }
@@ -3199,12 +3304,14 @@ struct Serve {
     std::atomic<bool> stop{false};
     std::vector<Slot> slots;
     int n_active = 0;
+    std::vector<bool> kv_batch_lease;
     std::vector<float> lg;
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
 
-    explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
+    explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess), kv_batch_lease((size_t) e.n_sess, false) {
+        E.kv_protocol = true;
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
 
@@ -3243,7 +3350,8 @@ struct Serve {
         int nc = 0;
         for (int k = 0; k < S && nc < room; ++k) {
             const int i = (mtp_turn + k) % S;
-            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits()) { cand[(size_t) i] = 1; ++nc; }
+            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits() &&
+                (!E.kv_pool || E.sess[(size_t) act[(size_t) i]].pos + 2 <= E.ctx)) { cand[(size_t) i] = 1; ++nc; }
         }
         ++mtp_turn;
         // a candidate without a proposal gets its first one from the state its last row left
@@ -3365,13 +3473,33 @@ struct Serve {
     /// One decode window over every active slot: one token each.
     void window() {
         poll_control();
+        if (E.kv_pool) {
+            // Admission protects logical output space. Physical pressure is checked
+            // before any row of this window runs; a failed slot does not poison peers.
+            for (int s = 0; s < E.n_sess; ++s) if (slots[(size_t) s].active) {
+                try { E.kv_ensure(s, std::min<uint64_t>(E.kv_required[(size_t) s], (uint64_t) E.sess[(size_t) s].pos + 3)); }
+                catch (const strata::core::KvFailure& error) {
+                    if (error.code == strata::core::KvCode::backend) throw;
+                    std::printf("BERR %d %s\n", s, error.what());
+                    slots[(size_t) s].active = E.sess[(size_t) s].active = false;
+                    --n_active;
+                }
+            }
+        }
+        bool ran_mtp = false;
         if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that decodes greedily
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
                 if (sl.active) { ++act; greedy += !sl.smp.needs_logits(); }
-            if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); return; }
+            if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); ran_mtp = true; }
         }
-        window_plain();
+        if (!ran_mtp) window_plain();
+        if (E.kv_pool)
+            for (int s = 0; s < E.n_sess; ++s)
+                if (kv_batch_lease[(size_t) s] && !slots[(size_t) s].active) {
+                    E.kv_end(s);
+                    kv_batch_lease[(size_t) s] = false;
+                }
     }
 
     /// One token of every active slot, no proposals.
@@ -3443,6 +3571,22 @@ struct Serve {
     }
 
     void request(const std::string& line) {
+        try { request_body(line); }
+        catch (const strata::core::KvFailure& error) {
+            if (error.code == strata::core::KvCode::backend) throw;
+            // No successful DONE/length for an allocation failure. Only this
+            // admission's partially read state is invalidated; batch leases stay live.
+            if (E.kv_pool)
+                for (int s = 0; s < E.n_sess; ++s)
+                    if (!kv_batch_lease[(size_t) s] && E.kv_pool->session(s).state == strata::core::KvResidency::active) {
+                        strata::core::kv_require(E.kv_pool->end(E.kv_ids[(size_t) s], 0));
+                        strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t) s], E.kv_ids[(size_t) s]));
+                    }
+            std::printf("ERR %s\n", error.what());
+            std::fflush(stdout);
+        }
+    }
+    void request_body(const std::string& line) {
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
         if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
@@ -3465,6 +3609,8 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        uint64_t kv_generation = 0, kv_epoch = UINT64_MAX;
+        bool kv_resume = false;
         std::vector<uint64_t> img_keys;
         for (;;) {
             while (*p == ' ') ++p;
@@ -3484,6 +3630,9 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "kv_generation") kv_generation = std::strtoull(v, nullptr, 10);
+            else if (key == "kv_epoch") kv_epoch = std::strtoull(v, nullptr, 10);
+            else if (key == "kv_resume") kv_resume = std::string(v) == "1";
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -3532,8 +3681,24 @@ struct Serve {
         stop.store(false);
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
         const int s = adm ? slot : pick_session(ids, ir.imgs);
+        if (s < 0) {
+            std::printf("ERR kv_session_busy: all inference slots are active\n"); std::fflush(stdout); return;
+        }
         Engine::Sess& ss = E.sess[(size_t) s];
         size_t reuse = match_len(ss, ids, ir.imgs);
+        if (E.kv_pool) {
+            const auto before = E.kv_pool->session(s);
+            if (kv_generation && kv_generation != before.id.generation)
+                throw strata::core::KvFailure({strata::core::KvCode::stale, "use KVSTATUS before reusing a session"});
+            if (kv_resume && (!reuse || before.state == strata::core::KvResidency::evicted ||
+                              kv_epoch == UINT64_MAX || kv_epoch != before.epoch))
+                throw strata::core::KvFailure({strata::core::KvCode::cache_miss, "full-history replay required"});
+            E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0);
+            const auto now = E.kv_pool->session(s);
+            std::printf("KVCACHE session=%d generation=%llu epoch=%llu result=%s replay=%d\n", s,
+                        (unsigned long long) now.id.generation, (unsigned long long) now.epoch,
+                        reuse ? "hit" : before.state == strata::core::KvResidency::evicted ? "miss" : "new", reuse ? 0 : 1);
+        }
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
             int src = -1;
             size_t best = reuse;
@@ -3543,6 +3708,8 @@ struct Serve {
                 if (l > best) { best = l; src = i; }
             }
             if (src >= 0) {
+                const strata::core::KvIdlePin source_pin(E.kv_pool.get(), E.kv_pool ? E.kv_ids[(size_t) src] : strata::core::KvIdentity{});
+                E.kv_ensure(s, (uint64_t) E.sess[(size_t) src].pos);
                 E.copy_session(src, s);
                 reuse = best;
             }
@@ -3586,6 +3753,7 @@ struct Serve {
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
+            E.kv_end(s);
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) got);
             if (adm) std::printf("BADM %d 0\n", slot);
             std::fflush(stdout);
@@ -3627,7 +3795,10 @@ struct Serve {
                 sl.hist = hist;
                 sl.t0 = Clock::now();
                 ss.active = true;
+                kv_batch_lease[(size_t) slot] = bool(E.kv_pool);
                 ++n_active;
+            } else {
+                E.kv_end(s);
             }
             std::printf("BADM %d %d\n", slot, cont ? 1 : 0);
             std::fflush(stdout);
@@ -3654,8 +3825,9 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
-                offered += E.mtp_d;
+                const int D = E.kv_pool ? (int) std::min<int64_t>(E.mtp_d, max_new - produced) : E.mtp_d;
+                const int a = E.spec_step(nx, fix, D, drafts, picks, &stop);
+                offered += D;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
@@ -3680,6 +3852,7 @@ struct Serve {
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
+        E.kv_end(s);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
@@ -3690,6 +3863,10 @@ struct Serve {
     }
 
     int run() {
+        if (E.kv_pool) {
+            std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=0\n");
+            strata::core::kv_print_status(*E.kv_pool, E.n_sess);
+        }
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
@@ -3723,7 +3900,9 @@ struct Serve {
             }
             if (!have) { window(); continue; }
             if (line.empty()) continue;
-            if (line.rfind("BSTOP ", 0) == 0) {
+            if (E.kv_pool && strata::core::kv_control(*E.kv_pool, E.kv_ids, line)) {
+                // Explicit residency/reset controls, serialized with inference.
+            } else if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
                 if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
             } else if (line.rfind("BYIELD", 0) == 0) {
@@ -3746,13 +3925,14 @@ int serve(Engine& E) {
 
 }  // namespace
 
-int strata::qwen35::run(int argc, char** argv) {
+static int q36_run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
+    uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -3788,6 +3968,8 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
+        else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
+        else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -3804,7 +3986,8 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
-                         "--bench-tg N)\n");
+                         "--bench-tg N)\n"
+                         "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --mtp 2 --batch-mtp]\n");
             return 2;
         }
     }
@@ -3820,6 +4003,10 @@ int strata::qwen35::run(int argc, char** argv) {
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
+    if (kv_pool_tokens && (batch < 0 || batch > Engine::kVerify))
+        throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
+    if (!kv_pool_tokens && kv_pool_bytes != UINT64_MAX)
+        throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
     Model m;
     std::string err;
     try {
@@ -3856,7 +4043,7 @@ int strata::qwen35::run(int argc, char** argv) {
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
             const int ns = std::max(1, batch);
             const double kv_one = 45056.0, kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
-            const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
+            const double sess_extra = std::max(0.0, (double) ctx * (kv_one * (kv_pool_tokens ? 0 : ns) + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
                 if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
@@ -3874,7 +4061,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (raw %.2f, with %.2f packed), main experts %.2f GiB, chunk %d\n",
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
-    E.init(m, ctx, chunk, batch, vision);
+    E.init(m, ctx, chunk, batch, vision, kv_pool_tokens, kv_pool_bytes);
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
@@ -3901,6 +4088,7 @@ int strata::qwen35::run(int argc, char** argv) {
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
+    E.kv_begin(0, std::min<uint64_t>(ctx, kv_pool_tokens ? kv_pool_tokens : (uint64_t) ctx), false);
     if (bench_pp > 0 || bench_tg > 0) {
         // llama-bench's shapes: a prompt of bench_pp tokens from a fresh state, then bench_tg tokens one at a time
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
@@ -3990,4 +4178,14 @@ int strata::qwen35::run(int argc, char** argv) {
                  prompt.size(), pp_ms, prompt.size() / (pp_ms / 1000.0), gen.size(), ms_since(t1),
                  gen.size() / (ms_since(t1) / 1000.0));
     return 0;
+}
+
+int strata::qwen35::run(int argc, char** argv) {
+    try { return q36_run(argc, argv); }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "strata-q36: %s\n", error.what());
+        std::printf("ERR %s\n", error.what());
+        std::fflush(stdout);
+        return 1;
+    }
 }

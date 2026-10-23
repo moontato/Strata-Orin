@@ -3,6 +3,7 @@
 // adapters must be synchronous, transactional on failure, and must not re-enter it.
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -51,6 +52,7 @@ public:
     // speculative cells past the logical end). No allocations or GPU work here.
     virtual uint64_t bytes_for(uint64_t cells) const = 0;
     virtual uint64_t committed_bytes() const = 0;
+    virtual bool faulted() const { return false; }
     virtual bool grow(uint64_t cells, std::string& error) = 0;
     // All device work, graphs, draft streams and asynchronous manipulation complete.
     virtual bool quiesce(std::string& error) = 0;
@@ -66,18 +68,18 @@ struct KvSessionInfo {
 struct KvEviction {
     uint64_t sequence = 0;
     KvIdentity id;
-    uint64_t epoch = 0, tokens = 0, reclaimed_bytes = 0;
+    uint64_t epoch = 0, tokens = 0, reclaimed_bytes = 0, latency_us = 0;
 };
 struct KvPoolInfo {
     uint64_t token_limit = 0, byte_limit = 0, resident_tokens = 0, reserved_tokens = 0;
-    uint64_t committed_bytes = 0, evictions = 0, reclaimed_bytes = 0;
+    uint64_t committed_bytes = 0, evictions = 0, reclaimed_bytes = 0, eviction_us = 0;
 };
 
 class UnifiedKvPool {
     struct Entry { KvSessionInfo info; KvAdapter* adapter = nullptr; };
     mutable std::mutex mutex_;
     std::vector<Entry> sessions_;
-    uint64_t token_limit_, byte_limit_, context_, clock_ = 0, evictions_ = 0, reclaimed_ = 0;
+    uint64_t token_limit_, byte_limit_, context_, clock_ = 0, evictions_ = 0, reclaimed_ = 0, eviction_us_ = 0;
     std::vector<KvEviction> events_;  // drained by the scheduler; no callbacks into user code
 
     Entry* find(KvIdentity id) {
@@ -106,6 +108,7 @@ class UnifiedKvPool {
             if (!victim || s.info.last_use < victim->info.last_use) victim = &s;
         }
         if (!victim) return {KvCode::pool_full, "no eligible idle session; active caches are protected"};
+        const auto started = std::chrono::steady_clock::now();
         std::string error;
         if (!victim->adapter->quiesce(error)) {
             victim->info.state = KvResidency::faulted;
@@ -121,8 +124,9 @@ class UnifiedKvPool {
         // Bounded, preallocated delivery queue. Sequence gaps are observable if a
         // caller neglects to drain it; totals remain authoritative.
         if (events_.size() == 256) events_.erase(events_.begin());
-        events_.push_back({++evictions_, i.id, i.epoch, i.tokens, before});
-        reclaimed_ += before;
+        const auto us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+        events_.push_back({++evictions_, i.id, i.epoch, i.tokens, before, us});
+        reclaimed_ += before; eviction_us_ += us;
         i.state = KvResidency::evicted;
         i.reserved_tokens = i.tokens = i.bytes = 0;
         return {};
@@ -192,7 +196,7 @@ public:
             const uint64_t held = bytes();
             if (held <= byte_limit_ - extra && available() >= extra) {
                 std::string error;
-                if (!e->adapter->quiesce(error)) return {KvCode::backend, error};
+                if (!e->adapter->quiesce(error)) { e->info.state = KvResidency::faulted; return {KvCode::backend, error}; }
                 if (e->adapter->grow(cells, error)) {
                     e->info.bytes = e->adapter->committed_bytes();
                     if (e->info.bytes != target) {
@@ -202,7 +206,7 @@ public:
                     return {};
                 }
                 // Transactional adapter: old contents and accounting survive OOM.
-                if (e->adapter->committed_bytes() != old) {
+                if (e->adapter->faulted() || e->adapter->committed_bytes() != old) {
                     e->info.state = KvResidency::faulted;
                     return {KvCode::backend, "adapter growth was not transactional: " + error};
                 }
@@ -210,6 +214,27 @@ public:
             const auto r = evict_one(id.slot);
             if (!r) return r; // explicit failure, never length/truncation
         }
+    }
+    // The backend is about to zero/replay a different full history in-place.
+    // Retain physical capacity, but change the validity epoch before writing it.
+    KvResult replay_started(KvIdentity id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry* e = find(id);
+        if (!e) return {KvCode::stale, "session generation changed"};
+        if (e->info.state != KvResidency::active) return {KvCode::busy, "replay requires an active lease"};
+        std::string error;
+        if (!e->adapter->quiesce(error)) { e->info.state = KvResidency::faulted; return {KvCode::backend, error}; }
+        ++e->info.epoch; e->info.tokens = 0; e->info.last_use = ++clock_;
+        return {};
+    }
+    KvResult progress(KvIdentity id, uint64_t live_tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry* e = find(id);
+        if (!e) return {KvCode::stale, "session generation changed"};
+        if (e->info.state != KvResidency::active) return {KvCode::busy, "progress requires an active lease"};
+        if (live_tokens > e->info.reserved_tokens) return {KvCode::context_limit, "unreserved logical KV tokens"};
+        e->info.tokens = live_tokens; e->info.last_use = ++clock_;
+        return {};
     }
     KvResult end(KvIdentity id, uint64_t live_tokens) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -224,6 +249,29 @@ public:
         i.tokens = i.reserved_tokens = live_tokens;
         i.bytes = e->adapter->committed_bytes();
         i.last_use = ++clock_; // actual completed use, not allocation order
+        return {};
+    }
+    // Existing Flash-Next admission copies a main workspace into a batch slot.
+    // Both physical copies are charged, but the logical conversation is counted
+    // once. The destination must be leased with a zero-token reservation.
+    KvResult handoff(KvIdentity from, KvIdentity to, uint64_t live_tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry* a = find(from); Entry* b = find(to);
+        if (!a || !b) return {KvCode::stale, "handoff generation changed"};
+        if (from.slot == to.slot || a->info.state != KvResidency::active || b->info.state != KvResidency::active ||
+            b->info.reserved_tokens != 0) return {KvCode::busy, "handoff requires a source and empty leased destination"};
+        if (live_tokens > a->info.reserved_tokens) return {KvCode::context_limit, "handoff exceeds reservation"};
+        std::string error;
+        if (!a->adapter->quiesce(error) || !b->adapter->quiesce(error)) return {KvCode::backend, error};
+        if (!a->adapter->discard(error) || a->adapter->committed_bytes()) {
+            a->info.state = KvResidency::faulted;
+            return {KvCode::backend, "handoff could not release workspace: " + error};
+        }
+        b->info.reserved_tokens = a->info.reserved_tokens;
+        b->info.tokens = live_tokens; b->info.bytes = b->adapter->committed_bytes();
+        b->info.last_use = ++clock_;
+        a->info.tokens = a->info.reserved_tokens = a->info.bytes = 0;
+        a->info.state = KvResidency::empty; ++a->info.epoch;
         return {};
     }
     KvResult reset(KvIdentity id, KvIdentity& next) {
@@ -249,7 +297,7 @@ public:
         KvPoolInfo i; i.token_limit = token_limit_; i.byte_limit = byte_limit_;
         i.committed_bytes = bytes(); i.reserved_tokens = tokens();
         for (const auto& s : sessions_) i.resident_tokens += s.info.tokens;
-        i.evictions = evictions_; i.reclaimed_bytes = reclaimed_;
+        i.evictions = evictions_; i.reclaimed_bytes = reclaimed_; i.eviction_us = eviction_us_;
         return i;
     }
     std::vector<KvEviction> drain_events() {
