@@ -1327,9 +1327,14 @@ struct Engine {
         if (kv_adapters[(size_t) s]->covers(cells)) return;
         if (cells > (uint64_t) ctx) throw strata::core::KvFailure({strata::core::KvCode::context_limit, "KV write beyond context"});
         const uint64_t target = std::min<uint64_t>((cells + 255) / 256 * 256, (uint64_t) ctx);
+        const auto before = kv_adapters[(size_t) s]->committed_bytes();
+        const auto started = Clock::now();
         const auto r = kv_pool->grow(kv_ids[(size_t) s], target, [] { return strata::core::unified_kv_available(); });
+        const auto us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count();
         kv_events();
         strata::core::kv_require(r);
+        if (kv_protocol && kv_adapters[(size_t) s]->committed_bytes() != before)
+            strata::core::kv_print_commit(*kv_pool, kv_ids[(size_t) s], target, us);
     }
     void kv_end(int s) {
         if (!kv_pool) return;
@@ -2871,9 +2876,16 @@ struct Engine {
     void warmup() {
         const auto t0 = Clock::now();
         warming = true;
-        kv_begin(0, ctx, true);
         const int32_t filler = 198;   // a newline: any token works
         std::vector<int32_t> toks((size_t) (kv_pool ? std::min(tmax, ctx / 2) : tmax), filler);
+        const uint64_t warm_cells = toks.size() + (tmax > kGemmT + 1 ? kGemmT + 1 : 0) + 1 + (mtp_d > 0 ? mtp_d + 1 : 0);
+        if (kv_pool && warm_cells > kv_pool->info().token_limit) {
+            warming = false;
+            std::fprintf(stderr, "strata-q36: warmup deferred: its temporary sequence exceeds the shared token ceiling; "
+                                 "graphs and kernels initialize on first request\n");
+            return;
+        }
+        kv_begin(0, warm_cells, true);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
         if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
@@ -3562,10 +3574,16 @@ struct Serve {
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
             if (ss.active) continue;
+            if (E.kv_pool) {
+                const auto state = E.kv_pool->session((uint32_t) i).state;
+                if (state == strata::core::KvResidency::active || state == strata::core::KvResidency::faulted) continue;
+            }
             const size_t l = match_len(ss, ids, imgs);
             if (l > bl) { bl = l; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
-            if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
+            if (lru < 0 || (E.kv_pool
+                ? E.kv_pool->session((uint32_t) i).last_use < E.kv_pool->session((uint32_t) lru).last_use
+                : ss.used < E.sess[(size_t) lru].used)) lru = i;
         }
         return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
     }
@@ -3581,6 +3599,10 @@ struct Serve {
                     if (!kv_batch_lease[(size_t) s] && E.kv_pool->session(s).state == strata::core::KvResidency::active) {
                         strata::core::kv_require(E.kv_pool->end(E.kv_ids[(size_t) s], 0));
                         strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t) s], E.kv_ids[(size_t) s]));
+                        E.kv_required[(size_t) s] = 0;
+                        const auto i = E.kv_pool->session((uint32_t) s);
+                        std::printf("KVINVALIDATE session=%d generation=%llu epoch=%llu reason=request_error\n", s,
+                                    (unsigned long long) i.id.generation, (unsigned long long) i.epoch);
                     }
             std::printf("ERR %s\n", error.what());
             std::fflush(stdout);
@@ -3665,7 +3687,7 @@ struct Serve {
             std::fflush(stdout);
             return;
         }
-        if ((int64_t) ids.size() + max_new > E.ctx) {
+        if (ids.size() > (uint64_t) E.ctx || (uint64_t) max_new > (uint64_t) E.ctx - ids.size()) {
             std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%d)\n", ids.size(), max_new, E.ctx);
             std::fflush(stdout);
             return;
@@ -3690,13 +3712,14 @@ struct Serve {
             const auto before = E.kv_pool->session(s);
             if (kv_generation && kv_generation != before.id.generation)
                 throw strata::core::KvFailure({strata::core::KvCode::stale, "use KVSTATUS before reusing a session"});
-            if (kv_resume && (!reuse || before.state == strata::core::KvResidency::evicted ||
+            if (kv_resume && (!kv_generation || !reuse || before.state == strata::core::KvResidency::evicted ||
                               kv_epoch == UINT64_MAX || kv_epoch != before.epoch))
                 throw strata::core::KvFailure({strata::core::KvCode::cache_miss, "full-history replay required"});
             E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0);
             const auto now = E.kv_pool->session(s);
-            std::printf("KVCACHE session=%d generation=%llu epoch=%llu result=%s replay=%d\n", s,
-                        (unsigned long long) now.id.generation, (unsigned long long) now.epoch,
+            std::printf("KVCACHE session=%d generation=%llu epoch=%llu state=%s tokens=%llu bytes=%llu reserved_tokens=%llu result=%s replay=%d\n", s,
+                        (unsigned long long) now.id.generation, (unsigned long long) now.epoch, strata::core::kv_residency_name(now.state),
+                        (unsigned long long) now.tokens, (unsigned long long) now.bytes, (unsigned long long) now.reserved_tokens,
                         reuse ? "hit" : before.state == strata::core::KvResidency::evicted ? "miss" : "new", reuse ? 0 : 1);
         }
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
@@ -3865,7 +3888,7 @@ struct Serve {
     int run() {
         if (E.kv_pool) {
             std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=0\n");
-            strata::core::kv_print_status(*E.kv_pool, E.n_sess);
+            strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
         }
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
         std::printf("READY %d stop\n", E.ctx);
@@ -3900,7 +3923,7 @@ struct Serve {
             }
             if (!have) { window(); continue; }
             if (line.empty()) continue;
-            if (E.kv_pool && strata::core::kv_control(*E.kv_pool, E.kv_ids, line)) {
+            if (E.kv_pool && strata::core::kv_control(*E.kv_pool, E.kv_ids, line, [] { return strata::core::unified_kv_available(); })) {
                 // Explicit residency/reset controls, serialized with inference.
             } else if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);

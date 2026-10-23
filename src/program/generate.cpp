@@ -3749,8 +3749,13 @@ static int strata_main(int argc, char** argv) {
         if (!unified_pool || unified_adapters.at(s)->covers(cells)) return true;
         if (cells > (uint64_t) unified_cells) { err = "kv_context_limit: write beyond physical cache extent"; return false; }
         const uint64_t target = std::min<uint64_t>((cells + 255) / 256 * 256, (uint64_t) unified_cells);
+        const auto before = unified_adapters.at(s)->committed_bytes();
+        const auto started = Clock::now();
         const auto r = unified_pool->grow(unified_ids.at(s), target, [] { return strata::core::unified_kv_available(); });
+        const auto us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count();
         strata::core::kv_print_events(*unified_pool);
+        if (r && unified_adapters.at(s)->committed_bytes() != before)
+            strata::core::kv_print_commit(*unified_pool, unified_ids.at(s), target, us);
         if (!r) err = std::string(strata::core::kv_code_name(r.code)) + ": " + r.message;
         return bool(r);
     };
@@ -4977,6 +4982,11 @@ static int strata_main(int argc, char** argv) {
             std::fprintf(stderr, "--kv-pool-mib requires --kv-pool-tokens\n"); return 2;
         }
         if (o.kv_pool_tokens) {
+            if (o.native_flash_attn_short) {
+                std::fprintf(stderr, "unified KV: --native-flash-attn-short has a 256-cell diagnostic contract; "
+                                     "use the original allocator for this diagnostic (unified QSA adds speculative padding)\n");
+                return 2;
+            }
             if (!o.serve || multi_gpu || split_same || o.batch < 0 || o.batch == 1 || o.batch > 8 ||
                 o.kv_grow || o.vram_elastic || o.peer_device >= 0 || !strata::core::vmm_available()) {
                 std::fprintf(stderr, "unified KV requires --serve, one CUDA VMM device, --batch 0 or 2..8; "
@@ -10627,7 +10637,7 @@ static int strata_main(int argc, char** argv) {
         if (unified_pool) {
             std::printf("INFO unified_kv=1 kv_protocol=1 batch_session_offset=1 fixed_session_bytes=%llu\n",
                         (unsigned long long) unified_fixed_bytes);
-            strata::core::kv_print_status(*unified_pool, (unsigned) unified_ids.size());
+            strata::core::kv_print_status(*unified_pool, (unsigned) unified_ids.size(), strata::core::unified_kv_available());
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -11426,9 +11436,9 @@ static int strata_main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
-            if (unified_pool && strata::core::kv_control(*unified_pool, unified_ids, line)) continue;
+            if (unified_pool && strata::core::kv_control(*unified_pool, unified_ids, line, [] { return strata::core::unified_kv_available(); })) continue;
             if (unified_pool && (line.rfind("SAVE", 0) == 0 || line.rfind("RESTORE", 0) == 0)) {
-                std::printf("ERR kv_unsupported: disk KV operations are not part of unified KV; replay full history\n");
+                std::printf("SERR invalid 0 kv_unsupported: disk KV operations are not part of unified KV; replay full history\n");
                 std::fflush(stdout); continue;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -11965,7 +11975,7 @@ static int strata_main(int argc, char** argv) {
                 if (req_kv_generation && req_kv_generation != before.id.generation) {
                     std::printf("ERR kv_stale_generation: query KVSTATUS\n"); std::fflush(stdout); continue;
                 }
-                if (req_kv_resume && (req_kv_epoch == UINT64_MAX || req_kv_epoch != before.epoch ||
+                if (req_kv_resume && (!req_kv_generation || req_kv_epoch == UINT64_MAX || req_kv_epoch != before.epoch ||
                     before.state == strata::core::KvResidency::empty || before.state == strata::core::KvResidency::evicted)) {
                     std::printf("ERR kv_cache_miss: full-history replay required\n"); std::fflush(stdout); continue;
                 }
@@ -11985,8 +11995,9 @@ static int strata_main(int argc, char** argv) {
                     continue;
                 }
                 const auto now = unified_pool->session((uint32_t) logical);
-                std::printf("KVCACHE session=%zu generation=%llu epoch=%llu result=%s full_history=1\n", logical,
-                            (unsigned long long) now.id.generation, (unsigned long long) now.epoch,
+                std::printf("KVCACHE session=%zu generation=%llu epoch=%llu state=%s tokens=%llu bytes=%llu reserved_tokens=%llu result=%s full_history=1\n", logical,
+                            (unsigned long long) now.id.generation, (unsigned long long) now.epoch, strata::core::kv_residency_name(now.state),
+                            (unsigned long long) now.tokens, (unsigned long long) now.bytes, (unsigned long long) now.reserved_tokens,
                             now.state == strata::core::KvResidency::evicted ? "miss" : "resident_or_new");
             }
             std::array<int64_t, 3> remote_before{};
@@ -12451,8 +12462,9 @@ static int strata_main(int argc, char** argv) {
                     }
                     strata::core::kv_require(unified_pool->replay_started(unified_ids[0]));
                     const auto i = unified_pool->session(0);
-                    std::printf("KVREPLAY session=0 generation=%llu epoch=%llu tokens=0\n",
-                                (unsigned long long) i.id.generation, (unsigned long long) i.epoch);
+                    std::printf("KVREPLAY session=0 generation=%llu epoch=%llu tokens=0 bytes=%llu reserved_tokens=%llu\n",
+                                (unsigned long long) i.id.generation, (unsigned long long) i.epoch,
+                                (unsigned long long) i.bytes, (unsigned long long) i.reserved_tokens);
                 }
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);

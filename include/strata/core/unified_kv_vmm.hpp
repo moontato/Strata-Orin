@@ -68,6 +68,7 @@ public:
         for (const auto& b : buffers_) chunks = kv_add(chunks, b->layout.chunks(cells, vmm_granularity()).size());
         return kv_mul(chunks, vmm_granularity());
     }
+    void cover(uint64_t cells) override { cells_ = std::max(cells_, cells); }
     bool faulted() const override { return faulted_; }
     uint64_t committed_bytes() const override {
         uint64_t chunks = 0;
@@ -89,10 +90,14 @@ public:
         for (auto& b : buffers_)
             for (const uint64_t c : b->layout.chunks(cells, gran))
                 if (!b->mapped((int64_t) c)) fresh.push_back({b.get(), (int64_t) c});
+        if (fresh.empty()) { cover(cells); return true; }
         bool ok = true;
         for (const auto& f : fresh) {
             if (mapping_test_hook && !mapping_test_hook()) { error = "injected physical mapping failure"; ok = false; break; }
-            if (!f.b->map(f.chunk)) { ok = false; break; }
+            if (!f.b->map(f.chunk)) {
+                if (f.b->host) error = f.b->host->error();
+                ok = false; break;
+            }
             const auto e = cudaMemset(f.b->base() + (uint64_t) f.chunk * gran, 0, (size_t) gran);
             if (e != cudaSuccess) { error = cudaGetErrorString(e); ok = false; break; }
         }

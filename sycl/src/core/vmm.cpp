@@ -12,12 +12,15 @@ bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
 void vmm_chunk_free(VmmChunk) {}
+bool vmm_chunk_release(VmmChunk h) { return h == 0; }
 
 bool VmmRange::reserve(uint64_t) { return false; }
 void VmmRange::release() {
     h_.clear();
     base_ = 0;
 }
+void VmmRange::discard_handle(VmmChunk) {}
+bool VmmRange::release_unmapped() { return true; }
 int64_t VmmRange::mapped_count() const { return 0; }
 VmmChunk VmmRange::unmap(int64_t) { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }

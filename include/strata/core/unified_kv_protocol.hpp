@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <sstream>
+#include <functional>
 
 namespace strata::core {
 struct KvFailure : std::runtime_error {
@@ -15,7 +16,7 @@ inline void kv_require(const KvResult& r) { if (!r) throw KvFailure(r); }
 inline uint64_t kv_parse_limit(const std::string& s, const char* flag) {
     char* end = nullptr; errno = 0;
     const auto n = std::strtoull(s.c_str(), &end, 10);
-    if (s.empty() || s[0] == '-' || s[0] == '+' || *end || errno || !n)
+    if (s.empty() || !std::all_of(s.begin(), s.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }) || *end || errno || !n)
         throw std::invalid_argument(std::string(flag) + " requires a positive integer");
     return n;
 }
@@ -27,7 +28,16 @@ inline void kv_print_events(UnifiedKvPool& pool) {
                     (unsigned long long) e.latency_us);
     std::fflush(stdout);
 }
-inline void kv_print_status(UnifiedKvPool& pool, unsigned slots) {
+inline void kv_print_commit(UnifiedKvPool& pool, KvIdentity id, uint64_t cells, uint64_t latency_us) {
+    const auto i = pool.session(id.slot);
+    const auto p = pool.info();
+    std::printf("KVCOMMIT session=%u generation=%llu epoch=%llu cells=%llu bytes=%llu pool_bytes=%llu latency_us=%llu\n",
+                id.slot, (unsigned long long) id.generation, (unsigned long long) i.epoch,
+                (unsigned long long) cells, (unsigned long long) i.bytes, (unsigned long long) p.committed_bytes,
+                (unsigned long long) latency_us);
+    std::fflush(stdout);
+}
+inline void kv_print_status(UnifiedKvPool& pool, unsigned slots, uint64_t available = UINT64_MAX) {
     const auto p = pool.info();
     std::printf("KVPOOL enabled=1 token_limit=%llu byte_limit=%llu committed_bytes=%llu resident_tokens=%llu "
                 "reserved_tokens=%llu evictions=%llu reclaimed_bytes=%llu available_tokens=%llu eviction_us=%llu\n",
@@ -36,6 +46,10 @@ inline void kv_print_status(UnifiedKvPool& pool, unsigned slots) {
                 (unsigned long long) p.reserved_tokens, (unsigned long long) p.evictions,
                 (unsigned long long) p.reclaimed_bytes, (unsigned long long) (p.token_limit - p.reserved_tokens),
                 (unsigned long long) p.eviction_us);
+    if (available != UINT64_MAX)
+        std::printf("KVMEM physical_available_after_headroom=%llu admissible_bytes=%llu\n",
+                    (unsigned long long) available,
+                    (unsigned long long) std::min(available, p.byte_limit > p.committed_bytes ? p.byte_limit - p.committed_bytes : 0));
     for (unsigned s = 0; s < slots; ++s) {
         const auto i = pool.session(s);
         std::printf("KVSESSION session=%u generation=%llu epoch=%llu state=%s tokens=%llu reserved_tokens=%llu bytes=%llu\n",
@@ -85,8 +99,9 @@ public:
     KvIdlePin& operator=(const KvIdlePin&) = delete;
 };
 // Only the engine worker calls controls, at a safe scheduling boundary.
-inline bool kv_control(UnifiedKvPool& pool, std::vector<KvIdentity>& ids, const std::string& line) {
-    if (line == "KVSTATUS") { kv_print_status(pool, (unsigned) ids.size()); return true; }
+inline bool kv_control(UnifiedKvPool& pool, std::vector<KvIdentity>& ids, const std::string& line,
+                       const std::function<uint64_t()>& available = {}) {
+    if (line == "KVSTATUS") { kv_print_status(pool, (unsigned) ids.size(), available ? available() : UINT64_MAX); return true; }
     if (line.rfind("KVRESET", 0) != 0) return false;
     std::istringstream input(line); std::string command, extra;
     uint64_t slot = UINT64_MAX, generation = 0;

@@ -602,7 +602,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     enable_testing()
-    add_executable(unified_kv_vmm_test tests/cuda/unified_kv_vmm_test.cpp)
+    add_executable(unified_kv_vmm_test tests/cuda/unified_kv_vmm_test.cu)
     target_link_libraries(unified_kv_vmm_test PRIVATE strata_engine)
     target_compile_options(unified_kv_vmm_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
     add_test(NAME unified_kv_vmm_test COMMAND unified_kv_vmm_test)

@@ -1,5 +1,4 @@
 """Native telemetry and error routing; no GPU, model or conversation database."""
-import io
 import queue
 import sys
 import tempfile
@@ -24,6 +23,28 @@ class Telemetry(unittest.TestCase):
         self.assertEqual(status.consume('BDONE 1 0 length 1'), (False, None))
         status.consume('KVCACHE session=1 generation=3 epoch=9 result=miss replay=1')
         self.assertEqual(status.snapshot()['sessions']['1']['state'], 'active')
+
+    def test_commit_and_physical_budget_are_observable_without_history_storage(self):
+        status = KvStatus()
+        status.consume('KVCOMMIT session=0 generation=1 epoch=2 cells=256 bytes=4194304 pool_bytes=8388608 latency_us=43')
+        status.consume('KVMEM physical_available_after_headroom=16777216 admissible_bytes=12582912')
+        snap = status.snapshot()
+        self.assertEqual(snap['pool']['committed_bytes'], 8388608)
+        self.assertEqual(snap['sessions']['0']['bytes'], 4194304)
+        self.assertEqual(snap['memory']['admissible_bytes'], 12582912)
+        self.assertNotIn('history', snap)
+
+    def test_workspace_admission_does_not_claim_the_destination_is_active_yet(self):
+        status = KvStatus()
+        status.consume('KVSESSION session=1 generation=1 epoch=2 state=resident tokens=1024 bytes=4096')
+        handled, invalid = status.consume('KVCACHE session=1 generation=1 epoch=2 state=resident tokens=1024 bytes=4096 result=resident_or_new')
+        self.assertTrue(handled)
+        self.assertIsNone(invalid)
+        self.assertEqual(status.snapshot()['sessions']['1']['state'], 'resident')
+        _, invalid = status.consume('KVCOMMIT session=1 generation=1 epoch=3 bytes=8192 pool_bytes=16384')
+        self.assertEqual(invalid, 1)
+        self.assertEqual(status.snapshot()['sessions']['1']['state'], 'active')
+        self.assertNotIn('tokens', status.snapshot()['sessions']['1'])  # old history is not attributed to a new epoch
 
     def test_stale_event_cannot_invalidate_new_generation(self):
         status = KvStatus()

@@ -4,25 +4,32 @@
 #include "strata/core/unified_kv_protocol.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/platform/mapped_memory.hpp"
+#include <cstring>
 #include <cassert>
 #include <iostream>
 #include <vector>
 
 using namespace strata::core;
+__global__ void copy_bytes(const uint8_t* source, uint8_t* destination, int n) {
+    for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) destination[i] = source[i];
+}
 static void cuda_check(cudaError_t e) {
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
 static void pattern(const uint8_t* p, size_t bytes, uint8_t expected) {
     std::vector<uint8_t> h(bytes);
-    cuda_check(cudaMemcpy(h.data(), p, bytes, cudaMemcpyDeviceToHost));
+    cuda_check(cudaMemcpy(h.data(), p, bytes, cudaMemcpyDefault));
     for (auto x : h) assert(x == expected);
 }
 int main() {
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || !vmm_available()) {
-        std::cout << "SKIP: native CUDA VMM device required\n"; return 77;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
+        std::cout << "SKIP: native CUDA device required\n"; return 77;
     }
     try {
+        cuda_check(cudaSetDevice(0));
+        if (!vmm_available()) { std::cout << "SKIP: CUDA VMM required\n"; return 77; }
         {
             // Inject a mid-growth failure without exhausting the machine's RAM.
             UnifiedKvVmm cache(8192);
@@ -68,7 +75,8 @@ int main() {
             uint8_t* output = nullptr;
             cuda_check(cudaMalloc(&output, 4096)); cuda_check(cudaStreamCreate(&stream));
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-            cuda_check(cudaMemcpyAsync(output, heads[0] + stride, 4096, cudaMemcpyDeviceToDevice, stream));
+            copy_bytes<<<1, 128, 0, stream>>>(heads[0] + stride, output, 4096);
+            cuda_check(cudaGetLastError());
             cuda_check(cudaStreamEndCapture(stream, &graph));
             cuda_check(cudaGraphInstantiate(&exec, graph, 0)); cuda_check(cudaGraphDestroy(graph));
             // Touch 0: 1 must be the LRU, not the earliest allocated session.
@@ -95,6 +103,47 @@ int main() {
             kv_require(pool.end(ids[0], 2048));
             cuda_check(cudaGraphExecDestroy(exec)); cuda_check(cudaStreamDestroy(stream)); cuda_check(cudaFree(output));
         }
+#if defined(__linux__)
+        {
+            // Several independent pinned registrations in one contiguous VA,
+            // CPU/GPU coherence, cross-registration copies and graph reuse after
+            // all physical host pages were discarded and registered again.
+            const uint64_t gran = vmm_granularity();
+            UnifiedKvVmm adapter(3 * gran);
+            auto* host = (uint8_t*) adapter.reserve({1, 1, 3 * gran, 1, 0}, true);
+            UnifiedKvPool pool(3 * gran, 3 * gran);
+            auto id = pool.add(adapter);
+            kv_require(pool.begin(id, 3 * gran));
+            kv_require(pool.grow(id, gran - 16, [] { return UINT64_MAX; }));
+            assert(adapter.committed_bytes() == gran);
+            std::memset(host, 0x73, (size_t) gran);
+            strata::platform::mapped_memory_release();
+            kv_require(pool.grow(id, 2 * gran + 16, [] { return UINT64_MAX; }));
+            assert(adapter.committed_bytes() == 3 * gran);
+            pattern(host, 128, 0x73); pattern(host + gran, 128, 0);
+            uint8_t* out = nullptr;
+            cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+            cuda_check(cudaMalloc(&out, 128)); cuda_check(cudaStreamCreate(&stream));
+            // These helpers also copy contiguous runs across registered chunks.
+            cuda_check(cudaMemcpy(out, host + gran - 64, 128, cudaMemcpyDefault));
+            pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            copy_bytes<<<1, 128, 0, stream>>>(host + gran - 64, out, 128);
+            cuda_check(cudaGetLastError()); cuda_check(cudaStreamEndCapture(stream, &graph));
+            cuda_check(cudaGraphInstantiate(&exec, graph, 0)); cuda_check(cudaGraphDestroy(graph));
+            cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
+            pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
+            kv_require(pool.end(id, 2 * gran)); kv_require(pool.reset(id, id));
+            assert(adapter.committed_bytes() == 0);
+            kv_require(pool.begin(id, 3 * gran, true));
+            kv_require(pool.grow(id, 2 * gran + 16, [] { return UINT64_MAX; }));
+            cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
+            pattern(out, 128, 0);
+            strata::platform::mapped_memory_acquire(); assert(host[gran - 1] == 0 && host[gran] == 0);
+            kv_require(pool.end(id, 2 * gran)); kv_require(pool.reset(id, id));
+            cuda_check(cudaGraphExecDestroy(exec)); cuda_check(cudaStreamDestroy(stream)); cuda_check(cudaFree(out));
+        }
+#endif
         // Exercise the ACTUAL QSA constructor/zero and all storage formats,
         // including authoritative streamed host memory and the draft ring.
         unified_qsa_enabled = true;

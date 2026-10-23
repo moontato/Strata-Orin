@@ -53,6 +53,9 @@ public:
     virtual uint64_t bytes_for(uint64_t cells) const = 0;
     virtual uint64_t committed_bytes() const = 0;
     virtual bool faulted() const { return false; }
+    // Advance a write watermark within already-committed granules. No GPU work,
+    // pointer changes or allocation; monotonic layouts only.
+    virtual void cover(uint64_t cells) { (void) cells; }
     virtual bool grow(uint64_t cells, std::string& error) = 0;
     // All device work, graphs, draft streams and asynchronous manipulation complete.
     virtual bool quiesce(std::string& error) = 0;
@@ -189,9 +192,10 @@ public:
         // must bound it by its virtual extent; logical reservation remains unchanged.
         const uint64_t target = e->adapter->bytes_for(cells);
         const uint64_t old = e->adapter->committed_bytes();
-        if (target <= old) return {};
+        if (target <= old) { e->adapter->cover(cells); return {}; }
         const uint64_t extra = target - old;
         if (extra > byte_limit_) return {KvCode::pool_full, "KV write exceeds physical byte ceiling"};
+        std::string last_allocation_error;
         for (;;) {
             const uint64_t held = bytes();
             if (held <= byte_limit_ - extra && available() >= extra) {
@@ -210,9 +214,15 @@ public:
                     e->info.state = KvResidency::faulted;
                     return {KvCode::backend, "adapter growth was not transactional: " + error};
                 }
+                last_allocation_error = error.empty() ? "physical allocator refused growth" : error;
             }
             const auto r = evict_one(id.slot);
-            if (!r) return r; // explicit failure, never length/truncation
+            if (!r) {
+                if (r.code == KvCode::backend) return r;
+                if (!last_allocation_error.empty()) return {KvCode::allocation, last_allocation_error + "; " + r.message};
+                return {KvCode::pool_full, "physical byte ceiling/free memory/headroom cannot admit " +
+                                          std::to_string(extra) + " bytes; " + r.message};
+            } // explicit failure, never length/truncation
         }
     }
     // The backend is about to zero/replay a different full history in-place.
@@ -302,7 +312,11 @@ public:
     }
     std::vector<KvEviction> drain_events() {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<KvEviction> out; out.swap(events_); return out;
+        // Keep the preallocated queue capacity: eviction must not allocate an
+        // event record AFTER it has discarded a victim's physical state.
+        std::vector<KvEviction> out(events_);
+        events_.clear();
+        return out;
     }
 };
 

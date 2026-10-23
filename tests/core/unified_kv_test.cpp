@@ -9,14 +9,15 @@
 
 using namespace strata::core;
 struct Adapter : KvAdapter {
-    uint64_t bytes = 0, writes = 0;
+    uint64_t bytes = 0, writes = 0, watermark = 0;
     bool fail = false, sync_ok = true, valid = false;
     int discards = 0;
     uint64_t bytes_for(uint64_t cells) const override { return kv_ceil(cells * 10, 64) * 64; }
     uint64_t committed_bytes() const override { return bytes; }
+    void cover(uint64_t cells) override { watermark = std::max(watermark, cells); }
     bool grow(uint64_t cells, std::string& error) override {
         if (fail) { error = "injected OOM"; return false; }
-        bytes = bytes_for(cells); valid = true; ++writes; return true;
+        bytes = bytes_for(cells); cover(cells); valid = true; ++writes; return true;
     }
     bool quiesce(std::string& error) override { if (!sync_ok) error = "in flight"; return sync_ok; }
     bool discard(std::string&) override { bytes = 0; valid = false; ++discards; return true; }
@@ -123,6 +124,37 @@ int main() {
         go = 1;
         for (auto& t : threads) t.join();
         assert(winners == 1 && pool.info().evictions == 0);
+    }
+    {
+        // Reaching more cells within the same physical granule must advance the
+        // adapter watermark, without CUDA work or reallocation on every token.
+        UnifiedKvPool pool(100, 100); Adapter a; const auto id = pool.add(a);
+        assert(pool.begin(id, 100)); assert(pool.grow(id, 1, unlimited));
+        a.fail = true;
+        assert(pool.grow(id, 2, unlimited));
+        assert(a.writes == 1 && a.watermark == 2 && a.bytes == 64);
+        assert(pool.end(id, 2));
+    }
+    {
+        // Two active growers compete for one idle victim under byte pressure.
+        // One wins; the other must fail without evicting the winner or its peer.
+        UnifiedKvPool pool(100, 400, 1024);
+        Adapter a[3]; KvIdentity id[3];
+        for (int s = 0; s < 3; ++s) {
+            id[s] = pool.add(a[s]); assert(pool.begin(id[s], 100)); assert(pool.grow(id[s], 32, unlimited));
+        }
+        assert(pool.end(id[0], 32));
+        std::atomic<int> go{0}, won{0}, full{0};
+        std::thread threads[2];
+        for (int s = 1; s < 3; ++s) threads[s-1] = std::thread([&,s] {
+            while (!go.load()) std::this_thread::yield();
+            const auto r = pool.grow(id[s], 64, unlimited);
+            if (r) ++won; else { assert(r.code == KvCode::pool_full); ++full; }
+        });
+        go = 1; for (auto& t : threads) t.join();
+        assert(won == 1 && full == 1 && a[0].bytes == 0 && a[0].discards == 1);
+        assert(pool.info().committed_bytes == 960 && pool.info().evictions == 1);
+        assert(pool.end(id[1], 32)); assert(pool.end(id[2], 32));
     }
     {
         // Flash-Next's workspace-to-slot migration: double physical backing is

@@ -4,11 +4,12 @@ import threading
 
 
 class KvStatus:
-    PREFIXES = {"KVPOOL", "KVSESSION", "KVEVICT", "KVRESET", "KVINVALIDATE", "KVCACHE", "KVMOVE", "KVREPLAY", "KVEND"}
+    PREFIXES = {"KVPOOL", "KVSESSION", "KVEVICT", "KVRESET", "KVINVALIDATE", "KVCACHE", "KVMOVE", "KVREPLAY", "KVCOMMIT", "KVMEM", "KVEND"}
 
     def __init__(self):
         self.lock = threading.Lock()
         self.pool = {}
+        self.memory = {}
         self.sessions = {}
         self.events = deque(maxlen=256)
         self.sequence = 0
@@ -29,6 +30,9 @@ class KvStatus:
             if kind == "KVPOOL":
                 self.pool = data
                 return True, None
+            if kind == "KVMEM":
+                self.memory = data
+                return True, None
             session = data.get("session")
             if not isinstance(session, int) or session < 0:
                 return True, None
@@ -38,8 +42,9 @@ class KvStatus:
                 return True, None
             if (generation, epoch) < (old.get("generation", 0), old.get("epoch", 0)):
                 return True, None
-            state = dict(old, **data)
-            invalidated = None
+            changed = bool(old) and (generation, epoch) != (old.get("generation", 0), old.get("epoch", 0))
+            state = dict(old if not changed else {}, **data)
+            invalidated = session if changed else None
             if kind in ("KVEVICT", "KVRESET", "KVINVALIDATE"):
                 state.update(state="evicted" if kind == "KVEVICT" else "empty", tokens=0, bytes=0, reserved_tokens=0)
                 invalidated = session
@@ -49,8 +54,10 @@ class KvStatus:
                     self.missed_events += max(0, sequence - self.sequence - 1)
                     self.sequence = sequence
                     self.events.append(dict(data))
-            if kind in ("KVCACHE", "KVMOVE", "KVREPLAY"):
-                state["state"] = "active"
+            if kind in ("KVCACHE", "KVMOVE", "KVREPLAY", "KVCOMMIT"):
+                state["state"] = data.get("state", "active")
+            if kind == "KVCOMMIT" and isinstance(data.get("pool_bytes"), int):
+                self.pool["committed_bytes"] = data["pool_bytes"]
             if kind == "KVMOVE" and isinstance(data.get("from"), int):
                 source = data["from"]
                 self.sessions[source] = dict(self.sessions.get(source, {}), state="empty", tokens=0, bytes=0, reserved_tokens=0)
@@ -59,6 +66,6 @@ class KvStatus:
 
     def snapshot(self):
         with self.lock:
-            return {"pool": dict(self.pool), "sessions": {str(s): dict(i) for s, i in self.sessions.items()},
+            return {"pool": dict(self.pool), "memory": dict(self.memory), "sessions": {str(s): dict(i) for s, i in self.sessions.items()},
                     "evictions": [dict(e) for e in self.events], "last_sequence": self.sequence,
                     "missed_events": self.missed_events}
