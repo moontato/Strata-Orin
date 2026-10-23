@@ -60,8 +60,10 @@ Growing within an already committed granule updates a host watermark, without
 remapping or adding a synchronization on every token.
 
 On Linux, streamed QSA's authoritative host arrays use reserved anonymous address
-ranges with incremental `cudaHostRegister`. Each registration must return the
-same contiguous UVA alias; otherwise growth fails explicitly. Unregister plus
+ranges with incremental `cudaHostRegister`. The CPU VA is used only when CUDA
+explicitly guarantees direct registered-host-pointer access or each registration
+returns that exact address; otherwise growth fails explicitly. See the bounded
+[host-mapping finding](KV_HOST_MAPPING.md). Unregister plus
 `MADV_DONTNEED` reclaims its RAM. GPU working slots and the MTP ring commit on first
 use; authoritative host history grows by prefix. The existing streaming kernels,
 QSA residency map and ring restoration remain in use. No filesystem backs KV.
