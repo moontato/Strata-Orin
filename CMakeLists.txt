@@ -124,6 +124,17 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # native-experts section far below, so a first configure registered four tests fewer than the second)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 
+if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+  enable_testing()
+  find_package(Threads REQUIRED)
+  add_executable(unified_kv_test tests/core/unified_kv_test.cpp)
+  target_include_directories(unified_kv_test PRIVATE include)
+  target_link_libraries(unified_kv_test PRIVATE Threads::Threads)
+  # Test expressions include operations; do not compile them away in Release.
+  target_compile_options(unified_kv_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+  add_test(NAME unified_kv_test COMMAND unified_kv_test)
+endif()
+
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
