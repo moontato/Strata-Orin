@@ -78,8 +78,11 @@ template <class RowLogits>
 inline SampledSpecResult q36_sample_verify_window(const std::vector<int32_t>& drafts, const Sampling& s,
                                                   std::vector<int32_t>& hist, std::mt19937_64& rng,
                                                   long long produced, long long max_new, RowLogits&& row,
-                                                  const std::atomic<bool>* cancel = nullptr) {
+                                                  const std::atomic<bool>* cancel = nullptr,
+                                                  std::vector<std::mt19937_64>* sampled_rng = nullptr) {
     SampledSpecResult r;
+    if (sampled_rng) sampled_rng->clear();
+    if (produced >= max_new) { r.accepted_finish = "length"; return r; }
     const int D = (int) drafts.size();
     std::vector<float> lg;
     int accepted = 0;
@@ -90,6 +93,7 @@ inline SampledSpecResult q36_sample_verify_window(const std::vector<int32_t>& dr
         }
         row(i, lg);
         const int y = q36_sample(lg, s, hist, rng);
+        if (sampled_rng) sampled_rng->push_back(rng);
         r.consumed = true;
         if (i == D) {
             r.next = y;
@@ -109,6 +113,117 @@ inline SampledSpecResult q36_sample_verify_window(const std::vector<int32_t>& dr
     r.accepted = std::max(r.accepted, accepted);
     if (r.accepted > D) r.accepted = D;
     return r;
+}
+
+// Shared solo sampled-request controller, used by Serve and the native/model
+// gate as well as CPU mock-backend tests. Backend supplies logits(row, out),
+// process(token), can_window(D), window(x, fix, D, drafts), commit(rows), and
+// publish(token) returning whether the token was actually published. window()
+// MUST defer recurrent/hidden-state commitment;
+// commit() keeps only the first rows. No backend work may overwrite the window
+// buffers between window() and commit(). The controller owns history/live edits.
+struct SampledRequestResult {
+    long long produced = 0, offered = 0, accepted = 0;
+    int logits_row = 0; // logits after the actual committed prefix, NOT always row zero
+    const char* finish = "length";
+};
+
+template <class Backend>
+inline SampledRequestResult q36_sampled_request(Backend& backend, const Sampling& s,
+                                               std::vector<int32_t>& hist, std::vector<int32_t>& live,
+                                               std::mt19937_64& rng, long long max_new, int draft_limit,
+                                               const std::atomic<bool>& cancel) {
+    SampledRequestResult out;
+    std::vector<int32_t> fix, drafts;
+    std::vector<float> lg;
+    std::vector<std::mt19937_64> sampled_rng;
+    int32_t pending = -1;
+    auto before_pending = rng;
+    auto stopped = [&] { return cancel.load(); };
+    auto ending = [&](int32_t t) -> const char* {
+        if (q36_is_eos(t)) return "stop";
+        if (out.produced >= max_new) return "length";
+        return stopped() ? "cancel" : nullptr;
+    };
+    while (out.produced < max_new) {
+        if (stopped()) {
+            if (pending >= 0) rng = before_pending; // discard an unpublished target sample
+            out.finish = "cancel";
+            break;
+        }
+        if (pending < 0) {
+            backend.logits(out.logits_row, lg);
+            before_pending = rng;
+            pending = q36_sample(lg, s, hist, rng);
+        }
+        if (stopped()) {
+            rng = before_pending;
+            out.finish = "cancel";
+            break;
+        }
+        const int32_t x = pending;
+        pending = -1; // mismatch/bonus is published exactly once, without another draw
+        if (!backend.publish(x)) {
+            rng = before_pending;
+            out.finish = "cancel";
+            break;
+        }
+        hist.push_back(x);
+        ++out.produced;
+        const char* finish = ending(x);
+        const int D = (int) std::min<long long>(draft_limit, max_new - out.produced);
+        if (finish || D <= 0 || !backend.can_window(D)) {
+            // Even a terminal published token is processed in this opt-in path.
+            // Thus cancellation, EOS and the output cap leave an exact published
+            // prefix, not a committed suffix the client has never seen.
+            backend.process(x);
+            live.push_back(x);
+            fix.clear();
+            out.logits_row = 0;
+            if (finish) { out.finish = finish; break; }
+            continue;
+        }
+        backend.window(x, fix, D, drafts);
+        out.offered += (long long) drafts.size();
+        const size_t base = hist.size();
+        const auto before_window = rng;
+        const auto verified = q36_sample_verify_window(
+            drafts, s, hist, rng, out.produced, max_new,
+            [&](int row, std::vector<float>& logits) { backend.logits(row, logits); }, &cancel, &sampled_rng);
+        // Verification is provisional. Publication promotes only a prefix of
+        // its decisions. Cancellation can arrive after verification or inside
+        // publish(); restore history/RNG for decisions that were never shown.
+        hist.resize(base);
+        rng = before_window;
+        int published = 0;
+        finish = nullptr;
+        for (; published < verified.accepted;) {
+            if (stopped()) { finish = "cancel"; break; }
+            const int32_t t = drafts[(size_t) published];
+            if (!backend.publish(t)) { finish = "cancel"; break; }
+            hist.push_back(t);
+            rng = sampled_rng[(size_t) published];
+            ++published;
+            ++out.produced;
+            finish = ending(t);
+            if (finish) break;
+        }
+        // Only x and the proposals actually published are allowed to change
+        // recurrence, convolution history, hidden seed, positions and KV progress.
+        backend.commit(published + 1);
+        live.push_back(x);
+        live.insert(live.end(), drafts.begin(), drafts.begin() + published);
+        fix.assign(drafts.begin(), drafts.begin() + published);
+        out.accepted += published;
+        out.logits_row = published;
+        if (!finish && stopped()) finish = "cancel";
+        if (finish) { out.finish = finish; break; }
+        if (verified.next < 0) { out.finish = "cancel"; break; }
+        before_pending = rng;
+        pending = verified.next;
+        rng = sampled_rng.back(); // the already sampled mismatch/bonus, not row zero
+    }
+    return out;
 }
 
 }  // namespace strata::core

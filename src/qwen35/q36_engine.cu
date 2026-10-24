@@ -3056,23 +3056,6 @@ struct Engine {
         return a;
     }
 
-    /// Experimental sampled verify path: keep the same greedy proposals, but ask
-    /// the main model's target sampler for every row. A proposal advances only on
-    /// an equality hit; the first sampled mismatch is returned instead. `hist`
-    /// contains x; accepted proposals are appended by the host verifier.
-    strata::core::SampledSpecResult spec_step_sampled(int x_tok, const std::vector<int32_t>& fix, int D,
-                                                      std::vector<int32_t>& drafts, const Sampling& smp,
-                                                      std::vector<int32_t>& hist, std::mt19937_64& rng,
-                                                      long long produced, long long max_new,
-                                                      const std::atomic<bool>* cancel = nullptr) {
-        D = spec_window(x_tok, fix, D, drafts);
-        const auto result = strata::core::q36_sample_verify_window(
-            drafts, smp, hist, rng, produced, max_new,
-            [&](int row, std::vector<float>& lg) { host_logits_row(row, lg); }, cancel);
-        spec_commit(result.accepted + 1);
-        return result;
-    }
-
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
     /// objects, the BLAS handles' kernels and the decode graph are made on first use.  A throw-away prompt of one
     /// chunk, a decode step and (with drafts) a speculative step at load do that before the first request; then the
@@ -3348,6 +3331,31 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 using strata::core::Sampling;
 using strata::core::q36_sample;
 inline bool is_eos(int t) { return strata::core::q36_is_eos(t); }
+
+// The request controller decides what was published BEFORE committing the
+// deferred verify window. This adapter never edits history or the live prefix.
+struct SampledEngineBackend {
+    Engine& E;
+    std::vector<int32_t>* emitted = nullptr;
+    bool protocol = false;
+    const std::atomic<bool>* cancel = nullptr;
+    void logits(int row, std::vector<float>& out) { E.host_logits_row(row, out); }
+    void process(int32_t token) { E.process(&token, 1, [](int64_t) {}); }
+    bool can_window(int D) const {
+        return !E.main_hybrid && !E.m->hybrid && E.pos + D + 1 <= E.ctx &&
+               (!E.kv_pool || (uint64_t) (E.pos + D + 1) <= E.kv_required[(size_t) E.cur]);
+    }
+    void window(int32_t x, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts) {
+        E.spec_window(x, fix, D, drafts);
+    }
+    void commit(int rows) { E.spec_commit(rows); }
+    bool publish(int32_t token) {
+        if (cancel && cancel->load()) return false;
+        if (protocol) { std::printf("T %d\n", token); std::fflush(stdout); }
+        if (emitted) emitted->push_back(token);
+        return true;
+    }
+};
 
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
@@ -3995,7 +4003,8 @@ struct Serve {
         // sampled_mtp=0 turns it off per request so one engine can measure both arms.
         const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
         const bool sampled_spec = E.mtp_d > 0 && E.mtp_sampled && smp.needs_logits() && smp.sampled_mtp &&
-                                  !adm && !geni && ir.imgs.empty() && ss.imgs.empty();
+                                  !adm && !geni && ir.imgs.empty() && ss.imgs.empty() && n_active == 0 &&
+                                  !E.main_hybrid && !E.m->hybrid;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -4036,17 +4045,25 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
-        for (;;) {
+        if (sampled_spec) {
+            SampledEngineBackend backend{E, request_log, true, &stop};
+            const auto result = strata::core::q36_sampled_request(
+                backend, smp, hist, ss.live, rng, max_new, E.mtp_d, stop);
+            produced = result.produced;
+            offered = result.offered;
+            accepted = result.accepted;
+            finish = result.finish;
+        } else for (;;) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
                 nx = q36_sample(lg, smp, hist, rng);
             }
-            auto emit = [&](int t, bool hist_already_contains_token = false) {   // false: the answer ends here
+            auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
                 if (request_log) request_log->push_back(t);
                 ++produced;
-                if (!hist_already_contains_token) hist.push_back(t);
+                hist.push_back(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -4054,26 +4071,6 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
-            if (sampled_spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int D = E.kv_pool ? (int) std::min<int64_t>(E.mtp_d, max_new - produced) : E.mtp_d;
-                if (D > 0) {
-                    const auto res = E.spec_step_sampled(nx, fix, D, drafts, smp, hist, rng, produced, max_new, &stop);
-                    offered += D;
-                    accepted += res.accepted;
-                    // Accepted proposals are already in `hist` and are processed in the window. The returned mismatch/bonus
-                    // target sample is not: it is emitted and processed by the ordinary path on the next loop.
-                    ss.live.push_back(nx);
-                    for (int i = 0; i < res.accepted; ++i) ss.live.push_back(drafts[(size_t) i]);
-                    fix.assign(drafts.begin(), drafts.begin() + res.accepted);
-                    bool ended = false;
-                    for (int i = 0; i < res.accepted && !ended; ++i)
-                        if (!emit(drafts[(size_t) i], true)) ended = true;
-                    if (ended) break;
-                    if (res.next < 0) { finish = stop.load() ? "cancel" : finish; break; }
-                    nx = res.next;
-                    continue;
-                }
-            }
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int D = E.kv_pool ? (int) std::min<int64_t>(E.mtp_d, max_new - produced) : E.mtp_d;
                 const int a = E.spec_step(nx, fix, D, drafts, picks, &stop);
@@ -4243,9 +4240,9 @@ int checkpoint_regression(Engine& E,const std::string& file) {
 }
 
 struct SampledMtpRun {
-    std::vector<int32_t> emitted, hist, live, continued;
+    std::vector<int32_t> emitted, hist, live, continued, continued_hist, continued_live;
     std::vector<float> logits, continued_logits;
-    std::mt19937_64 rng;
+    std::mt19937_64 rng, continued_rng;
     int64_t pos = 0;
     int offered = 0, accepted = 0;
 };
@@ -4266,8 +4263,9 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
         throw std::runtime_error("fixture is empty or leaves no room for sampled speculative windows");
     auto require = [](bool ok, const char* why) { if (!ok) throw std::runtime_error(why); };
     auto reset_all = [&] {
-        E.reset();
         for (int s = 0; s < E.n_sess; ++s) {
+            E.select(s);
+            E.reset();
             auto& ss = E.sess[(size_t) s];
             ss.live.clear();
             ss.imgs.clear();
@@ -4279,6 +4277,7 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
                 E.kv_required[(size_t) s] = 0;
             }
         }
+        E.select(0);
     };
     Sampling smp;
     smp.temperature = 1.0f; smp.top_p = 0.95f; smp.top_k = 20; smp.last_n = 64;
@@ -4293,74 +4292,43 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
         ss.live = ids;
         E.process(ids.data(), (int64_t) ids.size(), [](int64_t) {});
         ss.pos = E.pos;
-        std::vector<int32_t> hist = ids, fix, drafts;
-        int offered = 0, accepted = 0;
+        std::vector<int32_t> hist = ids;
         SampledMtpRun out;
-        std::vector<float> lg;
-        E.host_logits(lg);
         out.rng.seed(smp.seed);
-        int x = q36_sample(lg, smp, hist, out.rng);
-        while ((int) out.emitted.size() < target && E.pos < (int64_t) ids.size() + target) {
-            require(!is_eos(x), "fixture sampled EOS before the common checkpoint");
-            out.emitted.push_back(x);
-            hist.push_back(x);
-            if (E.pos >= (int64_t) ids.size() + target) break;
-            bool used_spec = false;
-            if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int remaining = (int) ((int64_t) ids.size() + target - E.pos);
-                const int D = std::min(E.mtp_d, remaining - 1);
-                if (D > 0) {
-                    const auto res = E.spec_step_sampled(x, fix, D, drafts, smp, hist, out.rng,
-                                                         (long long) out.emitted.size(), (long long) target, nullptr);
-                    offered += D;
-                    accepted += res.accepted;
-                    require(res.next >= 0, "sampled verifier stopped before the common checkpoint");
-                    require(!res.accepted_finish, "sampled verifier ended before the common checkpoint");
-                    ss.live.push_back(x);
-                    for (int i = 0; i < res.accepted; ++i) {
-                        require(!is_eos(drafts[(size_t) i]), "fixture accepted EOS before the common checkpoint");
-                        ss.live.push_back(drafts[(size_t) i]);
-                        out.emitted.push_back(drafts[(size_t) i]);
-                    }
-                    fix.assign(drafts.begin(), drafts.begin() + res.accepted);
-                    x = res.next;
-                    used_spec = true;
-                }
-            }
-            if (!used_spec) {
-                require(E.pos + 1 <= E.ctx, "fixture ran out of context before the common checkpoint");
-                const int32_t one = x;
-                E.process(&one, 1, [](int64_t) {});
-                ss.live.push_back(one);
-                fix.clear();
-                if (E.pos >= (int64_t) ids.size() + target) break;
-                E.host_logits(lg);
-                x = q36_sample(lg, smp, hist, out.rng);
-            }
-        }
+        std::atomic<bool> cancel{false};
+        SampledEngineBackend backend{E, &out.emitted, false};
+        const auto result = strata::core::q36_sampled_request(
+            backend, smp, hist, ss.live, out.rng, target, spec ? E.mtp_d : 0, cancel);
+        // An all-accepted window may end exactly at target: it is a valid
+        // terminal prefix, not a missing mismatch/bonus-token error.
+        require(std::string(result.finish) == "length", "fixture sampled EOS before the common checkpoint");
         require((int) out.emitted.size() == target, "sampled sequence did not reach the common checkpoint");
         require(E.pos == (int64_t) ids.size() + target, "speculative state did not commit the common prefix exactly");
         ss.pos = E.pos;
-        out.hist = std::move(hist);
+        out.hist = hist;
         out.live = ss.live;
         out.pos = E.pos;
-        E.host_logits(out.logits);
+        E.host_logits_row(result.logits_row, out.logits);
 
         // Continuation from the committed state: use the unchanged one-token sampled path, never speculation.
-        auto cont_rng = out.rng;
+        out.continued_rng = out.rng;
+        out.continued_hist = hist;
         std::vector<float> cur = out.logits;
         for (int i = 0; i < continuation; ++i) {
-            const int y = q36_sample(cur, smp, out.hist, cont_rng);
+            const int y = q36_sample(cur, smp, out.continued_hist, out.continued_rng);
             require(!is_eos(y), "fixture continuation sampled EOS too early");
             out.continued.push_back(y);
-            out.hist.push_back(y);
+            out.continued_hist.push_back(y);
             const int32_t one = y;
             E.process(&one, 1, [](int64_t) {});
             ss.live.push_back(one);
-            if (i + 1 < continuation) E.host_logits(cur);
+            E.host_logits(cur); // includes logits AFTER the eighth processed continuation token
         }
+        ss.pos = E.pos;
+        out.continued_live = ss.live;
+        require(E.pos == out.pos + continuation, "continuation did not process every token");
         out.continued_logits = std::move(cur);
-        out.accepted = accepted; out.offered = offered;
+        out.accepted = (int) result.accepted; out.offered = (int) result.offered;
         E.kv_end(0);
         reset_all();
         return out;
@@ -4368,6 +4336,8 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
 
     const auto sequential = run_direct(false);
     const auto speculative = run_direct(true);
+    require(speculative.offered > 0 && speculative.accepted > 0,
+            "acceptance scenario offered or accepted no drafts; choose a fixture/seed with acceptance");
     require(sequential.emitted == speculative.emitted, "sampled speculative text differs from sequential sampling");
     require(sequential.hist == speculative.hist, "sampled speculative history differs from sequential sampling");
     require(sequential.pos == speculative.pos && speculative.pos == (int64_t) ids.size() + target,
@@ -4377,6 +4347,10 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
             "committed live tokens differ at the common checkpoint");
     require(sequential.continued == speculative.continued, "committed state continues differently");
     require(sequential.rng == speculative.rng, "speculative path consumed a different RNG amount");
+    require(sequential.continued_rng == speculative.continued_rng &&
+            sequential.continued_hist == speculative.continued_hist &&
+            sequential.continued_live == speculative.continued_live,
+            "continuation history, live tokens or RNG differ");
     require(sequential.logits.size() == speculative.logits.size() &&
             sequential.continued_logits.size() == speculative.continued_logits.size(),
             "logit shapes differ");
@@ -4391,11 +4365,16 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
         max_continued = std::max(max_continued, std::abs((double) sequential.continued_logits[i] -
                                                           (double) speculative.continued_logits[i]));
     }
-    require(max_common <= 1e-4 && max_continued <= 1e-4, "sampled speculative logits differ materially");
     const bool byte_common = std::memcmp(sequential.logits.data(), speculative.logits.data(),
                                          speculative.logits.size() * 4) == 0;
     const bool byte_cont = std::memcmp(sequential.continued_logits.data(), speculative.continued_logits.data(),
                                        speculative.continued_logits.size() * 4) == 0;
+
+    std::printf("SAMPLED_MTP_TEST logits max_common_logit_abs=%.9g max_continuation_logit_abs=%.9g "
+                "common_bytes=%d continuation_bytes=%d tolerance=1e-4\n",
+                max_common, max_continued, byte_common ? 1 : 0, byte_cont ? 1 : 0);
+    std::fflush(stdout);
+    require(max_common <= 1e-4 && max_continued <= 1e-4, "sampled speculative logits differ materially");
 
     // Request-path check: exercise the native key and exact text emitted by Serve.
     const std::string ids_csv = [&] { std::string s; for (size_t i = 0; i < ids.size(); ++i) { if (i) s += ','; s += std::to_string(ids[i]); } return s; }();

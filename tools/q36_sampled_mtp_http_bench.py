@@ -23,7 +23,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--base-url", default="http://127.0.0.1:8095")
     p.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""))
-    p.add_argument("--model", default="strata")
+    p.add_argument("--model", help="API model ID; default: discover the first ID from /v1/models")
     p.add_argument("--prompt-text")
     p.add_argument("--prompt-file", help="read the prompt text from a file")
     p.add_argument("--repeat", type=int, default=1, help="repeat the prompt text (same text for both arms)")
@@ -43,14 +43,26 @@ def parse_args():
     return p.parse_args()
 
 
-def request(base_url, api_key, body):
-    req = urllib.request.Request(base_url.rstrip("/") + "/v1/chat/completions",
-                                 data=json.dumps(body).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+def api_request(base_url, api_key, path, body=None):
+    req = urllib.request.Request(base_url.rstrip("/") + path,
+                                 data=json.dumps(body).encode("utf-8") if body is not None else None,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST" if body is not None else "GET")
     if api_key:
         req.add_header("Authorization", "Bearer " + api_key)
     with urllib.request.urlopen(req, timeout=3600) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def discover_model(base_url, api_key):
+    models = api_request(base_url, api_key, "/v1/models").get("data") or []
+    if not models or not isinstance(models[0].get("id"), str):
+        raise ValueError("/v1/models returned no API model ID; specify --model")
+    return models[0]["id"]
+
+
+def request(base_url, api_key, body):
+    return api_request(base_url, api_key, "/v1/chat/completions", body)
 
 
 def prompt_text(args):
@@ -99,6 +111,9 @@ def summarize(samples):
 
 def main():
     args = parse_args()
+    if args.model is None:
+        args.model = discover_model(args.base_url, args.api_key)
+    print(f"API model: {args.model}", flush=True)
     prompt = prompt_text(args)
     samples = {name: [] for name, _ in ARMS}
     for rep in range(args.warmup + args.reps):
@@ -150,6 +165,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         print(f"benchmark request failed: {exc}", file=sys.stderr)
         sys.exit(1)
