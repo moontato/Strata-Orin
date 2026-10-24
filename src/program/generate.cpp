@@ -2343,6 +2343,10 @@ static int strata_main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-preallocate") {
+            std::fprintf(stderr, "--kv-preallocate requires the CUDA SM87 Qwen3.6 INT8/MTP engine; omit it for this model/backend\n");
+            return 2;
+        }
         else if (a == "--kv-pool-tokens") o.kv_pool_tokens = strata::core::kv_parse_limit(next("--kv-pool-tokens"), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") o.kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next("--kv-pool-mib"), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-grow") o.kv_grow = true;

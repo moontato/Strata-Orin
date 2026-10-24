@@ -21,6 +21,9 @@ VmmChunk vmm_chunk_new();
 void vmm_chunk_free(VmmChunk h);
 /// Checked release for byte-authoritative owners (false: the handle is still owned).
 bool vmm_chunk_release(VmmChunk h);
+struct VmmAllocationStats { uint64_t attempts = 0, allocations = 0, releases = 0; };
+/// Actual successful driver creations/releases, including non-bank callers.
+VmmAllocationStats vmm_allocation_stats();
 
 class VmmRange {
 public:
@@ -43,7 +46,12 @@ public:
     /// Maps chunks [lo, hi) that are not mapped yet, each to `take()` or, when that returns 0, to a new chunk.
     /// Readable and writable when it returns; false: out of memory (what was mapped stays mapped).
     template <class Take> bool map_range(int64_t lo, int64_t hi, Take take);
-    /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped).
+    /// Strict non-owning map: never allocates/releases h, including map/access
+    /// failure. On failure, mapped(i) tells the lender whether an unsuccessful
+    /// rollback unmap still holds h. Do not mix with owning map_range().
+    bool map_borrowed(int64_t i, VmmChunk h);
+    /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped
+    /// OR unmapping failed; check mapped(i) before recycling).
     VmmChunk unmap(int64_t i);
 
 private:
@@ -55,10 +63,12 @@ private:
     bool commit_run(int64_t lo, int64_t hi);
     unsigned long long base_ = 0;
     std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
+    bool borrowed_ = false;     // lender owns all handles; release() may only unmap
     std::vector<VmmChunk> unreleased_; // never lose ownership/accounting on a failed driver release
 };
 
 template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take) {
+    if (borrowed_) return false;
     lo = lo < 0 ? 0 : lo;
     hi = hi > chunks() ? chunks() : hi;
     int64_t run = -1;   // access is set once per run of newly mapped chunks (it costs as much as the map)

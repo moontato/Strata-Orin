@@ -46,10 +46,29 @@ inline void kv_print_status(UnifiedKvPool& pool, unsigned slots, uint64_t availa
                 (unsigned long long) p.reserved_tokens, (unsigned long long) p.evictions,
                 (unsigned long long) p.reclaimed_bytes, (unsigned long long) (p.token_limit - p.reserved_tokens),
                 (unsigned long long) p.eviction_us);
+    if (p.bank.granularity) {
+        const auto& b = p.bank;
+        std::printf("KVBANK preallocated=1 logical_tokens=%llu context_limit=%llu bank_bytes=%llu mapped_bytes=%llu "
+                    "granularity=%llu free_pages=%llu mapped_pages=%llu state_bytes=%llu checkpoint_bytes=%llu "
+                    "physical_allocations=%llu allocation_attempts=%llu map_calls=%llu unmap_calls=%llu "
+                    "initialized_pages=%llu allocation_us=%llu mapping_us=%llu initialization_us=%llu "
+                    "checkpoint_operations=%llu checkpoint_copy_bytes=%llu checkpoint_copy_us=%llu "
+                    "driver_allocations=%llu driver_allocation_attempts=%llu driver_releases=%llu\n",
+            (unsigned long long)p.token_limit,(unsigned long long)p.context_limit,(unsigned long long)b.bytes,
+            (unsigned long long)p.mapped_bytes,(unsigned long long)b.granularity,(unsigned long long)b.free_pages,
+            (unsigned long long)b.mapped_pages,(unsigned long long)b.state_bytes,(unsigned long long)b.checkpoint_bytes,
+            (unsigned long long)b.allocations,(unsigned long long)b.allocation_attempts,(unsigned long long)b.maps,
+            (unsigned long long)b.unmaps,(unsigned long long)b.initialized_pages,(unsigned long long)b.allocation_us,
+            (unsigned long long)b.mapping_us,(unsigned long long)b.initialization_us,
+            (unsigned long long)b.checkpoint_operations,(unsigned long long)b.checkpoint_copy_bytes,
+            (unsigned long long)b.checkpoint_copy_us,(unsigned long long)b.driver_allocations,
+            (unsigned long long)b.driver_allocation_attempts,(unsigned long long)b.driver_releases);
+    }
     if (available != UINT64_MAX)
         std::printf("KVMEM physical_available_after_headroom=%llu admissible_bytes=%llu\n",
                     (unsigned long long) available,
-                    (unsigned long long) std::min(available, p.byte_limit > p.committed_bytes ? p.byte_limit - p.committed_bytes : 0));
+                    (unsigned long long) (p.bank.granularity ? p.bank.free_pages * p.bank.granularity :
+                        std::min(available, p.byte_limit > p.committed_bytes ? p.byte_limit - p.committed_bytes : 0)));
     for (unsigned s = 0; s < slots; ++s) {
         const auto i = pool.session(s);
         std::printf("KVSESSION session=%u generation=%llu epoch=%llu state=%s tokens=%llu reserved_tokens=%llu bytes=%llu\n",

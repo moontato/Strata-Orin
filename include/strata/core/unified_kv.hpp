@@ -45,13 +45,33 @@ inline const char* kv_code_name(KvCode c) {
     }
 }
 
+struct KvBackingInfo {
+    uint64_t bytes = 0, free_pages = 0, mapped_pages = 0, granularity = 0;
+    uint64_t state_bytes = 0, checkpoint_bytes = 0;
+    uint64_t allocations = 0, allocation_attempts = 0, maps = 0, unmaps = 0, initialized_pages = 0;
+    uint64_t driver_allocations = 0, driver_allocation_attempts = 0, driver_releases = 0;
+    uint64_t allocation_us = 0, mapping_us = 0, initialization_us = 0;
+    uint64_t checkpoint_operations = 0, checkpoint_copy_bytes = 0, checkpoint_copy_us = 0;
+};
+class KvBacking {
+public:
+    virtual ~KvBacking() = default;
+    virtual KvBackingInfo backing_info() const = 0;
+};
+
 class KvAdapter {
 public:
     virtual ~KvAdapter() = default;
     // Exact rounded physical commitment at this write high-water mark (may include
     // speculative cells past the logical end). No allocations or GPU work here.
     virtual uint64_t bytes_for(uint64_t cells) const = 0;
+    // In bank mode this is MAPPED bytes, not exclusive physical ownership.
     virtual uint64_t committed_bytes() const = 0;
+    virtual const KvBacking* backing() const { return nullptr; }
+    virtual uint64_t write_limit(uint64_t) const { return UINT64_MAX; }
+    // Before lowering a reservation, reclaim old high-water tails. Lazy mode
+    // deliberately retains the release's existing allocation policy.
+    virtual bool trim_reservation(uint64_t, std::string&) { return true; }
     virtual bool faulted() const { return false; }
     // Advance a write watermark within already-committed granules. No GPU work,
     // pointer changes or allocation; monotonic layouts only.
@@ -59,7 +79,8 @@ public:
     virtual bool grow(uint64_t cells, std::string& error) = 0;
     // All device work, graphs, draft streams and asynchronous manipulation complete.
     virtual bool quiesce(std::string& error) = 0;
-    // Invalidate ALL dependent state, release physical KV; preserve virtual addresses.
+    // Invalidate ALL dependent state, release mapped KV (return bank loans in
+    // preallocated mode); preserve virtual addresses. committed_bytes must be zero.
     // Failure is fatal to this session: never claim successful reclamation.
     virtual bool discard(std::string& error) = 0;
 };
@@ -76,6 +97,8 @@ struct KvEviction {
 struct KvPoolInfo {
     uint64_t token_limit = 0, byte_limit = 0, resident_tokens = 0, reserved_tokens = 0;
     uint64_t committed_bytes = 0, evictions = 0, reclaimed_bytes = 0, eviction_us = 0;
+    uint64_t mapped_bytes = 0, context_limit = 0;
+    KvBackingInfo bank;
 };
 
 class UnifiedKvPool {
@@ -83,6 +106,7 @@ class UnifiedKvPool {
     mutable std::mutex mutex_;
     std::vector<Entry> sessions_;
     uint64_t token_limit_, byte_limit_, context_, clock_ = 0, evictions_ = 0, reclaimed_ = 0, eviction_us_ = 0;
+    const KvBacking* backing_ = nullptr;
     std::vector<KvEviction> events_;  // drained by the scheduler; no callbacks into user code
 
     Entry* find(KvIdentity id) {
@@ -95,8 +119,9 @@ class UnifiedKvPool {
         return n;
     }
     uint64_t bytes() const {
-        uint64_t n = 0;
+        uint64_t n = backing_ ? backing_->backing_info().bytes : 0;
         for (const auto& s : sessions_) {
+            if (s.adapter->backing()) continue; // already charged once to the bank
             const uint64_t b = s.adapter->committed_bytes();
             if (b > UINT64_MAX - n) throw std::overflow_error("unified KV byte accounting overflow");
             n += b;
@@ -135,9 +160,11 @@ class UnifiedKvPool {
         return {};
     }
 public:
-    UnifiedKvPool(uint64_t context, uint64_t tokens, uint64_t bytes = UINT64_MAX)
-        : token_limit_(tokens), byte_limit_(bytes), context_(context) {
+    UnifiedKvPool(uint64_t context, uint64_t tokens, uint64_t bytes = UINT64_MAX, const KvBacking* backing = nullptr)
+        : token_limit_(tokens), byte_limit_(bytes), context_(context), backing_(backing) {
         if (!context || !tokens || !bytes) throw std::invalid_argument("unified KV limits must be positive");
+        if (backing_ && !backing_->backing_info().granularity)
+            throw std::invalid_argument("unified KV bank requires a supported allocation granularity");
         events_.reserve(256);
     }
     UnifiedKvPool(const UnifiedKvPool&) = delete;
@@ -145,6 +172,7 @@ public:
     KvIdentity add(KvAdapter& adapter) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (adapter.committed_bytes()) throw std::invalid_argument("register an uncommitted KV adapter");
+        if (adapter.backing() != backing_) throw std::invalid_argument("KV adapter/bank ownership mismatch");
         KvIdentity id{static_cast<uint32_t>(sessions_.size()), 1};
         Entry e; e.info.id = id; e.adapter = &adapter;
         sessions_.push_back(e);
@@ -168,7 +196,7 @@ public:
         }
         if (replay) {
             std::string error;
-            if (!e->adapter->quiesce(error) || !e->adapter->discard(error)) {
+            if (!e->adapter->quiesce(error) || !e->adapter->discard(error) || e->adapter->committed_bytes()) {
                 i.state = KvResidency::faulted;
                 return {KvCode::backend, error};
             }
@@ -183,6 +211,7 @@ public:
     // Admission and physical growth are separate. Active reservations never cause
     // eager allocation of a request's output allowance. available is a fresh,
     // headroom-adjusted physical reading, NOT an additional pool to add to byte_limit.
+    // Bank loans need free bank pages, not a second physical allocation charge.
     template<class Available> KvResult grow(KvIdentity id, uint64_t cells, Available available) {
         std::lock_guard<std::mutex> lock(mutex_);
         Entry* e = find(id);
@@ -190,6 +219,8 @@ public:
         if (e->info.state != KvResidency::active) return {KvCode::busy, "growth requires an active lease"};
         // cells can include backend-specific speculative padding. The scheduler
         // must bound it by its virtual extent; logical reservation remains unchanged.
+        if (cells > e->adapter->write_limit(e->info.reserved_tokens))
+            return {KvCode::context_limit, "KV write exceeds padded reservation"};
         const uint64_t target = e->adapter->bytes_for(cells);
         const uint64_t old = e->adapter->committed_bytes();
         if (target <= old) { e->adapter->cover(cells); return {}; }
@@ -198,7 +229,12 @@ public:
         std::string last_allocation_error;
         for (;;) {
             const uint64_t held = bytes();
-            if (held <= byte_limit_ - extra && available() >= extra) {
+            const bool banked = e->adapter->backing() != nullptr;
+            const auto bank = backing_ ? backing_->backing_info() : KvBackingInfo{};
+            const bool fits = banked
+                ? held <= byte_limit_ && extra / bank.granularity <= bank.free_pages
+                : held <= byte_limit_ - extra && available() >= extra;
+            if (fits) {
                 std::string error;
                 if (!e->adapter->quiesce(error)) { e->info.state = KvResidency::faulted; return {KvCode::backend, error}; }
                 if (e->adapter->grow(cells, error)) {
@@ -254,6 +290,9 @@ public:
         if (live_tokens > e->info.reserved_tokens) return {KvCode::context_limit, "unreserved tokens"};
         std::string error;
         if (!e->adapter->quiesce(error)) { e->info.state = KvResidency::faulted; return {KvCode::backend, error}; }
+        if (!e->adapter->trim_reservation(live_tokens, error)) {
+            e->info.state = KvResidency::faulted; return {KvCode::backend, error};
+        }
         auto& i = e->info;
         i.state = live_tokens || e->adapter->committed_bytes() ? KvResidency::idle : KvResidency::empty;
         i.tokens = i.reserved_tokens = live_tokens;
@@ -290,7 +329,10 @@ public:
         if (!e) return {KvCode::stale, "session generation changed"};
         if (e->info.state == KvResidency::active) return {KvCode::busy, "cannot reset an active session"};
         std::string error;
-        if (!e->adapter->quiesce(error) || !e->adapter->discard(error)) return {KvCode::backend, error};
+        if (!e->adapter->quiesce(error) || !e->adapter->discard(error) || e->adapter->committed_bytes()) {
+            e->info.state = KvResidency::faulted;
+            return {KvCode::backend, error.empty() ? "reset did not reclaim slot mappings" : error};
+        }
         next = {id.slot, id.generation + 1};
         const uint64_t epoch = e->info.epoch + 1;
         e->info = {}; e->info.id = next; e->info.epoch = epoch;
@@ -305,8 +347,16 @@ public:
     KvPoolInfo info() const {
         std::lock_guard<std::mutex> lock(mutex_);
         KvPoolInfo i; i.token_limit = token_limit_; i.byte_limit = byte_limit_;
-        i.committed_bytes = bytes(); i.reserved_tokens = tokens();
-        for (const auto& s : sessions_) i.resident_tokens += s.info.tokens;
+        i.committed_bytes = bytes(); i.reserved_tokens = tokens(); i.context_limit = context_;
+        if (backing_) i.bank = backing_->backing_info();
+        for (const auto& s : sessions_) {
+            i.resident_tokens += s.info.tokens;
+            i.mapped_bytes += s.adapter->committed_bytes();
+        }
+        if (backing_ && (i.mapped_bytes != i.bank.mapped_pages * i.bank.granularity ||
+                         i.bank.bytes % i.bank.granularity ||
+                         i.bank.bytes / i.bank.granularity != i.bank.free_pages + i.bank.mapped_pages))
+            throw std::logic_error("KV bank/mapping accounting mismatch");
         i.evictions = evictions_; i.reclaimed_bytes = reclaimed_; i.eviction_us = eviction_us_;
         return i;
     }

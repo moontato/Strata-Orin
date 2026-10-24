@@ -4,12 +4,13 @@ import threading
 
 
 class KvStatus:
-    PREFIXES = {"KVPOOL", "KVSESSION", "KVEVICT", "KVRESET", "KVINVALIDATE", "KVCACHE", "KVMOVE", "KVREPLAY", "KVCOMMIT", "KVMEM", "KVEND"}
+    PREFIXES = {"KVPOOL", "KVSESSION", "KVEVICT", "KVRESET", "KVINVALIDATE", "KVCACHE", "KVMOVE", "KVREPLAY", "KVCOMMIT", "KVMEM", "KVBANK", "KVEND"}
 
     def __init__(self):
         self.lock = threading.Lock()
         self.pool = {}
         self.memory = {}
+        self.bank = {}
         self.sessions = {}
         self.events = deque(maxlen=256)
         self.sequence = 0
@@ -29,6 +30,9 @@ class KvStatus:
         with self.lock:
             if kind == "KVPOOL":
                 self.pool = data
+                return True, None
+            if kind == "KVBANK":
+                self.bank = data
                 return True, None
             if kind == "KVMEM":
                 self.memory = data
@@ -66,6 +70,9 @@ class KvStatus:
 
     def snapshot(self):
         with self.lock:
-            return {"pool": dict(self.pool), "memory": dict(self.memory), "sessions": {str(s): dict(i) for s, i in self.sessions.items()},
-                    "evictions": [dict(e) for e in self.events], "last_sequence": self.sequence,
-                    "missed_events": self.missed_events}
+            result = {"pool": dict(self.pool), "memory": dict(self.memory), "sessions": {str(s): dict(i) for s, i in self.sessions.items()},
+                      "evictions": [dict(e) for e in self.events], "last_sequence": self.sequence,
+                      "missed_events": self.missed_events}
+            if self.bank:
+                result["bank"] = dict(self.bank)
+            return result

@@ -5,10 +5,12 @@
 #include <cuda_runtime.h>
 
 #include <mutex>
+#include <atomic>
 
 namespace strata::core {
 namespace {
 
+std::atomic<uint64_t> allocation_attempts{0}, allocations{0}, releases{0};
 struct Api {
     bool ok = false;
     uint64_t gran = 0;
@@ -71,6 +73,10 @@ const Api& api() {
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 
+VmmAllocationStats vmm_allocation_stats() {
+    return {allocation_attempts.load(), allocations.load(), releases.load()};
+}
+
 VmmChunk vmm_chunk_new() {
     const Api& a = api();
     if (!a.ok) return 0;
@@ -79,12 +85,16 @@ VmmChunk vmm_chunk_new() {
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = a.dev;
     CUmemGenericAllocationHandle h = 0;
+    ++allocation_attempts;
     if (a.create(&h, (size_t) a.gran, &prop, 0) != CUDA_SUCCESS) return 0;
+    ++allocations;
     return (VmmChunk) h;
 }
 
 bool vmm_chunk_release(VmmChunk h) {
-    return h == 0 || (api().ok && api().release((CUmemGenericAllocationHandle) h) == CUDA_SUCCESS);
+    if (!h) return true;
+    if (!api().ok || api().release((CUmemGenericAllocationHandle) h) != CUDA_SUCCESS) return false;
+    ++releases; return true;
 }
 void vmm_chunk_free(VmmChunk h) { (void) vmm_chunk_release(h); }
 
@@ -96,6 +106,7 @@ bool VmmRange::reserve(uint64_t bytes) {
     CUdeviceptr p = 0;
     if (a.reserve(&p, (size_t) (n * a.gran), 0, 0, 0) != CUDA_SUCCESS) return false;
     base_ = (unsigned long long) p;
+    borrowed_ = false;
     h_.assign((size_t) n, 0);
     unreleased_.reserve((size_t) n);
     return true;
@@ -104,7 +115,10 @@ bool VmmRange::reserve(uint64_t bytes) {
 void VmmRange::release() {
     if (base_ == 0) return;
     const Api& a = api();
-    for (int64_t i = 0; i < chunks(); ++i) discard_handle(unmap(i));
+    for (int64_t i = 0; i < chunks(); ++i) {
+        const auto h = unmap(i);
+        if (!borrowed_) discard_handle(h);
+    }
     // Failed unmapping is not permission to recycle a still-referenced address.
     // Retain the reservation/handles; on a fatal driver failure prefer a leak.
     if (!release_unmapped() || mapped_count() != 0) return;
@@ -128,6 +142,17 @@ int64_t VmmRange::mapped_count() const {
     int64_t n = 0;
     for (const VmmChunk h : h_) n += h != 0;
     return n;
+}
+
+bool VmmRange::map_borrowed(int64_t i, VmmChunk h) {
+    if (!h || i < 0 || i >= chunks() || mapped(i) || (!borrowed_ && physical_count())) return false;
+    borrowed_ = true;
+    if (!map_one(i, h)) return false;
+    if (set_access(i, i + 1)) return true;
+    // Neither this handle nor a successfully-unmapped handle is ever released
+    // here. The lender checks mapped(i) before returning it to its free list.
+    (void) unmap(i);
+    return false;
 }
 
 bool VmmRange::map_one(int64_t i, VmmChunk h) {
@@ -172,6 +197,7 @@ VmmChunk VmmRange::unmap(int64_t i) {
 namespace strata::core {
 bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
+VmmAllocationStats vmm_allocation_stats() { return {}; }
 VmmChunk vmm_chunk_new() { return 0; }
 void vmm_chunk_free(VmmChunk) {}
 bool vmm_chunk_release(VmmChunk h) { return h == 0; }
@@ -180,6 +206,7 @@ void VmmRange::release() {}
 void VmmRange::discard_handle(VmmChunk) {}
 bool VmmRange::release_unmapped() { return true; }
 int64_t VmmRange::mapped_count() const { return 0; }
+bool VmmRange::map_borrowed(int64_t, VmmChunk) { return false; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }
 bool VmmRange::commit_run(int64_t, int64_t) { return false; }

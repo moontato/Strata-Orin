@@ -1,5 +1,6 @@
 #pragma once
 #include "strata/core/unified_kv.hpp"
+#include "strata/core/unified_kv_bank.hpp"
 #include "strata/core/unified_kv_layout.hpp"
 #include "strata/core/vmm.hpp"
 #include "strata/core/unified_kv_host.hpp"
@@ -18,42 +19,73 @@ class UnifiedKvVmm final : public KvAdapter {
         VmmRange range;
         std::unique_ptr<UnifiedKvHostRange> host;
         KvPrefix layout;
+        KvBufferKind kind = KvBufferKind::attention;
+        UnifiedKvBank* bank = nullptr;
         std::vector<VmmChunk> unreleased;
-        ~Buffer() { for (auto h : unreleased) (void) vmm_chunk_release(h); }
+        ~Buffer() {
+            if (bank) for (int64_t c = 0; c < chunks(); ++c) (void) unmap(c);
+            for (auto h : unreleased) (void) vmm_chunk_release(h);
+        }
         uint8_t* base() const { return host ? host->base() : range.base(); }
         int64_t chunks() const { return host ? host->chunks() : range.chunks(); }
         bool mapped(int64_t c) const { return host ? host->mapped(c) : range.mapped(c); }
         uint64_t count() const { return host ? host->count() : (uint64_t) range.physical_count() + unreleased.size(); }
         bool map(int64_t c) {
-            return host ? host->map(c) : range.map_range(c, c + 1, [] { return VmmChunk{0}; });
+            if (!bank) return host ? host->map(c) : range.map_range(c, c + 1, [] { return VmmChunk{0}; });
+            const auto h = bank->take();
+            if (!h) return false;
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = range.map_borrowed(c, h);
+            bank->mapped((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count());
+            if (!ok && !range.mapped(c)) bank->put(h);
+            return ok;
         }
         bool unmap(int64_t c) {
             if (host) return host->unmap(c);
             const auto h = range.unmap(c);
+            if (bank) {
+                if (h) { bank->put(h); bank->unmapped(); }
+                return !range.mapped(c);
+            }
             if (h && !vmm_chunk_release(h)) { unreleased.push_back(h); return false; }
             return !range.mapped(c);
         }
     };
     std::vector<std::unique_ptr<Buffer>> buffers_;
     uint64_t cells_ = 0;
-    bool faulted_ = false;
+    bool faulted_ = false, quarantined_ = false;
+    UnifiedKvBank* bank_ = nullptr;
 public:
     std::function<bool(std::string&)> synchronize;
     std::function<bool(std::string&)> invalidate;
     // Native fault-injection gate; unset in engines. Never changes layout or kernels.
     std::function<bool()> mapping_test_hook;
     uint64_t max_cells = 0;
-    explicit UnifiedKvVmm(uint64_t max) : max_cells(max) {}
+    explicit UnifiedKvVmm(uint64_t max, UnifiedKvBank* bank = nullptr) : bank_(bank), max_cells(max) {}
+    const KvBacking* backing() const override { return bank_; }
+    uint64_t write_limit(uint64_t logical) const override {
+        return bank_ ? kv_retained_cells(logical, max_cells) : UINT64_MAX;
+    }
+    std::vector<KvCapacityLayout> capacity_layouts() const {
+        std::vector<KvCapacityLayout> out;
+        for (const auto& b : buffers_) out.push_back({b->layout, b->kind});
+        return out;
+    }
+    // Fatal owner shutdown failure: preserve every referenced VA/loan until
+    // process teardown, even if a subsequent stream query happens to succeed.
+    void quarantine() noexcept { quarantined_ = faulted_ = true; }
     ~UnifiedKvVmm() override {
         // Owners must destroy graphs and synchronize before destroying adapters.
         // A failed synchronization cannot make freeing in-flight memory safe.
         std::string error;
-        if (!quiesce(error)) {
+        if (quarantined_ || !quiesce(error)) {
             for (auto& b : buffers_) (void) b.release(); // deliberate leak on fatal device failure
         }
     }
-    void* reserve(KvPrefix layout, bool host = false) {
-        auto b = std::make_unique<Buffer>(); b->layout = layout;
+    void* reserve(KvPrefix layout, bool host = false, KvBufferKind kind = KvBufferKind::attention) {
+        if (bank_ && host) throw std::invalid_argument("--kv-preallocate does not support host KV backing");
+        auto b = std::make_unique<Buffer>(); b->layout = layout; b->kind = kind; b->bank = bank_;
         if (host) b->host = std::make_unique<UnifiedKvHostRange>();
         const bool ok = host ? b->host->reserve(layout.extent(), vmm_granularity()) : b->range.reserve(layout.extent());
         if (!ok) throw std::runtime_error("unified KV: virtual address reservation failed (streamed host backing requires Linux UVA)");
@@ -92,19 +124,28 @@ public:
                 if (!b->mapped((int64_t) c)) fresh.push_back({b.get(), (int64_t) c});
         if (fresh.empty()) { cover(cells); return true; }
         bool ok = true;
+        uint64_t initialized = 0, initialization_us = 0;
         for (const auto& f : fresh) {
             if (mapping_test_hook && !mapping_test_hook()) { error = "injected physical mapping failure"; ok = false; break; }
             if (!f.b->map(f.chunk)) {
                 if (f.b->host) error = f.b->host->error();
                 ok = false; break;
             }
+            const auto start = std::chrono::steady_clock::now();
             const auto e = cudaMemset(f.b->base() + (uint64_t) f.chunk * gran, 0, (size_t) gran);
+            initialization_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
             if (e != cudaSuccess) { error = cudaGetErrorString(e); ok = false; break; }
+            ++initialized;
         }
         if (ok) {
+            const auto start = std::chrono::steady_clock::now();
             const auto e = cudaDeviceSynchronize();
+            initialization_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
             if (e != cudaSuccess) { error = cudaGetErrorString(e); ok = false; }
         }
+        if (bank_) bank_->initialized(initialized, initialization_us);
         if (!ok) {
             if (error.empty()) error = "CUDA physical allocation/map/access failed";
             // cudaMemset may have returned before filling a freshly mapped page.
@@ -116,11 +157,25 @@ public:
                 return false; // retain mappings; manager faults the owner rather than recycling in-flight pages
             }
             for (const auto& f : fresh) {
-                if (!f.b->unmap(f.chunk)) error += "; rollback unmap failed";
+                if (!f.b->unmap(f.chunk)) { error += "; rollback unmap failed"; faulted_ = true; }
             }
             return false;
         }
         cells_ = std::max(cells_, cells);
+        return true;
+    }
+    bool trim_reservation(uint64_t logical, std::string& error) override {
+        if (!bank_) return true;
+        const auto keep = kv_retained_cells(logical, max_cells);
+        const auto gran = vmm_granularity();
+        for (auto& b : buffers_) {
+            const auto wanted = b->layout.chunks(keep, gran);
+            for (int64_t c = 0; c < b->chunks(); ++c)
+                if (b->mapped(c) && !std::binary_search(wanted.begin(), wanted.end(), (uint64_t) c) && !b->unmap(c)) {
+                    error = "CUDA unmap failed while trimming KV reservation"; faulted_ = true; return false;
+                }
+        }
+        cells_ = std::min(cells_, keep);
         return true;
     }
     bool discard(std::string& error) override {

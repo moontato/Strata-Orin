@@ -34,6 +34,21 @@ class Telemetry(unittest.TestCase):
         self.assertEqual(snap['memory']['admissible_bytes'], 12582912)
         self.assertNotIn('history', snap)
 
+    def test_bank_held_memory_is_not_cleared_by_slot_reset(self):
+        status = KvStatus()
+        self.assertNotIn('bank', status.snapshot())  # unchanged lazy/default schema
+        status.consume('KVPOOL committed_bytes=16777216 token_limit=500000')
+        handled, invalid = status.consume('KVBANK preallocated=1 bank_bytes=16777216 mapped_bytes=4194304 '
+                                         'free_pages=6 mapped_pages=2 physical_allocations=8 context_limit=262144')
+        self.assertEqual((handled, invalid), (True, None))
+        status.consume('KVRESET session=0 generation=2 epoch=3')
+        snap = status.snapshot()
+        self.assertEqual(snap['pool']['committed_bytes'], 16777216)
+        self.assertEqual(snap['bank']['bank_bytes'], 16777216)
+        self.assertEqual(snap['bank']['physical_allocations'], 8)
+        snap['bank']['bank_bytes'] = 0
+        self.assertEqual(status.snapshot()['bank']['bank_bytes'], 16777216)
+
     def test_workspace_admission_does_not_claim_the_destination_is_active_yet(self):
         status = KvStatus()
         status.consume('KVSESSION session=1 generation=1 epoch=2 state=resident tokens=1024 bytes=4096')

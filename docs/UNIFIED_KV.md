@@ -45,6 +45,11 @@ invalidated. A later request cannot mount a checkpoint of an evicted cache.
 
 ## Physical commitment
 
+The following describes the default **lazy** pool. The separate opt-in
+[Qwen3.6 physical preallocation path](Q36_KV_PREALLOCATION.md) holds an engine-owned
+page bank at startup, retains it across reset/eviction, and reports held versus
+mapped bytes separately. It preserves the same logical admission contract.
+
 CUDA VMM reserves addresses once and maps physical allocation granules as needed.
 Granularity comes from the device, not a hard-coded 2 MiB assumption. Qwen3.6 maps
 a prefix of **each head**, preserving its original head stride. QSA retains each

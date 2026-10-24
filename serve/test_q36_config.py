@@ -39,6 +39,17 @@ class Q36Config(unittest.TestCase):
         self.assertEqual(engine_args(cfg(vision=v, args=cfg()["args"] + ["--vision"])).count("--vision"), 1)
         self.assertNotIn("--vision", engine_args(cfg()))
 
+    def test_preallocation_is_explicit_and_preserves_the_requested_limits(self):
+        self.assertNotIn('--kv-preallocate', engine_args(cfg(parallel=4)))
+        args = ['--native', '/m/q36.gguf', '--max-context', '262144', '--kv-pool-tokens', '500000',
+                '--kv', 'int8', '--mtp', '2', '--batch-mtp', '--mtp-sampled', '--chunk', '512',
+                '--kv-checkpoint-mib', '1024', '--kv-checkpoint-interval', '1024', '--kv-preallocate']
+        actual = engine_args(cfg(parallel=4, args=args))
+        self.assertEqual(actual.count('--kv-preallocate'), 1)
+        self.assertEqual(actual[actual.index('--max-context') + 1], '262144')
+        self.assertEqual(actual[actual.index('--kv-pool-tokens') + 1], '500000')
+        self.assertEqual(actual[actual.index('--batch') + 1], '4')
+
     def test_an_explicit_batch_in_the_args_wins(self):
         c = cfg(parallel=4, args=cfg()["args"] + ["--batch", "2"])
         self.assertEqual(parallel_args(c, c["args"]), [])

@@ -133,6 +133,20 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   # Test expressions include operations; do not compile them away in Release.
   target_compile_options(unified_kv_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
   add_test(NAME unified_kv_test COMMAND unified_kv_test)
+  # CPU fault injection executes the production allocator, with only the CUDA
+  # driver boundary replaced. Never link this shim into an engine/native gate.
+  if(UNIX)
+    add_executable(kv_preallocation_test tests/core/kv_preallocation_test.cpp
+      src/core/vmm.cpp tests/fake_cuda/driver.cpp)
+    target_include_directories(kv_preallocation_test PRIVATE tests/fake_cuda include)
+    target_compile_definitions(kv_preallocation_test PRIVATE STRATA_KV_FAKE_DRIVER=1)
+    target_link_libraries(kv_preallocation_test PRIVATE Threads::Threads)
+    # Some alternate backends define these directory-wide. This hermetic CPU
+    # driver-shim target must still exercise vmm.cpp's CUDA branch, not its stub.
+    target_compile_options(kv_preallocation_test PRIVATE -UNDEBUG
+      -USTRATA_USE_HIP -USTRATA_HIP_GFX906 -USTRATA_GPU_METAL)
+    add_test(NAME kv_preallocation_test COMMAND kv_preallocation_test)
+  endif()
   add_executable(q36_prefix_checkpoint_test tests/core/q36_prefix_checkpoint_test.cpp)
   target_include_directories(q36_prefix_checkpoint_test PRIVATE include)
   target_link_libraries(q36_prefix_checkpoint_test PRIVATE Threads::Threads)
@@ -622,6 +636,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_options(unified_kv_vmm_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
     add_test(NAME unified_kv_vmm_test COMMAND unified_kv_vmm_test)
     set_tests_properties(unified_kv_vmm_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_executable(kv_preallocation_cuda_test tests/cuda/kv_preallocation_test.cu)
+    target_link_libraries(kv_preallocation_cuda_test PRIVATE strata_engine)
+    target_compile_options(kv_preallocation_cuda_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    add_test(NAME kv_preallocation_cuda_test COMMAND kv_preallocation_cuda_test)
+    set_tests_properties(kv_preallocation_cuda_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     add_executable(q36_kv_int8_test tests/cuda/q36_kv_int8_test.cu)
     target_link_libraries(q36_kv_int8_test PRIVATE strata_engine)
     target_compile_options(q36_kv_int8_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)

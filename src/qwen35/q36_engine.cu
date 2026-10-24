@@ -1320,11 +1320,36 @@ struct Engine {
         }
     }
 
+    bool kv_preallocate = false;
+    // Declared before adapters: all loans are drained before the bank dies.
+    std::unique_ptr<strata::core::UnifiedKvBank> kv_bank;
     std::unique_ptr<strata::core::UnifiedKvPool> kv_pool;
     std::vector<std::unique_ptr<strata::core::UnifiedKvVmm>> kv_adapters;
     std::vector<strata::core::KvIdentity> kv_ids;
     std::vector<uint64_t> kv_required;
     bool kv_protocol = false;
+
+    ~Engine() {
+        if(!kv_bank) return; // retain the original non-preallocated shutdown path
+        bool ok=cudaDeviceSynchronize()==cudaSuccess;
+        auto destroy=[&](cudaGraphExec_t& graph) {
+            if(graph && cudaGraphExecDestroy(graph)!=cudaSuccess) ok=false;
+            else graph=nullptr;
+        };
+        if(ok) {
+            for(auto& set:gsets) {
+                destroy(set.g1); destroy(set.gm1);
+                for(auto& graph:set.gv) destroy(graph);
+            }
+            for(auto& item:row_graphs) destroy(item.second);
+        }
+        if(!ok) {
+            std::fprintf(stderr,"--kv-preallocate: shutdown synchronization/graph destruction failed; quarantining KV until process teardown\n");
+            for(auto& adapter:kv_adapters) adapter->quarantine();
+        }
+        // Members now drain adapters before destroying the bank. No captured
+        // graph can reference physical pages returned to CUDA on normal exit.
+    }
 
     void kv_events() { if (kv_pool && kv_protocol) strata::core::kv_print_events(*kv_pool); }
     void kv_begin(int s, uint64_t required, bool replay) {
@@ -1363,7 +1388,7 @@ struct Engine {
         const auto& g = m->g;
         strata::core::UnifiedKvVmm* adapter = kv_pool ? kv_adapters[(size_t) slot].get() : nullptr;
         auto state = [&](size_t floats) -> float* {
-            return adapter ? (float*) adapter->reserve({floats * 4, UINT64_MAX, 1, 1, 0}) : dalloc(floats);
+            return adapter ? (float*) adapter->reserve({floats * 4, UINT64_MAX, 1, 1, 0}, false, strata::core::KvBufferKind::state) : dalloc(floats);
         };
         auto attention = [&]() -> float* {
             return adapter ? (float*) adapter->reserve({(uint64_t) g.head_dim * 4, 1, (uint64_t) ctx,
@@ -1404,7 +1429,7 @@ struct Engine {
         ss.checkpoints.interval = checkpoint_interval;
         ss.checkpoints.points.resize(checkpoint_count);
         for (size_t i=0;i<checkpoint_count;++i)
-            ss.checkpoint_data.push_back((float*) adapter->reserve({checkpoint_payload, UINT64_MAX, 1, 1, 0}));
+            ss.checkpoint_data.push_back((float*) adapter->reserve({checkpoint_payload, UINT64_MAX, 1, 1, 0}, false, strata::core::KvBufferKind::checkpoint));
     }
 
     /// The current session: `i`'s state, cache and position become the engine's (conv / S / kc / vc / pos / hlast).
@@ -1438,7 +1463,8 @@ struct Engine {
         ctx = ctx_;
         if (pool_tokens) {
             if (!strata::core::vmm_available()) throw std::runtime_error("unified KV requires CUDA VMM on the current device");
-            kv_pool = std::make_unique<strata::core::UnifiedKvPool>(ctx, pool_tokens, pool_bytes);
+            if (kv_preallocate) kv_bank = std::make_unique<strata::core::UnifiedKvBank>();
+            kv_pool = std::make_unique<strata::core::UnifiedKvPool>(ctx, pool_tokens, pool_bytes, kv_bank.get());
         }
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
@@ -1456,6 +1482,8 @@ struct Engine {
             checkpoint_count = strata::core::Q36PrefixCheckpoints::capacity(checkpoint_budget,checkpoint_payload,
                                                                           strata::core::vmm_granularity(),(unsigned)n_sess);
             const uint64_t rounded = strata::core::kv_mul(strata::core::kv_ceil(checkpoint_payload,strata::core::vmm_granularity()),strata::core::vmm_granularity());
+            if(kv_bank && !checkpoint_count)
+                throw std::runtime_error("--kv-preallocate: checkpoint budget cannot hold one snapshot per slot; increase --kv-checkpoint-mib");
             std::fprintf(stderr,"Qwen3.6 prefix checkpoints: budget=%llu payload=%llu rounded=%llu per_slot=%zu slots=%d interval=%llu reserved_ceiling=%llu%s\n",
                          (unsigned long long)checkpoint_budget,(unsigned long long)checkpoint_payload,(unsigned long long)rounded,
                          checkpoint_count,n_sess,(unsigned long long)checkpoint_interval,
@@ -1591,7 +1619,7 @@ struct Engine {
         if (kv_pool) {
             kv_required.resize((size_t) n_sess, 0);
             for (int s = 0; s < n_sess; ++s) {
-                auto a = std::make_unique<strata::core::UnifiedKvVmm>((uint64_t) ctx);
+                auto a = std::make_unique<strata::core::UnifiedKvVmm>((uint64_t) ctx, kv_bank.get());
                 a->synchronize = [this](std::string& error) {
                     const auto e = cudaStreamSynchronize(st);
                     if (e == cudaSuccess) return true;
@@ -1617,10 +1645,11 @@ struct Engine {
             const uint64_t per_token = (uint64_t) g.n_head_kv * (kv_int8 ? 2 * (g.head_dim + (g.head_dim / 64) * 2) : g.head_dim * 8) * attention_layers;
             std::fprintf(stderr, "Unified KV: enabled; model=Qwen3.6-35B-A3B slots=%d max_context=%d pool_tokens=%llu "
                          "kv_bytes_per_token=%llu logical_kv_bytes=%llu committed_bytes=0 vmm_granularity=%llu "
-                         "(alignment/recurrent state charged separately; no eager pool commitment)\n",
+                         "(alignment/recurrent state charged separately; %s)\n",
                          n_sess, ctx, (unsigned long long) pool_tokens, (unsigned long long) per_token,
                          (unsigned long long) strata::core::kv_mul(pool_tokens, per_token),
-                         (unsigned long long) strata::core::vmm_granularity());
+                         (unsigned long long) strata::core::vmm_granularity(),
+                         kv_bank ? "strict bank commitment follows before expert placement" : "no eager pool commitment");
         }
         std::fprintf(stderr, "Qwen3.6 KV: format=%s K+V storage=%s; prefill=FP16-staged cuBLAS; graphs=%s\n",
                      kv_int8 ? "int8" : "fp32", kv_int8 ? "signed INT8 + FP16 scales/64 values" : "FP32",
@@ -1671,6 +1700,21 @@ struct Engine {
         CK(memory_info(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+    }
+
+    void preallocate_kv() {
+        if (!kv_bank) return;
+        const auto bound = strata::core::kv_capacity_bound(kv_adapters[0]->capacity_layouts(),
+            (uint64_t) ctx, kv_pool->info().token_limit, (unsigned) n_sess, strata::core::vmm_granularity());
+        kv_bank->preallocate(bound, kv_pool->info().byte_limit, strata::core::unified_kv_available());
+        const auto b = kv_bank->backing_info();
+        std::fprintf(stderr, "KV_PREALLOCATE logical_tokens=%llu context_limit=%d slots=%d granularity=%llu "
+            "attention_pages=%llu state_bytes=%llu checkpoint_bytes=%llu bank_bytes=%llu free_pages=%llu "
+            "physical_allocations=%llu allocation_us=%llu padding=8 growth_quantum=256\n",
+            (unsigned long long)kv_pool->info().token_limit,ctx,n_sess,(unsigned long long)b.granularity,
+            (unsigned long long)bound.attention_pages,(unsigned long long)b.state_bytes,
+            (unsigned long long)b.checkpoint_bytes,(unsigned long long)b.bytes,(unsigned long long)b.free_pages,
+            (unsigned long long)b.allocations,(unsigned long long)b.allocation_us);
     }
 
     /// The recurrent state and the cache to a fresh sequence.
@@ -2548,12 +2592,18 @@ struct Engine {
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
         if (!use_graph) { body(); return; }
         if (!gx) {
+            if (kv_bank && !strata::core::unified_kv_available())
+                throw std::runtime_error("--kv-preallocate: no memory headroom for a new CUDA graph");
             cudaGraph_t graph = nullptr;
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
             body();
             CK(cudaStreamEndCapture(st, &graph));
             CK(cudaGraphInstantiate(&gx, graph, 0));
             CK(cudaGraphDestroy(graph));
+            if (kv_bank && !strata::core::unified_kv_available()) {
+                CK(cudaGraphExecDestroy(gx)); gx=nullptr;
+                throw std::runtime_error("--kv-preallocate: new CUDA graph exceeded memory headroom");
+            }
         }
         CK(cudaGraphLaunch(gx, st));
     }
@@ -2882,8 +2932,10 @@ struct Engine {
         auto& ss=sess[(size_t)cur];
         const int i=ss.checkpoints.placement((uint64_t)pos);
         if(i<0) return;
+        const auto started=Clock::now();
         checkpoint_transfer(ss,ss.checkpoint_data[(size_t)i],false);
         CK(cudaStreamSynchronize(st)); // publish metadata only after the entire state is copied
+        if(kv_bank) kv_bank->checkpoint_copy(checkpoint_payload,(uint64_t)(ms_since(started)*1000));
         const auto owner=kv_pool->session((uint32_t)cur);
         ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
     }
@@ -2896,22 +2948,31 @@ struct Engine {
         for(auto& q:inherited) if(q.pos>p.pos || q.generation!=p.generation || q.epoch!=p.epoch) q={};
         kv_ensure(dst,p.pos); // snapshots and every KV code/scale plane are charged to the adapter
         select(dst);
+        const auto started=Clock::now();
+        uint64_t copied=checkpoint_payload;
         checkpoint_transfer(b,a.checkpoint_data[(size_t)index],true);
         if(src!=dst) {
             const auto& g=m->g;
             for(size_t l=0;l<a.kc.size();++l) {
-                if(kv_int8 && a.kv8[l].k) CK(q36kv8::copy_prefix(b.kv8[l],a.kv8[l],ctx,p.pos,g.n_head_kv,st));
+                if(kv_int8 && a.kv8[l].k) {
+                    CK(q36kv8::copy_prefix(b.kv8[l],a.kv8[l],ctx,p.pos,g.n_head_kv,st));
+                    copied+=p.pos*g.n_head_kv*2*(g.head_dim+(g.head_dim/64)*2);
+                }
                 if(a.kc[l]) for(int h=0;h<g.n_head_kv;++h) {
                     const size_t offset=(size_t)h*ctx*g.head_dim, bytes=(size_t)p.pos*g.head_dim*4;
                     CK(cudaMemcpyAsync(b.kc[l]+offset,a.kc[l]+offset,bytes,cudaMemcpyDeviceToDevice,st));
                     CK(cudaMemcpyAsync(b.vc[l]+offset,a.vc[l]+offset,bytes,cudaMemcpyDeviceToDevice,st));
+                    copied+=2*bytes;
                 }
             }
-            for(size_t i=0;i<inherited.size();++i) if(inherited[i].pos)
+            for(size_t i=0;i<inherited.size();++i) if(inherited[i].pos) {
                 CK(cudaMemcpyAsync(b.checkpoint_data[i],a.checkpoint_data[i],checkpoint_payload,cudaMemcpyDeviceToDevice,st));
+                copied+=checkpoint_payload;
+            }
             b.live.assign(a.live.begin(),a.live.begin()+(size_t)p.pos);
         } else b.live.resize((size_t)p.pos);
         CK(cudaStreamSynchronize(st));
+        if(kv_bank) kv_bank->checkpoint_copy(copied,(uint64_t)(ms_since(started)*1000));
         strata::core::kv_require(kv_pool->replay_started(kv_ids[(size_t)dst]));
         const auto owner=kv_pool->session((uint32_t)dst);
         b.checkpoints.points=std::move(inherited);
@@ -3061,19 +3122,21 @@ struct Engine {
     /// chunk, a decode step and (with drafts) a speculative step at load do that before the first request; then the
     /// state, the cache position and the hybrid counters are as after load.
     bool warming = false;
-    void warmup() {
+    void warmup(int slot = 0) {
         const auto t0 = Clock::now();
+        select(slot);
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
         std::vector<int32_t> toks((size_t) (kv_pool ? std::min(tmax, ctx / 2) : tmax), filler);
-        const uint64_t warm_cells = toks.size() + (tmax > kGemmT + 1 ? kGemmT + 1 : 0) + 1 + (mtp_d > 0 ? mtp_d + 1 : 0);
+        const uint64_t warm_cells = toks.size() + (tmax > kGemmT + 1 ? kGemmT + 1 : 0) + 1 + (mtp_d > 0 ? mtp_d + 1 : 0) + (kv_bank ? 2 : 0);
         if (kv_pool && warm_cells > kv_pool->info().token_limit) {
+            if(kv_bank) throw std::runtime_error("--kv-preallocate: shared token ceiling cannot admit startup warmup");
             warming = false;
             std::fprintf(stderr, "strata-q36: warmup deferred: its temporary sequence exceeds the shared token ceiling; "
                                  "graphs and kernels initialize on first request\n");
             return;
         }
-        kv_begin(0, warm_cells, true);
+        kv_begin(slot, warm_cells, true);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
         if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
@@ -3081,6 +3144,7 @@ struct Engine {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
             spec_step(filler, fix, mtp_d, drafts, picks);
+            if(kv_bank) spec_step(filler, fix, 1, drafts, picks); // capture shortened terminal verify window too
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
@@ -3089,8 +3153,8 @@ struct Engine {
         hy_cpu_ms = 0;
         reset();
         if (kv_pool) {
-            strata::core::kv_require(kv_pool->end(kv_ids[0], 0));
-            strata::core::kv_require(kv_pool->reset(kv_ids[0], kv_ids[0]));
+            strata::core::kv_require(kv_pool->end(kv_ids[(size_t)slot], 0));
+            strata::core::kv_require(kv_pool->reset(kv_ids[(size_t)slot], kv_ids[(size_t)slot]));
         }
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
@@ -3130,6 +3194,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t reserve = (size_t) 768 << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
+    if (E.kv_bank && (slots > 0 || total > budget || total > strata::core::unified_kv_available())) {
+        err = "--kv-preallocate requires every main/MTP expert in GPU memory beside the physical KV bank, "
+              "scratch and headroom; requested configuration does not fit (no hybrid/packed-copy/score-buffer fallback)";
+        return false;
+    }
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
     // room, UD-Q6_K_XL on 32 GB): drop them - the decode reads the GGUF layout then, bitwise the same outputs, a little
     // slower - rather than run the hybrid mode with its CPU share and streamed prompt layers.  STRATA_Q36_KEEP_PACKED=1
@@ -4166,9 +4235,29 @@ struct Serve {
     }
 };
 
+// Optional developer-gate artifact, for exact off/on A/B comparison. Contains
+// lengths, raw vectors and serialized RNG, never timings or allocation addresses.
+class GateDump {
+    std::ofstream file_;
+public:
+    explicit GateDump(const std::string& path) : file_(path,std::ios::binary) {
+        if(!file_) throw std::runtime_error("cannot open gate state dump: "+path);
+        file_.exceptions(std::ios::badbit|std::ios::failbit);
+    }
+    template<class T> void vector(const std::vector<T>& values) {
+        const uint64_t n=values.size();
+        file_.write((const char*)&n,sizeof n);
+        file_.write((const char*)values.data(),(std::streamsize)(n*sizeof(T)));
+    }
+    void rng(const std::mt19937_64& state) {
+        std::ostringstream text; text<<state;
+        const auto s=text.str(); vector(std::vector<char>(s.begin(),s.end()));
+    }
+};
+
 // Developer-only focused GPU/model gate, not a benchmark or an HTTP feature.
 // FILE is two CSV token lines: the original prompt, then its revised system suffix.
-int checkpoint_regression(Engine& E,const std::string& file) {
+int checkpoint_regression(Engine& E,const std::string& file,const std::string& dump) {
     if(!E.checkpoint_count || E.n_sess!=4 || E.m->hybrid || E.mtp_d!=2)
         throw std::runtime_error("checkpoint test needs four slots, sufficient checkpoint budget, full-GPU experts and MTP 2");
     std::ifstream input(file);std::string original,revised;
@@ -4233,7 +4322,13 @@ int checkpoint_regression(Engine& E,const std::string& file) {
         E.kv_required[(size_t)s]=0;
         require(E.checkpoint_match(s,b)<0,"reset left a checkpoint available");
     }
-    require(E.kv_pool->info().committed_bytes==0,"checkpoint/KV physical memory survived reset");
+    require(E.kv_bank ? E.kv_pool->info().mapped_bytes==0 : E.kv_pool->info().committed_bytes==0,
+            "checkpoint/KV slot mappings survived reset");
+    if(E.kv_bank) require(E.kv_pool->info().committed_bytes==E.kv_bank->backing_info().bytes,
+                         "reset destroyed the physical bank");
+    if(!dump.empty()) {
+        GateDump out(dump); out.vector(restored); out.vector(fresh); out.vector(cloned); out.vector(restored_probe);
+    }
     std::printf("PREFIX_CHECKPOINT_TEST PASS common_tokens=%zu reused_tokens=%llu max_logit_abs=%.9g mtp=%d slots=%d\n",
                 common,(unsigned long long)expected,max_error,E.mtp_d,E.n_sess);
     return 0;
@@ -4251,7 +4346,7 @@ struct SampledMtpRun {
 /// window, state commit and sampler as serve. The first check is the full request
 /// text; the second forces both arms to stop after a common processed prefix so
 /// committed state and continuation can be compared.
-int sampled_mtp_regression(Engine& E, const std::string& file) {
+int sampled_mtp_regression(Engine& E, const std::string& file, const std::string& dump) {
     if (!E.mtp_sampled || E.mtp_d < 2 || E.m->hybrid)
         throw std::runtime_error("sampled-MTP test needs --mtp-sampled, --mtp 2 or more and full-GPU experts");
     std::ifstream input(file);
@@ -4391,6 +4486,17 @@ int sampled_mtp_regression(Engine& E, const std::string& file) {
     };
     const auto request_seq = run_request(false), request_spec = run_request(true);
     require(request_seq == request_spec, "sampled MTP request text differs from sequential request text");
+    if(!dump.empty()) {
+        GateDump out(dump);
+        for(const auto* run:{&sequential,&speculative}) {
+            out.vector(run->emitted); out.vector(run->hist); out.vector(run->live); out.vector(run->continued);
+            out.vector(run->continued_hist); out.vector(run->continued_live);
+            out.vector(run->logits); out.vector(run->continued_logits);
+            out.vector(std::vector<int64_t>{run->pos,run->offered,run->accepted});
+            out.rng(run->rng); out.rng(run->continued_rng);
+        }
+        out.vector(request_seq); out.vector(request_spec);
+    }
     std::printf("SAMPLED_MTP_TEST PASS sampled_tokens=%d continuation=%d request_tokens=%zu accepted=%d/%d "
                 "max_common_logit_abs=%.9g max_continuation_logit_abs=%.9g common_bytes=%d continuation_bytes=%d\n",
                 target, continuation, request_seq.size(), speculative.accepted, speculative.offered,
@@ -4406,10 +4512,10 @@ int serve(Engine& E) {
 }  // namespace
 
 static int q36_run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test;
+    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
-    bool warm = true;
+    bool warm = true, kv_preallocate = false;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false, mtp_sampled = false;
     uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX, checkpoint_budget = 0, checkpoint_interval = 1024;
@@ -4455,11 +4561,13 @@ static int q36_run(int argc, char** argv) {
             if (format != "fp32" && format != "int8") throw std::invalid_argument("Qwen3.6 --kv takes fp32 or int8");
             kv_int8 = format == "int8";
         }
+        else if (a == "--kv-preallocate") kv_preallocate = true;
         else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-interval") checkpoint_interval = strata::core::kv_parse_limit(next(), "--kv-checkpoint-interval");
         else if (a == "--kv-checkpoint-test") checkpoint_test = next();
+        else if (a == "--test-state-dump") test_state_dump = next();
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -4479,7 +4587,7 @@ static int q36_run(int argc, char** argv) {
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
                          "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
-                         "       [--mtp-sampled [--mtp-sampled-test FILE]]\n");
+                         "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n");
             return 2;
         }
     }
@@ -4508,6 +4616,22 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("--kv-checkpoint-test requires opt-in checkpoints and a unified pool");
     if (checkpoint_budget && !serve_mode && checkpoint_test.empty())
         throw std::invalid_argument("prefix checkpoints require --serve or --kv-checkpoint-test");
+    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty())
+        throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test or --mtp-sampled-test");
+    if (kv_preallocate) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
+        throw std::invalid_argument("--kv-preallocate requires CUDA SM87 Qwen3.6; omit it on this backend");
+#else
+        if (!kv_pool_tokens || !kv_int8 || mtp_d != 2 || batch != 4 || !batch_mtp || vision ||
+            !emb_file.empty() || expert_slots > 0 || expert_vram >= 0 || chunk == 0 || !warm)
+            throw std::invalid_argument("--kv-preallocate supports text full-GPU Qwen3.6 only: use --kv-pool-tokens N "
+                "--kv int8 --mtp 2 --batch 4 --batch-mtp --chunk N; keep warmup, omit vision and expert placement overrides");
+        int device = 0; cudaDeviceProp prop{};
+        CK(cudaGetDevice(&device)); CK(cudaGetDeviceProperties(&prop, device));
+        if (prop.major != 8 || prop.minor != 7)
+            throw std::invalid_argument("--kv-preallocate is supported only on CUDA SM87; omit it on this device");
+#endif
+    }
     Model m;
     std::string err;
     try {
@@ -4519,6 +4643,8 @@ static int q36_run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv_int8 = kv_int8;
+    E.kv_preallocate = kv_preallocate;
+    if (kv_preallocate && !m.has_mtp) throw std::runtime_error("--kv-preallocate requires the loaded Qwen3.6 MTP block");
     E.checkpoint_budget = checkpoint_budget;
     E.checkpoint_interval = checkpoint_interval;
     if (chunk == 0) {
@@ -4566,6 +4692,9 @@ static int q36_run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision, kv_pool_tokens, kv_pool_bytes);
+    // Hold the complete bank BEFORE expert placement. Strict placement may not
+    // consume its budget then silently offload experts or shrink other buffers.
+    E.preallocate_kv();
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
@@ -4591,9 +4720,32 @@ static int q36_run(int argc, char** argv) {
     E.draft_n = std::max(0, draft_vocab);
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
-    if (warm) E.warmup();
-    if (!checkpoint_test.empty()) return checkpoint_regression(E,checkpoint_test);
-    if (!sampled_mtp_test.empty()) return sampled_mtp_regression(E,sampled_mtp_test);
+    if (warm) {
+        if(E.kv_bank) { for(int s=0;s<E.n_sess;++s) E.warmup(s); E.select(0); }
+        else E.warmup();
+    }
+    if (E.kv_bank) {
+        if (!strata::core::unified_kv_available())
+            throw std::runtime_error("--kv-preallocate: post-warmup memory headroom exhausted; refusing READY");
+        strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
+    }
+    if (!checkpoint_test.empty() || !sampled_mtp_test.empty()) {
+        const auto allocations=E.kv_bank ? E.kv_bank->backing_info().allocations : 0;
+        const auto driver=strata::core::vmm_allocation_stats();
+        const int result=!checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
+                                                : sampled_mtp_regression(E,sampled_mtp_test,test_state_dump);
+        if(E.kv_bank) {
+            const auto info=E.kv_pool->info();
+            if(info.bank.allocations!=allocations || info.mapped_bytes ||
+               info.bank.driver_allocations!=driver.allocations || info.bank.driver_allocation_attempts!=driver.attempts ||
+               info.bank.driver_releases!=driver.releases)
+                throw std::runtime_error("preallocation gate leaked mappings or allocated physical pages after readiness");
+            strata::core::kv_print_status(*E.kv_pool,E.n_sess,strata::core::unified_kv_available());
+            std::printf("KV_PREALLOCATION_MODEL PASS physical_allocations=%llu driver_allocations=%llu mapped_bytes=0\n",
+                        (unsigned long long)allocations,(unsigned long long)info.bank.driver_allocations);
+        }
+        return result;
+    }
     if (serve_mode) return serve(E);
     E.kv_begin(0, std::min<uint64_t>(ctx, kv_pool_tokens ? kv_pool_tokens : (uint64_t) ctx), false);
     if (bench_pp > 0 || bench_tg > 0) {

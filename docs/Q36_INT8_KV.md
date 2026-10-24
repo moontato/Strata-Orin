@@ -12,6 +12,11 @@ Raw bytes per token per attention cache: `2 * 2 * (256 + 4*2) = 1056`, versus 40
 
 Reference checked: [Strata PR #3678](https://github.com/Niko1221/Strata/pull/3678), head `8e7742e8ac2412d59ed3b6a52a9aa7259bc1f128`. Its newer engine has an FP16 baseline and other cache formats, changed attention, Windows trimming and no corresponding unified-VMM ownership. It was **not** merged/cherry-picked. This implementation uses its group-64 INT8 format/GQA approach in a parallel path, with explicit four-plane batch selection and v0.1.45's FP32 default preserved. FP8, Q4 and sampled-MTP changes are not included.
 
+For optional startup backing of this same layout, see
+[Qwen3.6 physical preallocation](Q36_KV_PREALLOCATION.md). It keeps INT8 kernels,
+head strides and the shared logical capacity unchanged, with a separate physical
+bank and a page-rounding/distribution bound rather than raw bytes/token.
+
 ## Focused validation actually performed here
 
 * x86_64, CUDA 12.6.85, SM87: `strata`, `strata-q36`, `q36_kv_int8_test`, `unified_kv_test` built/linked.

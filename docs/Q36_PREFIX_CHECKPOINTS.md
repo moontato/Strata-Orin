@@ -40,6 +40,12 @@ The startup log prints the actual geometry-derived payload, rounding, per-slot c
 
 One record pins the earliest usable checkpoint. Two records pin that first point and roll the last. Three/four records also pin anchors at eligible chunks reaching 2x/4x the interval; only the last record rolls. Intervals do not split existing chunks. Long later prompt segments cannot evict every early anchor. The longest **retained**, validated point is used, not an unrecorded arbitrary token prefix.
 
+The separate opt-in [physical page bank](Q36_KV_PREALLOCATION.md) preallocates this
+same configured checkpoint ceiling before readiness. It does not change retention,
+copying, donor pins or identity validation. With that flag, reset must leave zero
+slot mappings while retaining bank-owned physical memory; without it, the original
+zero-physical-commitment reset assertion still applies.
+
 Snapshot buffers are fixed-state VMM ranges within their session's existing adapter. Virtual reservations occur at initialization; the bank's bounded physical storage is committed with that slot's first KV write, including for a short request that never reaches a checkpoint. All banks count in `KVPOOL`/`KVSESSION`, physical-byte limits and fresh UMA headroom. No maximum-context KV mirror, pageable host copy, persistence or swap backend is added. Captures/restores cost device copies and synchronization; opt-in performance has not been measured here.
 
 ## Focused validation

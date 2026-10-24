@@ -50,6 +50,8 @@ def memory(pid):
 class Native:
     def __init__(self, exe, args, prefix, timeout):
         self.timeout = timeout
+        started = time.monotonic()
+        self.bank = {}
         self.stderr = Path(str(prefix) + '.stderr.log').open('w')
         self.stdout = Path(str(prefix) + '.stdout.log').open('w')
         self.proc = subprocess.Popen([exe, '--serve', *args], stdin=subprocess.PIPE,
@@ -68,6 +70,7 @@ class Native:
                 if line.startswith('READY '):
                     self.context = int(line.split()[1])
                     break
+            self.startup_seconds = time.monotonic() - started
             if int(self.info.get('batch_slots', 0)) != 4:
                 raise NativeError('gate requires exactly four native slots; no silently reduced batch')
         except BaseException:
@@ -89,6 +92,7 @@ class Native:
         if line.startswith('INFO '): self.info.update(fields(line))
         if line.startswith('KVPOOL '): self.pool = fields(line)
         if line.startswith('KVMEM '): self.physical = fields(line)
+        if line.startswith('KVBANK '): self.bank = fields(line)
         if line.startswith('KVSESSION '):
             data = fields(line); self.sessions[int(data['session'])] = data
         if line.startswith('KVEVICT '): self.events.append(fields(line))
@@ -104,7 +108,7 @@ class Native:
         while not self.recv().startswith('KVEND '):
             pass
         return {'pool': dict(self.pool), 'sessions': {str(k): dict(v) for k, v in self.sessions.items()},
-                'memory': memory(self.proc.pid), 'physical_budget': dict(self.physical)}
+                'memory': memory(self.proc.pid), 'physical_budget': dict(self.physical), 'bank': dict(self.bank)}
 
     def reset(self):
         self.status()
@@ -113,8 +117,13 @@ class Native:
             while not self.recv().startswith('KVRESET '):
                 pass
         status = self.status()
-        if self.info.get('unified_kv') and status['pool']['committed_bytes'] != 0:
-            raise NativeError('reset did not reclaim physical KV')
+        if self.info.get('unified_kv'):
+            bank = status.get('bank', {})
+            if bank.get('preallocated'):
+                if bank['mapped_bytes'] != 0 or status['pool']['committed_bytes'] != bank['bank_bytes']:
+                    raise NativeError('reset leaked mappings or destroyed the preallocated bank')
+            elif status['pool']['committed_bytes'] != 0:
+                raise NativeError('reset did not reclaim physical KV')
 
     def batch(self, prompts, gen):
         """Queue admissions together; tokens of other slots may arrive during prefill."""
