@@ -56,6 +56,7 @@ class UnifiedKvVmm final : public KvAdapter {
     uint64_t cells_ = 0;
     bool faulted_ = false, quarantined_ = false;
     UnifiedKvBank* bank_ = nullptr;
+    KvHostMapFailure last_host_failure_ = KvHostMapFailure::none;
 public:
     std::function<bool(std::string&)> synchronize;
     std::function<bool(std::string&)> invalidate;
@@ -102,6 +103,9 @@ public:
     }
     void cover(uint64_t cells) override { cells_ = std::max(cells_, cells); }
     bool faulted() const override { return faulted_; }
+    KvHostMapFailure last_host_failure() const {
+        return faulted_ ? KvHostMapFailure::backend : last_host_failure_;
+    }
     uint64_t committed_bytes() const override {
         uint64_t chunks = 0;
         for (const auto& b : buffers_) chunks += b->count();
@@ -116,6 +120,7 @@ public:
         faulted_ = true; error = cudaGetErrorString(e); return false;
     }
     bool grow(uint64_t cells, std::string& error) override {
+        last_host_failure_ = KvHostMapFailure::none;
         struct Fresh { Buffer* b; int64_t chunk; };
         std::vector<Fresh> fresh;
         const uint64_t gran = vmm_granularity();
@@ -128,7 +133,10 @@ public:
         for (const auto& f : fresh) {
             if (mapping_test_hook && !mapping_test_hook()) { error = "injected physical mapping failure"; ok = false; break; }
             if (!f.b->map(f.chunk)) {
-                if (f.b->host) error = f.b->host->error();
+                if (f.b->host) {
+                    error = f.b->host->error();
+                    last_host_failure_ = f.b->host->last_failure();
+                }
                 ok = false; break;
             }
             const auto start = std::chrono::steady_clock::now();

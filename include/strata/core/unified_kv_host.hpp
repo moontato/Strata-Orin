@@ -68,6 +68,10 @@ struct KvHostDeviceInfo {
     }
 };
 
+// Diagnostic classification only: never changes which pointer is accepted.
+// Unknown attributes/API/cleanup failures are errors, not unsupported coverage.
+enum class KvHostMapFailure { none, unsupported_flat_address, backend };
+
 class UnifiedKvHostRange {
     // Retain the physical charge until unregister and OS reclamation both
     // succeed. A failed/partial registration can populate pages.
@@ -79,6 +83,7 @@ class UnifiedKvHostRange {
     KvHostDeviceInfo info_;
     bool info_ready_ = false;
     std::string error_;
+    KvHostMapFailure last_failure_ = KvHostMapFailure::none;
     std::string mapping(int64_t c, void* alias) const {
         const auto* p = base_ + (uint64_t) c * gran_;
         std::ostringstream out;
@@ -95,6 +100,7 @@ class UnifiedKvHostRange {
     }
 public:
     const std::string& error() const { return error_; }
+    KvHostMapFailure last_failure() const { return last_failure_; }
     ~UnifiedKvHostRange() {
 #if defined(__linux__)
         bool ok = true;
@@ -122,8 +128,13 @@ public:
     bool mapped(int64_t c) const { return mapped_.at((size_t) c) != 0; }
     uint64_t count() const { uint64_t n = 0; for (auto m : mapped_) n += m != 0; return n; }
     bool map(int64_t c) {
+        last_failure_ = KvHostMapFailure::backend;
 #if defined(__linux__)
-        if (mapped(c)) return (mapped_[(size_t) c] & registered) != 0;
+        if (mapped(c)) {
+            const bool ok = (mapped_[(size_t) c] & registered) != 0;
+            if (ok) last_failure_ = KvHostMapFailure::none;
+            return ok;
+        }
         if (!info_ready_) { if (!info_.query(error_)) return false; info_ready_ = true; }
         int current = -1;
         const auto current_result = cudaGetDevice(&current);
@@ -135,9 +146,13 @@ public:
             error_ = std::string("KV host commitment: ") + std::strerror(errno); return false;
         }
         mapped_[(size_t) c] = physical;
-        auto fail = [&](const std::string& reason) {
+        auto fail = [&](const std::string& reason, KvHostMapFailure failure = KvHostMapFailure::backend) {
             error_ = reason;
-            if (!unmap(c)) error_ += "; rollback retained physical host pages";
+            last_failure_ = failure;
+            if (!unmap(c)) {
+                error_ += "; rollback retained physical host pages";
+                last_failure_ = KvHostMapFailure::backend;
+            }
             return false;
         };
         const auto result = cudaHostRegister(p, (size_t) gran_, cudaHostRegisterMapped | cudaHostRegisterPortable);
@@ -164,7 +179,10 @@ public:
         // registration/re-registration; adjacency is not inferred from chunk 0.
         if (!alias || (alias != p && info_.can_use_host_pointer <= 0))
             return fail("KV host backing cannot satisfy flat device addressing: " + details +
-                        "; no direct-host-pointer guarantee; independent registration aliases cannot be concatenated");
+                        "; no direct-host-pointer guarantee; independent registration aliases cannot be concatenated",
+                        alias && info_.can_use_host_pointer == 0 ? KvHostMapFailure::unsupported_flat_address
+                                                                 : KvHostMapFailure::backend);
+        last_failure_ = KvHostMapFailure::none;
         return true;
 #else
         (void) c; return false;

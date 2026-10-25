@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <vector>
 #define CUDART_VERSION 13020
 using cudaError_t = int;
 using cudaDeviceAttr = int;
@@ -26,6 +27,10 @@ cudaError_t cudaHostRegister(void*, size_t, unsigned);
 cudaError_t cudaHostUnregister(void*);
 cudaError_t cudaHostGetDevicePointer(void**, void*, unsigned);
 namespace fake_cuda {
-extern int fail_create, fail_map, fail_access, fail_unmap, fail_release, fail_zero;
-extern size_t creates, releases, live_handles, maps, unmaps;
+extern int fail_create, fail_map, fail_access, fail_unmap, fail_release, fail_zero, fail_sync;
+extern size_t creates, releases, live_handles, maps, unmaps, memsets;
+extern int host_pointer_attribute, fail_host_attribute, fail_host_register, fail_host_alias, fail_host_unregister;
+extern bool host_alias_null;
+extern std::vector<bool> host_alias_identity;
+extern size_t host_registers, host_unregisters, host_alias_queries, live_host_registrations;
 }

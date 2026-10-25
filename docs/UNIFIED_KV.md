@@ -247,9 +247,13 @@ ctest --test-dir build-orin -R '^unified_kv' --output-on-failure
 
 The CUDA MMQ cache option naming is explained in BUILD.md: `STRATA_PREFILL_MMQ=OFF`
 is **not** a CUDA MMQ disable. Keep `libstrata_kq.so` beside the engine. The native
-VMM test must **pass, not skip** on Orin. It exercises head boundaries, rollback,
-four owners, LRU, old graph pointers after eviction, incremental host registrations,
-CPU/GPU coherence and the real QSA constructors for all formats/streaming/rings.
+VMM test must **exit 0, not skip** on Orin. Device VMM, head boundaries, rollback,
+four owners, LRU, graph replay, resident QSA formats and device ring tables remain
+mandatory. The [capability-aware review harness](Q36_KV_PREALLOCATION.md#capability-aware-native-host-coverage-correction-after-7cbe4df6)
+reports host-backed positive coverage separately: each registration must satisfy
+the flat-address contract, or explicitly reject it with verified rollback/accounting.
+Unsupported host coherence/stream/ring-restoration positives are not reported as
+passed. They do not skip device-only cases or excuse any allocator/API error.
 
 Record model/binary hashes, git revision, CUDA/GCC/JetPack versions, nvpmodel,
 clocks, cooling and competing memory users. Do not change these between arms.

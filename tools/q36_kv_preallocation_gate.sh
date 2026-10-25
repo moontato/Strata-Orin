@@ -15,11 +15,9 @@ done
 [[ $(git -C /mnt/ssd/llama-strata-pin rev-parse HEAD) == 3cf03257f219afbe7334045ff7c6a06ac68c627d ]]
 "$PYTHON" tools/q36_sampled_mtp_fixture.py --model "$MODEL" --out "$RESULTS/sampled.csv"
 "$PYTHON" tools/q36_prefix_checkpoint_fixture.py --model "$MODEL" --out "$RESULTS/checkpoints.csv"
-# Direct execution treats skip (77) as failure, unlike CTest's CUDA skip handling.
-for test in unified_kv_vmm_test q36_kv_int8_test kv_preallocation_cuda_test; do
-  "$BUILD/$test" > "$RESULTS/$test.log" 2>&1
-done
-grep -q 'KV_PREALLOCATION_TEST PASS' "$RESULTS/kv_preallocation_cuda_test.log"
+# Every native test must exit 0. Only explicit, rollback-checked unsupported
+# host-positive cases are partial coverage; device/ring checks remain mandatory.
+"$PYTHON" tools/q36_kv_preallocation_native_gate.py --build "$BUILD" --results "$RESULTS"
 base=(--model "$MODEL" --serve --max-context 262144 --batch 4 --kv-pool-tokens 500000
       --kv int8 --mtp 2 --batch-mtp --mtp-sampled --chunk 512
       --kv-checkpoint-mib 1024 --kv-checkpoint-interval 1024)

@@ -6,9 +6,11 @@ CUDA explicitly guarantees GPU access through the registered CPU pointer when `c
 
 This preserves incremental registration and reclamation; it does not reserve physical storage for the maximum context. Qwen3.6 GPU VMM and Flash-Next kernels are unchanged by this correction.
 
-A focused host-only test with mocked CUDA covered capability 0/1, matching/nonmatching aliases, an actual GetDevicePointer error, rollback and incremental preservation. This is not an Orin runtime pass. The old error alone does not reveal the actual Orin pointers or capability value: rerun with tracing to obtain them.
+`unified_kv_host_capability_test` runs the production guard, adapter, pool and native probe policy with a CPU driver shim. It covers capability 0/1, matching/nonmatching aliases, unknown attributes, GetDevicePointer/register/null-alias errors, incremental and re-registration rejection, partial rollback, retained charges on cleanup failure, recovery and device/host mixed allocations. It is not an Orin runtime pass.
 
-## If the Orin capability is zero
+The operator's `7cbe4df6` Orin run reported capability 0, CPU pointer `0xffff79e00000` and alias `0x1021c4000`: the guard correctly rejected this registration. The old native harness incorrectly required a host-positive pass before running the remaining device tests. The [corrected review harness](Q36_KV_PREALLOCATION.md#capability-aware-native-host-coverage-correction-after-7cbe4df6) uses explicit typed failure/probe results, checks rollback/accounting and reports host-positive coverage as unsupported while continuing applicable device cases. It never accepts exit 1/77 or hides allocator/API/cleanup failures. Attribute zero alone is NOT a rejection: an equal returned alias still satisfies the contract.
+
+## If the actual flat-address probe is unsupported
 
 Independent registrations have no requested device-address parameter. Their aliases cannot be concatenated by assuming a constant offset or by retrying registration until addresses happen to line up. `KvHostPools` is a flat device-pointer layout used by append, prefill mirror, refill and ring-restore operations; replacing its base with the first alias would leave later chunks incorrect and invalidate graph arguments.
 

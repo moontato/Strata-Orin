@@ -21,6 +21,13 @@ MUTATIONS = {
     'reservation-tail-not-reclaimed': ('unified_kv_vmm.hpp', 'if (!bank_) return true;', 'return true;'),
     'borrowed-handle-released-on-failure': ('unified_kv_vmm.hpp', 'range.map_borrowed(c, h)',
                                           'range.map_range(c, c + 1, [h] { return h; })'),
+    'force-unsupported-cpu-pointer': ('unified_kv_host.hpp',
+        'if (!alias || (alias != p && info_.can_use_host_pointer <= 0))', 'if (false)'),
+    'attribute-zero-skips-equal-alias': ('unified_kv_host.hpp',
+        'if (!alias || (alias != p && info_.can_use_host_pointer <= 0))',
+        'if (!alias || info_.can_use_host_pointer <= 0)'),
+    'cleanup-failure-hidden-as-unsupported': ('unified_kv_host.hpp',
+        'last_failure_ = KvHostMapFailure::backend;\n            }', 'last_failure_ = failure;\n            }'),
 }
 
 
@@ -35,9 +42,10 @@ def main():
             assert text.count(old) == 1, (name, 'mutation no longer unique')
             path.write_text(text.replace(old, new))
             exe = temp / 'test'
+            source = 'unified_kv_host_capability_test' if header == 'unified_kv_host.hpp' else 'kv_preallocation_test'
             subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++20', '-O1', '-pthread',
                             '-DSTRATA_KV_FAKE_DRIVER', '-I' + str(temp), '-Itests/fake_cuda', '-Iinclude',
-                            'tests/core/kv_preallocation_test.cpp', 'src/core/vmm.cpp',
+                            'tests/core/' + source + '.cpp', 'src/core/vmm.cpp',
                             'tests/fake_cuda/driver.cpp', '-o', str(exe)], cwd=ROOT, check=True)
             result = subprocess.run([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             if not result.returncode:

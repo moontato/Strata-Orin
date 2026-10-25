@@ -5,6 +5,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/platform/mapped_memory.hpp"
+#include "../support/unified_kv_host_probe.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -60,6 +61,68 @@ static void pattern_at(const uint8_t* p, size_t bytes, uint8_t expected,
 }
 #define pattern(pointer, bytes, expected) \
     pattern_at((pointer), (bytes), (expected), "pattern(" #pointer ", " #bytes ", " #expected ")", __FILE__, __LINE__)
+static bool host_registration_test() {
+    using strata::test::HostProbeResult;
+    test_phase("host registration / capability, incremental commit and CPU-GPU coherence");
+    const uint64_t gran = vmm_granularity();
+    UnifiedKvVmm adapter(3 * gran);
+    auto* host = (uint8_t*) adapter.reserve({1, 1, 3 * gran, 1, 0}, true);
+    UnifiedKvPool pool(3 * gran, 3 * gran);
+    auto id = pool.add(adapter);
+    uint8_t* out = nullptr;
+    cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    auto cleanup = [&] {
+        if (exec) cuda_check(cudaGraphExecDestroy(exec));
+        if (stream) cuda_check(cudaStreamDestroy(stream));
+        if (out) cuda_check(cudaFree(out));
+    };
+    bool prefix = false;
+    std::string reason;
+    auto grow = [&](uint64_t cells) {
+        if (strata::test::probe_kv_growth(pool, id, adapter, cells, true, reason) == HostProbeResult::supported)
+            return true;
+        if (prefix) pattern(host, 128, 0x73); // old contents survive partial rejection
+        strata::test::reset_host_probe(pool, id, adapter);
+        cleanup();
+        std::cerr << "host-backed positive coverage unsupported: " << reason << '\n';
+        return false;
+    };
+    kv_require(pool.begin(id, 3 * gran));
+    if (!grow(gran - 16)) return false;
+    assert(adapter.committed_bytes() == gran);
+    std::memset(host, 0x73, (size_t) gran);
+    strata::platform::mapped_memory_release(); prefix = true;
+    if (!grow(2 * gran + 16)) return false;
+    assert(adapter.committed_bytes() == 3 * gran);
+    pattern(host, 128, 0x73); pattern(host + gran, 128, 0);
+    test_phase("host registration / cross-registration copy");
+    cuda_check(cudaMalloc(&out, 128)); cuda_check(cudaStreamCreate(&stream));
+    cuda_check(cudaMemcpy(out, host + gran - 64, 128, cudaMemcpyDefault));
+    pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
+    test_phase("host registration / graph capture and replay");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    copy_bytes<<<1, 128, 0, stream>>>(host + gran - 64, out, 128);
+    cuda_check(cudaGetLastError()); cuda_check(cudaStreamEndCapture(stream, &graph));
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0)); cuda_check(cudaGraphDestroy(graph));
+    cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
+    pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
+    test_phase("host registration / reclaim, re-register and graph pointer reuse");
+    strata::test::reset_host_probe(pool, id, adapter); prefix = false;
+    kv_require(pool.begin(id, 3 * gran, true));
+    if (!grow(2 * gran + 16)) return false;
+    cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
+    pattern(out, 128, 0);
+    strata::platform::mapped_memory_acquire(); assert(host[gran - 1] == 0 && host[gran] == 0);
+    strata::test::reset_host_probe(pool, id, adapter);
+    test_phase("host registration / cleanup"); cleanup();
+    return true;
+}
+static void check_ring_table(const QsaState& state) {
+    assert(state.kv_mode == 2 && state.n_slots > 0 && state.n_slots < state.n_pages);
+    std::vector<int32_t> table((size_t) state.n_pages);
+    cuda_check(cudaMemcpy(table.data(), state.page_table, table.size() * sizeof(int32_t), cudaMemcpyDefault));
+    for (size_t i = 0; i < table.size(); ++i) assert(table[i] == (int32_t) (i % (size_t) state.n_slots));
+}
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
@@ -205,107 +268,101 @@ int main() {
             test_phase("graph pointer reuse / cleanup");
             cuda_check(cudaGraphExecDestroy(exec)); cuda_check(cudaStreamDestroy(stream)); cuda_check(cudaFree(output));
         }
-#if defined(__linux__)
-        {
-            // Several independent pinned registrations in one contiguous VA,
-            // CPU/GPU coherence, cross-registration copies and graph reuse after
-            // all physical host pages were discarded and registered again.
-            test_phase("host registration / incremental commit and CPU-GPU coherence");
-            const uint64_t gran = vmm_granularity();
-            UnifiedKvVmm adapter(3 * gran);
-            auto* host = (uint8_t*) adapter.reserve({1, 1, 3 * gran, 1, 0}, true);
-            UnifiedKvPool pool(3 * gran, 3 * gran);
-            auto id = pool.add(adapter);
-            kv_require(pool.begin(id, 3 * gran));
-            kv_require(pool.grow(id, gran - 16, [] { return UINT64_MAX; }));
-            assert(adapter.committed_bytes() == gran);
-            std::memset(host, 0x73, (size_t) gran);
-            strata::platform::mapped_memory_release();
-            kv_require(pool.grow(id, 2 * gran + 16, [] { return UINT64_MAX; }));
-            assert(adapter.committed_bytes() == 3 * gran);
-            pattern(host, 128, 0x73); pattern(host + gran, 128, 0);
-            test_phase("host registration / cross-registration copy");
-            uint8_t* out = nullptr;
-            cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
-            cuda_check(cudaMalloc(&out, 128)); cuda_check(cudaStreamCreate(&stream));
-            // These helpers also copy contiguous runs across registered chunks.
-            cuda_check(cudaMemcpy(out, host + gran - 64, 128, cudaMemcpyDefault));
-            pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
-            test_phase("host registration / graph capture and replay");
-            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-            copy_bytes<<<1, 128, 0, stream>>>(host + gran - 64, out, 128);
-            cuda_check(cudaGetLastError()); cuda_check(cudaStreamEndCapture(stream, &graph));
-            cuda_check(cudaGraphInstantiate(&exec, graph, 0)); cuda_check(cudaGraphDestroy(graph));
-            cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
-            pattern(out, 64, 0x73); pattern(out + 64, 64, 0);
-            test_phase("host registration / reclaim, re-register and graph pointer reuse");
-            kv_require(pool.end(id, 2 * gran)); kv_require(pool.reset(id, id));
-            assert(adapter.committed_bytes() == 0);
-            kv_require(pool.begin(id, 3 * gran, true));
-            kv_require(pool.grow(id, 2 * gran + 16, [] { return UINT64_MAX; }));
-            cuda_check(cudaGraphLaunch(exec, stream)); cuda_check(cudaStreamSynchronize(stream));
-            pattern(out, 128, 0);
-            strata::platform::mapped_memory_acquire(); assert(host[gran - 1] == 0 && host[gran] == 0);
-            kv_require(pool.end(id, 2 * gran)); kv_require(pool.reset(id, id));
-            test_phase("host registration / cleanup");
-            cuda_check(cudaGraphExecDestroy(exec)); cuda_check(cudaStreamDestroy(stream)); cuda_check(cudaFree(out));
-        }
-#endif
+        // Probe actual registrations. Attribute zero is NOT an unsupported
+        // result by itself: equal aliases satisfy the production contract.
+        const bool host_positive = host_registration_test();
+        unsigned host_rejections = host_positive ? 0 : 1;
+        std::cout << "UNIFIED_KV_COVERAGE case=host_incremental host_required=1 status="
+                  << (host_positive ? "passed" : "unsupported")
+                  << (host_positive ? "" : " rejection=passed reason=unsupported_flat_address") << '\n';
         // Exercise the ACTUAL QSA constructor/zero and all storage formats,
         // including authoritative streamed host memory and the draft ring.
         unified_qsa_enabled = true;
         const char* formats[] = {"FP16", "INT8", "Q4_0", "K8V4"};
-        const char* placements[] = {"device resident", "host streamed", "draft ring"};
-        for (int streamed : {0, 1, 2}) for (int format = 0; format < 4; ++format) {
+        const char* placements[] = {"device resident", "host streamed", "draft ring", "draft resident"};
+        const char* case_names[] = {"qsa_device_", "qsa_stream_", "qsa_ring_", "qsa_draft_resident_"};
+        unsigned device_passed = 0, host_passed = 0, host_unsupported = 0, ring_tables = 0;
+        for (int streamed : {0, 1, 2, 3}) for (int format = 0; format < 4; ++format) {
             const std::string qsa_case = std::string("QSA [format=") + formats[format] + ", placement=" + placements[streamed]
-                + (streamed == 2 && format == 3 ? ", effective=INT8 (MTP K8V4 rule)]" : "]");
+                + (streamed >= 2 && format == 3 ? ", effective=INT8 (MTP K8V4 rule)]" : "]");
             test_phase(qsa_case + " / constructor and initial zero");
             qsa_set_kv_int8(format == 1); qsa_set_kv_q4(format == 2); qsa_set_kv_hybrid(format == 3);
             qsa_set_kv_resident(streamed ? 20480 : 0);
-            if (streamed == 2 && format == 3) { qsa_set_kv_hybrid(false); qsa_set_kv_int8(true); } // MtpDrafter's K8V4 rule
+            if (streamed >= 2 && format == 3) { qsa_set_kv_hybrid(false); qsa_set_kv_int8(true); } // MtpDrafter's K8V4 rule
             ModelGeometry geometry;
             constexpr int64_t context = 32768;
             UnifiedKvVmm adapter(context);
             UnifiedKvPool pool(context, context);
-            const auto id = pool.add(adapter);
+            auto id = pool.add(adapter);
             QsaState state;
             void* arena = nullptr;
             {
                 UnifiedKvBinding binding(&adapter);
-                const int64_t ring = streamed == 2 ? 512 : 0;
+                // -1 is the production forced-resident draft layout, tested
+                // independently; NEVER substitute it for a rejected ring.
+                const int64_t ring = streamed == 2 ? 512 : streamed == 3 ? -1 : 0;
                 const auto bytes = qsa_state_bytes(geometry, context, true, ring);
                 cuda_check(cudaMalloc(&arena, bytes));
                 assert(qsa_state_init(geometry, context, arena, state, nullptr, ring));
                 qsa_state_zero(state, geometry, nullptr); // no dynamic pages at startup
                 cuda_check(cudaDeviceSynchronize());
             }
-            test_phase(qsa_case + " / first physical commit");
+            const bool requires_host = state.host.present();
+            assert(state.kv_mode == (streamed == 3 ? 0 : streamed));
+            assert(requires_host == (streamed == 1 || streamed == 2));
+            if (streamed == 2) { check_ring_table(state); ++ring_tables; }
+            test_phase(qsa_case + " / first physical commit or explicit host rejection");
             assert(adapter.committed_bytes() == 0);
             kv_require(pool.begin(id, context));
-            kv_require(pool.grow(id, 512, [] { return UINT64_MAX; }));
-            assert(adapter.committed_bytes() == adapter.bytes_for(512));
-            test_phase(qsa_case + " / zero committed state and fill prefix");
-            qsa_state_zero(state, geometry, nullptr); cuda_check(cudaDeviceSynchronize());
+            std::string reason;
+            auto grow = [&](uint64_t cells) {
+                return strata::test::probe_kv_growth(pool, id, adapter, cells, requires_host, reason) ==
+                       strata::test::HostProbeResult::supported;
+            };
+            bool positive = grow(512);
             const auto pointer = state.kv_hybrid || state.kv_int8 ? (void*) state.k_q :
                                  state.kv_q4 ? (void*) state.k_q4 : (void*) state.k_pool;
-            cuda_check(cudaMemset(pointer, 0x31, 128));
-            test_phase(qsa_case + " / growth and prefix preservation");
-            kv_require(pool.grow(id, 8192, [] { return UINT64_MAX; }));
-            pattern((const uint8_t*) pointer, 128, 0x31);
-            kv_require(pool.end(id, 8192));
-            test_phase(qsa_case + " / reset, recommit and zeroed-page check");
-            KvIdentity next; kv_require(pool.reset(id, next)); assert(adapter.committed_bytes() == 0);
-            assert(state.kv_unified_owner == &adapter); // the VA owner survives reset
-            kv_require(pool.begin(next, context, true));
-            kv_require(pool.grow(next, 512, [] { return UINT64_MAX; }));
-            pattern((const uint8_t*) pointer, 128, 0);
-            kv_require(pool.end(next, 512)); kv_require(pool.reset(next, next));
+            if (positive) {
+                assert(adapter.committed_bytes() == adapter.bytes_for(512));
+                test_phase(qsa_case + " / zero committed state and fill prefix");
+                qsa_state_zero(state, geometry, nullptr); cuda_check(cudaDeviceSynchronize());
+                cuda_check(cudaMemset(pointer, 0x31, 128));
+                test_phase(qsa_case + " / growth and prefix preservation");
+                positive = grow(8192);
+                pattern((const uint8_t*) pointer, 128, 0x31); // also on transactional rejection
+            }
+            if (positive) {
+                test_phase(qsa_case + " / reset, recommit and zeroed-page check");
+                strata::test::reset_host_probe(pool, id, adapter);
+                assert(state.kv_unified_owner == &adapter);
+                kv_require(pool.begin(id, context, true));
+                positive = grow(512);
+                if (positive) pattern((const uint8_t*) pointer, 128, 0);
+            }
+            strata::test::reset_host_probe(pool, id, adapter);
+            if (streamed == 2) check_ring_table(state); // device-only ring metadata remains exercised
+            if (!requires_host) { assert(positive); ++device_passed; }
+            else if (positive) ++host_passed;
+            else {
+                ++host_unsupported; ++host_rejections;
+                std::cerr << qsa_case << " host-backed positive coverage unsupported: " << reason << '\n';
+            }
+            std::cout << "UNIFIED_KV_COVERAGE case=" << case_names[streamed] << formats[format]
+                      << " host_required=" << (requires_host ? 1 : 0)
+                      << " status=" << (positive ? "passed" : "unsupported")
+                      << (positive ? "" : " rejection=passed reason=unsupported_flat_address")
+                      << (streamed == 2 ? " ring_table=passed" : "") << '\n';
             test_phase(qsa_case + " / cleanup");
             strata::kernels::rope_table_release(state.cos_tab);
             cuda_check(cudaFreeHost(state.host_step)); cuda_check(cudaFreeHost(state.host_pos)); cuda_check(cudaFree(arena));
         }
         unified_qsa_enabled = false;
-        std::cout << "native VMM, head boundaries, four owners, LRU, graph replay and QSA formats/stream/ring passed\n";
+        assert(device_passed == 8 && host_passed + host_unsupported == 8 && ring_tables == 4);
+        std::cout << "UNIFIED_KV_VMM_TEST PASS device_vmm=passed graph_reuse=passed qsa_device_passed=" << device_passed
+                  << " qsa_host_passed=" << host_passed << " qsa_host_unsupported=" << host_unsupported
+                  << " draft_ring_tables_passed=" << ring_tables
+                  << " host_incremental=" << (host_positive ? "passed" : "unsupported")
+                  << " host_rejections=" << host_rejections << '\n';
     } catch (const std::exception& error) {
         std::cerr << "unified_kv_vmm_test FAILED [phase: " << active_phase << "]\n" << error.what() << '\n'; return 1;
     }

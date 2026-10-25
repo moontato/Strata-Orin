@@ -189,14 +189,66 @@ zero initialization and checkpoint copies. Failed-map rollback can contribute to
 mapping time. A profiler is needed to separate lazy `KVCOMMIT` allocation versus
 map/access versus memset/sync; do not label its combined time as just allocation.
 
+## Capability-aware native host coverage (correction after `7cbe4df6`)
+
+The operator reports that CUDA/SM87 compilation and the original five CPU CTests
+passed on Orin at `7cbe4df6`. The GPU sequence then stopped in the unchanged
+`unified_kv_vmm_test` host-registration positive test: attribute
+`can_use_host_pointer_for_registered_mem=0`, CPU address `0xffff79e00000`, returned
+alias `0x1021c4000`. The production guard correctly rejected that unsupported flat
+address contract. The service was restored. **No preallocation GPU or model result
+was reached.** This is an operator report, not a local hardware run or raw log.
+
+The correction preserves the guard. `KvHostMapFailure` only adds explicit failure
+classification; it never changes the accepted pointer or concatenates aliases.
+The shared native/CPU probe calls production pool/adapter growth for every range,
+including later growth and re-registration. Attribute zero alone never skips a
+positive test: equal CPU/device addresses still satisfy the existing contract.
+Only confirmed zero capability plus a non-null unequal alias, successful rollback,
+unchanged old commitment and an intact active owner qualify as `unsupported`.
+Null aliases, query/API/allocation/map/access/sync/cleanup errors, byte-limit failures,
+faulted owners and partial rollback remain fatal. Unknown attributes cannot justify
+soft-skipping a failed registration; equal aliases can independently satisfy the guard.
+
+Actual QSA placement ownership comes from `kv_plan()` / `qsa_state_init()`:
+
+| Test placement | Mode | Authoritative host backing | Required native coverage |
+| --- | ---: | --- | --- |
+| Main resident | 0 | No | All four formats positive |
+| Main streamed | 1 | Yes | Positive, or explicit guarded rejection + reset/accounting |
+| Draft ring (`ring_cells=512`) | 2 | Yes, for restoration | Device ring-table checks always; host positive or guarded rejection |
+| Forced-resident draft (`ring_cells=-1`) | 0 | No | All four input formats positive; MTP K8V4 uses INT8 |
+
+The forced-resident draft is an independent constructor/layout case, **not** an
+automatic fallback for a rejected ring. Ring constructors and modulo page tables
+are checked for all four formats even if their host-backed positive portion is
+unsupported. The test does not claim ring mirror/refill or host graph/coherence
+coverage passed when that portion cannot execute.
+
+`UNIFIED_KV_COVERAGE` reports each of 17 cases: eight device-only QSA cases, eight
+host-requiring QSA cases and one host incremental/coherence/graph case. Unsupported
+entries must say `rejection=passed reason=unsupported_flat_address`. The final
+`UNIFIED_KV_VMM_TEST PASS` separately counts passed device tests, passed host tests,
+unsupported host positives, rejection checks and four device ring-table cases.
+`native-coverage.json` retains the lists separately; unsupported is never added to
+passed host coverage. All three native executables must still exit **0** and emit
+their required markers. Exit 1 (even with a host-addressing message), skip 77,
+missing cases, missing ring checks or inconsistent counters fail the gate.
+
+The INT8/preallocation native tests, sampled/checkpoint off/on byte comparisons,
+physical-allocation invariants, failure gates and benchmark remain mandatory and
+unchanged. Unsupported legacy Flash-Next host streaming does not authorize a
+weaker Qwen3.6 device-VMM/preallocation gate.
+
 ## Local validation and pending checks
 
 Run locally on x86_64 / GCC 12.2 / Python 3.11, with CMake 3.28.4 installed only
 in session scratch. No nvcc, CUDA headers/runtime/device, Orin or model is available.
 
-* Focused CPU CMake Release/CTest: **5/5 passed** — unified KV, prefix checkpoints,
-  sampled MTP, sampled request controller and new production preallocation test.
-* All five also compiled with `-Wall -Wextra -Werror` and non-PIE ASan/UBSan;
+* Focused CPU CMake Release/CTest: **6/6 passed** — unified KV, prefix checkpoints,
+  sampled MTP, sampled request controller, production preallocation and the new
+  host-capability/rejection regression (production guard/adapter/pool/probe).
+* All six also compiled with `-Wall -Wextra -Werror` and non-PIE ASan/UBSan;
   leak detection enabled. Production pool/bank/adapter/VmmRange are tested, with
   only CUDA's driver/runtime boundary replaced by a test-only shim.
 * Tests cover each slot reaching 262,144, aggregate 500,000, refusal of two active
@@ -205,17 +257,21 @@ in session scratch. No nvcc, CUDA headers/runtime/device, Orin or model is avail
   reset, rewind tail reclamation, stale checkpoint identity, startup byte/free-
   memory/allocation failure, partial map/access/initialization/unmap failure,
   failed-release accounting, recovery and zero live handles at shutdown.
-* Five compile-and-run negative controls deliberately break exhaustion, zeroing,
-  fresh-free admission, tail reclamation and borrowed ownership. All must fail.
-* **33/33 Python tests passed**: telemetry, config pass-through, validation-driver,
-  sampling-key, HTTP-benchmark mock and new benchmark/reset invariant tests.
+* Eight compile-and-run negative controls deliberately break exhaustion, zeroing,
+  fresh-free admission, tail reclamation, borrowed ownership, the host-pointer
+  guard, equal-alias support and cleanup-error classification. All must fail.
+* **44/44 Python tests passed**: telemetry, config pass-through, validation-driver,
+  sampling-key, HTTP-benchmark mock, benchmark/reset invariants and native harness
+  coverage policy. Tiny executable mocks prove that host-unsupported cases still
+  run INT8/preallocation and that exit 1/77 or missing markers cannot pass.
   Bash/Python syntax checks passed.
 * Compute kernels, prefill/platform sources, INT8 layout kernels, sampled verifier/
   request-controller headers and the layout calculator are source-byte unchanged
   from `f121cd08`. CUDA machine-code comparison is still pending.
 * HIP's no-VMM stub compiled with strict warnings. This is NOT a HIP engine build.
 
-**Pending:** CUDA 13.2 SM87 compile/link, native VMM/INT8/preallocation gates,
+**Pending for this correction:** CUDA 13.2 SM87 compile/link (the operator's pass
+was for `7cbe4df6`, not this corrected source), native VMM/INT8/preallocation gates,
 compute-sanitizer, every real-model gate and dump comparison, model cancellation/
 image legacy regressions, CUDA kernel machine-code preservation, all performance
 measurements, and full HIP/SYCL/other-backend builds touched by common headers.
@@ -229,10 +285,10 @@ CHECK=$(mktemp -d)
 cmake -S . -B "$CHECK/cmake" -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF \
   -DSTRATA_ENABLE_SYCL=OFF -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_BUILD_TESTS=ON \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build "$CHECK/cmake" --target unified_kv_test kv_preallocation_test \
+cmake --build "$CHECK/cmake" --target unified_kv_test kv_preallocation_test unified_kv_host_capability_test \
   q36_prefix_checkpoint_test q36_sampled_mtp_test q36_sampled_request_test -j4
 ctest --test-dir "$CHECK/cmake" \
-  -R '^(unified_kv_test|kv_preallocation_test|q36_prefix_checkpoint_test|q36_sampled_mtp_test|q36_sampled_request_test)$' \
+  -R '^(unified_kv_test|kv_preallocation_test|unified_kv_host_capability_test|q36_prefix_checkpoint_test|q36_sampled_mtp_test|q36_sampled_request_test)$' \
   --output-on-failure
 for n in unified_kv q36_prefix_checkpoint q36_sampled_mtp q36_sampled_request; do
   g++ -std=c++20 -O1 -g -Wall -Wextra -Werror -pthread -Iinclude \
@@ -240,13 +296,16 @@ for n in unified_kv q36_prefix_checkpoint q36_sampled_mtp q36_sampled_request; d
     "tests/core/${n}_test.cpp" -o "$CHECK/$n"
   ASAN_OPTIONS=detect_leaks=1 "$CHECK/$n"
 done
-g++ -std=c++20 -O1 -g -Wall -Wextra -Werror -pthread -Iinclude -Itests/fake_cuda \
-  -DSTRATA_KV_FAKE_DRIVER -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie \
-  tests/core/kv_preallocation_test.cpp src/core/vmm.cpp tests/fake_cuda/driver.cpp -o "$CHECK/preallocation"
-ASAN_OPTIONS=detect_leaks=1 "$CHECK/preallocation"
+for n in kv_preallocation_test unified_kv_host_capability_test; do
+  g++ -std=c++20 -O1 -g -Wall -Wextra -Werror -pthread -Iinclude -Itests/fake_cuda \
+    -DSTRATA_KV_FAKE_DRIVER -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie \
+    "tests/core/$n.cpp" src/core/vmm.cpp tests/fake_cuda/driver.cpp -o "$CHECK/$n"
+  ASAN_OPTIONS=detect_leaks=1 "$CHECK/$n"
+done
 python3 tools/check_kv_preallocation_negative.py
 python3 -m unittest serve.test_unified_kv serve.test_q36_config serve.test_server.SamplingKeys \
-  tools.test_unified_kv_validate tools.test_q36_sampled_mtp_http_bench tools.test_q36_kv_preallocation_bench
+  tools.test_unified_kv_validate tools.test_q36_sampled_mtp_http_bench tools.test_q36_kv_preallocation_bench \
+  tools.test_q36_kv_preallocation_native_gate
 ```
 
 ## Export without pushing
@@ -259,34 +318,50 @@ EXPORT="$HOME/strata-kv-review-exports"
 mkdir -p "$EXPORT"
 git -C "$DEV" status --short
 git -C "$DEV" log -1 --format=fuller
-git -C "$DEV" format-patch --binary --stdout \
-  f121cd08b17f43b219df27625fcbdf3bbf1c1204..feature/q36-kv-preallocation \
-  > "$EXPORT/q36-kv-preallocation.patch"
-git -C "$DEV" bundle create "$EXPORT/q36-kv-preallocation.bundle" feature/q36-kv-preallocation
-git -C "$DEV" bundle verify "$EXPORT/q36-kv-preallocation.bundle"
-sha256sum "$EXPORT"/q36-kv-preallocation.{patch,bundle} > "$EXPORT/SHA256SUMS"
+BASE=f121cd08b17f43b219df27625fcbdf3bbf1c1204
+git -C "$DEV" format-patch --binary --full-index --stdout \
+  "$BASE..feature/q36-kv-preallocation" > "$EXPORT/q36-kv-preallocation.patch"
+git -C "$DEV" diff --binary --full-index "$BASE" feature/q36-kv-preallocation \
+  > "$EXPORT/q36-kv-preallocation.diff"
+git -C "$DEV" bundle create "$EXPORT/q36-kv-preallocation-incremental.bundle" \
+  feature/q36-kv-preallocation "^$BASE"
+git -C "$DEV" bundle verify "$EXPORT/q36-kv-preallocation-incremental.bundle"
+sha256sum "$EXPORT"/q36-kv-preallocation.{patch,diff} \
+  "$EXPORT/q36-kv-preallocation-incremental.bundle" > "$EXPORT/SHA256SUMS"
 ```
 
-Copy these files to the Orin using your normal reviewed transfer mechanism.
-The bundle is self-contained. The patch alternative requires the exact base:
-create another isolated worktree at `f121cd08`, a new local review branch, then
-`git am /absolute/path/q36-kv-preallocation.patch`. **Use patch OR bundle, not both.**
+The review archive includes the complete patch mail series (implementation plus
+correction), a cumulative `.diff`, the incremental bundle, these docs and validation
+logs. The bundle requires `f121cd08` in the receiving repository and preserves both
+commit identities; it is not a self-contained clone. The patch series is for
+`git am` from the exact base only, not for reapplying over `7cbe4df6`. The `.diff`
+is the same complete final change as a plain Git patch. **Choose one import path.**
+On Orin, transfer staging remains `/mnt/ssd/tmp/strata-preallocation`; update the
+existing test worktree below by bundle fast-forward. Do not create another test
+worktree or reset/recreate the existing one.
 
 ## Isolated Orin build (no model or service operation)
 
 Do not touch `worktrees/current`, `worktrees/rollback`, `/mnt/ssd/strata-service`,
 OWUI or their configuration. Do not recreate retired top-level unified/checkpoint/
-sampled-MTP directories. Import the bundle into a new local branch/worktree:
+sampled-MTP directories. The **only** Orin test worktree is the already-created
+`/mnt/ssd/Strata-Orin/worktrees/preallocation`. The following updates that worktree
+only and refuses dirty or divergent local work. No production checkout is updated.
 
 ```bash
-REPO=/mnt/ssd/Strata-Orin
-BUNDLE=/absolute/path/to/copied/q36-kv-preallocation.bundle
-export TEST_REPO="$REPO/worktrees/kv-preallocation-review"
-test ! -e "$TEST_REPO"
-git -C "$REPO" bundle verify "$BUNDLE"
-git -C "$REPO" fetch "$BUNDLE" \
-  refs/heads/feature/q36-kv-preallocation:refs/heads/review/q36-kv-preallocation
-git -C "$REPO" worktree add "$TEST_REPO" review/q36-kv-preallocation
+export STAGING=/mnt/ssd/tmp/strata-preallocation
+export TEST_REPO=/mnt/ssd/Strata-Orin/worktrees/preallocation
+# Copy the new archive to "$STAGING/q36-kv-preallocation-review.tar.gz" first.
+tar -xzf "$STAGING/q36-kv-preallocation-review.tar.gz" -C "$STAGING"
+ART="$STAGING/strata-kv-preallocation-review"
+(cd "$ART" && sha256sum -c SHA256SUMS)
+BUNDLE="$ART/q36-kv-preallocation-incremental.bundle"
+test "$(git -C "$TEST_REPO" rev-parse --show-toplevel)" = "$TEST_REPO"
+test -z "$(git -C "$TEST_REPO" status --porcelain)"
+git -C "$TEST_REPO" bundle verify "$BUNDLE"
+git -C "$TEST_REPO" fetch "$BUNDLE" refs/heads/feature/q36-kv-preallocation
+git -C "$TEST_REPO" merge-base --is-ancestor 7cbe4df66f2788ff83c2fae8855901f7e597fed7 FETCH_HEAD
+git -C "$TEST_REPO" merge --ff-only FETCH_HEAD
 cd "$TEST_REPO"
 git merge-base --is-ancestor f121cd08b17f43b219df27625fcbdf3bbf1c1204 HEAD
 test -z "$(git status --porcelain)"
@@ -303,10 +378,10 @@ cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_PREFILL_MMQ=OFF \
   -DSTRATA_BUILD_TESTS=ON
 cmake --build "$BUILD" --target strata strata-q36 strata_kq unified_kv_test \
-  kv_preallocation_test unified_kv_vmm_test q36_kv_int8_test kv_preallocation_cuda_test \
+  kv_preallocation_test unified_kv_host_capability_test unified_kv_vmm_test q36_kv_int8_test kv_preallocation_cuda_test \
   q36_prefix_checkpoint_test q36_sampled_mtp_test q36_sampled_request_test -j4
 ctest --test-dir "$BUILD" \
-  -R '^(unified_kv_test|kv_preallocation_test|q36_prefix_checkpoint_test|q36_sampled_mtp_test|q36_sampled_request_test)$' \
+  -R '^(unified_kv_test|kv_preallocation_test|unified_kv_host_capability_test|q36_prefix_checkpoint_test|q36_sampled_mtp_test|q36_sampled_request_test)$' \
   --output-on-failure
 # STRATA_PREFILL_MMQ is HIP-only in this release. OFF does not disable CUDA MMQ.
 test -f "$BUILD/libstrata_kq.so"
@@ -330,7 +405,7 @@ SERVICE='REPLACE-WITH-ACTUAL-DEPLOYED-UNIT.service'
 SYSTEMCTL=(systemctl --user)      # system unit instead: (sudo systemctl)
 SYSTEMD_RUN=(systemd-run --user)  # system unit instead: (sudo systemd-run --uid="$(id -u)" --gid="$(id -g)")
 TEST_UNIT="strata-kv-preallocation-review-$$"
-export RESULTS="$(mktemp -d /mnt/ssd/strata-kv-review-results.XXXXXX)"
+export RESULTS="$(mktemp -d "$STAGING/results.XXXXXX")"
 export PAIRS=5
 export PROFILE=0  # set to 1 for an additional, separately recorded Nsight run (requires nsys)
 [[ "$("${SYSTEMCTL[@]}" is-active "$SERVICE")" == active ]]
@@ -386,7 +461,12 @@ files, executable, OWUI settings or service configuration.
   planes at full virtual extents, redistributes four slots, tests padded physical
   capacity, exhaustion and reset/eviction recycling with constant allocation
   counts. It needs no model or 262K-token prefill.
-* Existing unified VMM and INT8 native tests must exit 0, not skip (77).
+* Unified VMM, INT8 and preallocation native tests must exit 0, not skip (77).
+  `KV_NATIVE_DEVICE_GATES PASS` requires eight positive device-only QSA cases,
+  four ring-table cases and valid per-case coverage. `KV_NATIVE_HOST_COVERAGE`
+  separately reports positive passed/unsupported counts and verified rejections.
+  Inspect `native-coverage.json`: missing host-positive coverage is not a pass for
+  host streaming/coherence/ring restoration. A real allocator failure is fatal.
 * Both arms: `SAMPLED_MTP_TEST PASS`, positive offers **and accepts**, unchanged
   1e-4 full-logit tolerance, exact request/output/history/live/RNG/continuation
   checks; `PREFIX_CHECKPOINT_TEST PASS`, positive reused tokens, byte-identical
