@@ -32,6 +32,7 @@
 #include "q36_kernels.cuh"
 #include "q36_kv_int8.cuh"
 #include "strata/core/q36_prefix_checkpoint.hpp"
+#include "strata/core/q36_checkpoint_schedule.hpp"
 #include "strata/core/q36_vision_preallocation.hpp"
 #include "strata/core/q36_sampled_mtp.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
@@ -1237,6 +1238,10 @@ struct Engine {
     };
     uint64_t checkpoint_budget = 0, checkpoint_interval = 1024, checkpoint_payload = 0;
     uint64_t checkpoint_last_reused = 0; // focused native regression, not a scheduling hint
+    // Optional developer instrumentation. Null in every normal engine invocation.
+    strata::core::Q36ScheduleBook* schedule_book=nullptr;
+    std::function<void(int)> schedule_restored;
+    std::function<void(int,int)> schedule_before_restore;
     size_t checkpoint_count = 0;
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -1641,6 +1646,7 @@ struct Engine {
                     Sess& ss = sess[(size_t) s];
                     ss.live.clear(); ss.imgs.clear(); ss.pos = 0; ss.rdelta = 0;
                     ss.checkpoints.clear();
+                    if(schedule_book) schedule_book->reset(s);
                     if (cur == s) pos = 0;
                     if(kv_bank && vision && vision_lease.owner==s) release_vision_views();
                     // Every dependent device buffer belongs to this adapter and is
@@ -1741,6 +1747,7 @@ struct Engine {
 
     /// The recurrent state and the cache to a fresh sequence.
     void reset() {
+        if(schedule_book) schedule_book->reset(cur);
         sess[(size_t) cur].checkpoints.clear();
         if (kv_pool && !kv_adapters[(size_t) cur]->covers(1)) {
             pos = 0; sess[(size_t) cur].pos = 0; set_delta(0);
@@ -2971,6 +2978,7 @@ struct Engine {
         if(kv_bank) kv_bank->checkpoint_copy(checkpoint_payload,(uint64_t)(ms_since(started)*1000));
         const auto owner=kv_pool->session((uint32_t)cur);
         ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
+        if(schedule_book) schedule_book->capture(cur,(size_t)i);
     }
     bool checkpoint_restore(int src,int index,int dst,const strata::core::KvIdlePin* donor_pin) {
         const auto* destination_lease=src==dst ? &kv_ids[(size_t)dst] : nullptr;
@@ -2983,6 +2991,7 @@ struct Engine {
         select(dst);
         const auto started=Clock::now();
         uint64_t copied=checkpoint_payload;
+        if(schedule_before_restore) schedule_before_restore(src,index);
         checkpoint_transfer(b,a.checkpoint_data[(size_t)index],true);
         if(src!=dst) {
             const auto& g=m->g;
@@ -3014,6 +3023,8 @@ struct Engine {
         b.imgs.clear();clear_images(); // checkpoints are text-only; image requests never select them
         kv_progress(dst,p.pos);
         checkpoint_last_reused=p.pos;
+        if(schedule_book) schedule_book->restore(src,(size_t)index,dst);
+        if(schedule_restored) schedule_restored(dst);
         if(kv_protocol) std::printf("KVREPLAY session=%d generation=%llu epoch=%llu tokens=%llu reason=prefix_checkpoint\n",dst,
             (unsigned long long)owner.id.generation,(unsigned long long)owner.epoch,(unsigned long long)p.pos);
         std::fprintf(stderr,"Qwen3.6 prefix checkpoint: source=%d session=%d restored_tokens=%llu\n",src,dst,(unsigned long long)p.pos);
@@ -3066,6 +3077,8 @@ struct Engine {
         b.live = a.live;
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
+        if(schedule_book) schedule_book->copy(src,dst);
+        if(schedule_restored) schedule_restored(dst);
     }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
@@ -3606,6 +3619,7 @@ struct Serve {
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
     std::function<void(int64_t)> vision_test_on_chunk; // optional developer gate only
+    double schedule_prefill_ms=0; // optional developer gate measurement
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess), kv_batch_lease((size_t) e.n_sess, false) {
         E.kv_protocol = true;
@@ -4072,7 +4086,9 @@ struct Serve {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
+        if(E.schedule_book) E.schedule_book->begin(s,ids.data()+reuse,fresh,restored);
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+            if(E.schedule_book) E.schedule_book->progress(s,(uint64_t)done);
             if(geni && vision_test_on_chunk) vision_test_on_chunk(done);
             // Only fresh/restored text-prefill lineage has a fully seeded MTP
             // prefix. Preserve the exact-prefix decode fast path unchanged.
@@ -4105,6 +4121,7 @@ struct Serve {
         if(geni && E.kv_bank) E.set_delta(cut ? 0 : strata::core::q36_vision_prefix_delta(ir.mrope,ss.live.size()));
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
+        if(E.schedule_book) schedule_prefill_ms=prompt_ms;
         if (cancelled) {
             E.kv_end(s);
             if(geni && cut && E.kv_bank) {
@@ -4311,6 +4328,7 @@ public:
 
 #define STRATA_Q36_VISION_PREALLOCATION_IMPL 1
 #include "q36_vision_regression.inc"
+#include "q36_checkpoint_schedule.inc"
 
 // Developer-only focused GPU/model gate, not a benchmark or an HTTP feature.
 // FILE is two CSV token lines: the original prompt, then its revised system suffix.
@@ -4570,6 +4588,7 @@ int serve(Engine& E) {
 
 static int q36_run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump, vision_test;
+    std::string schedule_test, schedule_corrupt;
     uint64_t kv_vision_max_tokens=0;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
@@ -4627,6 +4646,8 @@ static int q36_run(int argc, char** argv) {
         else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-interval") checkpoint_interval = strata::core::kv_parse_limit(next(), "--kv-checkpoint-interval");
         else if (a == "--kv-checkpoint-test") checkpoint_test = next();
+        else if (a == "--kv-schedule-test") schedule_test = next();
+        else if (a == "--kv-schedule-corrupt") schedule_corrupt = next();
         else if (a == "--test-state-dump") test_state_dump = next();
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
@@ -4647,6 +4668,7 @@ static int q36_run(int argc, char** argv) {
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
                          "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
+                         "       [--kv-schedule-test FILE [--kv-schedule-corrupt conv|gdn|hlast]]\n"
                          "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n"
                          "       [--vision [--kv-vision-max-tokens N] [--kv-vision-test FILE]]\n");
             return 2;
@@ -4673,11 +4695,16 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
     if (checkpoint_budget && !kv_pool_tokens) throw std::invalid_argument("--kv-checkpoint-mib requires --kv-pool-tokens");
     if (checkpoint_budget && checkpoint_interval > (uint64_t)ctx) throw std::invalid_argument("checkpoint interval exceeds context");
+    if(!schedule_corrupt.empty() && schedule_test.empty()) throw std::invalid_argument("--kv-schedule-corrupt requires --kv-schedule-test");
+    if(!schedule_test.empty() && (!checkpoint_test.empty() || !vision_test.empty() || !sampled_mtp_test.empty()))
+        throw std::invalid_argument("select only one native developer test");
+    if(!schedule_test.empty() && (!checkpoint_budget || !kv_pool_tokens || batch!=4))
+        throw std::invalid_argument("--kv-schedule-test requires checkpoints, unified pool and four slots");
     if (!checkpoint_test.empty() && (!checkpoint_budget || !kv_pool_tokens))
         throw std::invalid_argument("--kv-checkpoint-test requires opt-in checkpoints and a unified pool");
-    if (checkpoint_budget && !serve_mode && checkpoint_test.empty())
+    if (checkpoint_budget && !serve_mode && checkpoint_test.empty() && schedule_test.empty())
         throw std::invalid_argument("prefix checkpoints require --serve or --kv-checkpoint-test");
-    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty() && vision_test.empty())
+    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty() && vision_test.empty() && schedule_test.empty())
         throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test, --mtp-sampled-test or --kv-vision-test");
     if(kv_vision_max_tokens && (!kv_preallocate || !vision || kv_vision_max_tokens>(uint64_t)ctx))
         throw std::invalid_argument("--kv-vision-max-tokens requires --kv-preallocate --vision and a limit <= context");
@@ -4796,10 +4823,11 @@ static int q36_run(int argc, char** argv) {
             throw std::runtime_error("--kv-preallocate: post-warmup memory headroom exhausted; refusing READY");
         strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
     }
-    if (!vision_test.empty() || !checkpoint_test.empty() || !sampled_mtp_test.empty()) {
+    if (!vision_test.empty() || !checkpoint_test.empty() || !sampled_mtp_test.empty() || !schedule_test.empty()) {
         const auto allocations=E.kv_bank ? E.kv_bank->backing_info().allocations : 0;
         const auto driver=strata::core::vmm_allocation_stats();
-        const int result=!vision_test.empty() ? vision_preallocation_regression(E,vision_test,test_state_dump)
+        const int result=!schedule_test.empty() ? checkpoint_schedule_regression(E,schedule_test,test_state_dump,schedule_corrupt)
+                        : !vision_test.empty() ? vision_preallocation_regression(E,vision_test,test_state_dump)
                         : !checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
                                                 : sampled_mtp_regression(E,sampled_mtp_test,test_state_dump);
         if(E.kv_bank) {
