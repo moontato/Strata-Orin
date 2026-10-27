@@ -84,8 +84,13 @@ class Vision(unittest.TestCase):
 
     def test_numerical_kernels_and_text_eligibility_source_unchanged(self):
         base=subprocess.check_output(['git','show',BASE+':src/qwen35/q36_engine.cu'],cwd=ROOT).decode();current=(ROOT/'src/qwen35/q36_engine.cu').read_text();diagnostic=overlay(base)
-        for marker in ['template <class F> int64_t process(', 'void f32mm(', 'void layer(', 'void forward(', 'void forward_mtp(', 'void run_rows(', 'void mtp_rows(', 'void preallocate_kv(', 'void checkpoint_capture(', 'bool checkpoint_available(']:
+        for marker in ['template <class F> int64_t process(', 'void f32mm(', 'void layer(', 'void forward(', 'void forward_mtp(', 'void run_rows(', 'void mtp_rows(', 'void preallocate_kv(', 'void checkpoint_transfer(', 'bool checkpoint_available(']:
             self.assertEqual(block(base,marker),block(current,marker),marker);self.assertEqual(block(base,marker),block(diagnostic,marker),marker)
+        # Capture publication now retires metadata before writing, but payload
+        # layout/copy, capacity, numerical methods and image eligibility stay fixed.
+        capture=block(current,'void checkpoint_capture(')
+        self.assertLess(capture.index('checkpoints.retire('),capture.index('checkpoint_transfer('))
+        self.assertLess(capture.index('cudaStreamSynchronize'),capture.index('checkpoints.publish('))
         marker='        const bool sampled_spec ='
         self.assertEqual(base[base.index(marker):base.index(';',base.index(marker))],current[current.index(marker):current.index(';',current.index(marker))])
         self.assertIn('if(!geni && fresh>1 && (!reuse || restored)) E.checkpoint_capture();',current)

@@ -1237,6 +1237,7 @@ struct Engine {
         std::vector<float*> checkpoint_data; // packed GDN/conv/hlast, owned by this slot's VMM adapter
     };
     uint64_t checkpoint_budget = 0, checkpoint_interval = 1024, checkpoint_payload = 0;
+    strata::core::Q36PrefixCheckpoints::Policy checkpoint_policy = strata::core::Q36PrefixCheckpoints::Policy::fixed;
     uint64_t checkpoint_last_reused = 0; // focused native regression, not a scheduling hint
     // Optional developer instrumentation. Null in every normal engine invocation.
     strata::core::Q36ScheduleBook* schedule_book=nullptr;
@@ -1441,6 +1442,7 @@ struct Engine {
         }
         ss.hlast = state((size_t) g.n_embd);
         ss.checkpoints.interval = checkpoint_interval;
+        ss.checkpoints.policy = checkpoint_policy;
         ss.checkpoints.points.resize(checkpoint_count);
         for (size_t i=0;i<checkpoint_count;++i)
             ss.checkpoint_data.push_back((float*) adapter->reserve({checkpoint_payload, UINT64_MAX, 1, 1, 0}, false, strata::core::KvBufferKind::checkpoint));
@@ -2958,27 +2960,66 @@ struct Engine {
         return strata::core::Q36PrefixCheckpoints::available(p,owner,ss.live.size(),(uint64_t)ss.pos,
             !ss.imgs.empty(),ss.active,kv_adapters[(size_t)s]->covers(p.pos),kv_pool.get(),donor_pin,destination_lease);
     }
-    int checkpoint_match(int s,const std::vector<int32_t>& ids) const {
+    size_t checkpoint_common(int s,const std::vector<int32_t>& ids) const {
+        const auto& live=sess[(size_t)s].live;
+        size_t common=0;
+        while(common<live.size() && common<ids.size() && live[common]==ids[common]) ++common;
+        return common;
+    }
+    int checkpoint_match(int s,const std::vector<int32_t>& ids,size_t common=SIZE_MAX) const {
         if(!checkpoint_count) return -1;
         const auto& ss=sess[(size_t)s];
-        size_t common=0;
-        while(common<ss.live.size() && common<ids.size() && ss.live[common]==ids[common]) ++common;
+        if(common==SIZE_MAX) common=checkpoint_common(s,ids);
         const auto owner=kv_pool->session((uint32_t)s);
-        const int i=ss.checkpoints.best(common,ids.size(),owner.id.generation,owner.epoch);
-        return checkpoint_available(s,i) ? i : -1;
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::fixed) {
+            const int i=ss.checkpoints.best(common,ids.size(),owner.id.generation,owner.epoch);
+            return checkpoint_available(s,i) ? i : -1;
+        }
+        return ss.checkpoints.best_available(common,ids.size(),owner.id.generation,owner.epoch,
+            [&](int i){return checkpoint_available(s,i);});
+    }
+    // Request-local observation, NOT a mutation during candidate discovery. Prefer
+    // the closest idle text lineage even if it has no useful snapshot yet.
+    // Full-prefix continuation in ANY slot is not evidence of a rewrite.
+    strata::core::Q36PrefixCheckpoints::Learning checkpoint_learning(const size_t* common_tokens) {
+        strata::core::Q36PrefixCheckpoints::Learning result;
+        if(checkpoint_policy!=strata::core::Q36PrefixCheckpoints::Policy::adaptive || !checkpoint_count) return result;
+        size_t longest=0;int source=-1;
+        for(int i=0;i<n_sess;++i) {
+            const auto& ss=sess[(size_t)i];const auto owner=kv_pool->session((uint32_t)i);
+            if(ss.active || !ss.imgs.empty() || owner.state!=strata::core::KvResidency::idle ||
+               !kv_adapters[(size_t)i]->covers(ss.live.size())) continue;
+            const size_t common=common_tokens[i];
+            if(common && common==ss.live.size()) return ss.checkpoints.learning;
+            if(common>longest) {longest=common;source=i;}
+        }
+        if(source>=0) {
+            result=sess[(size_t)source].checkpoints.learning;
+            const auto previous=sess[(size_t)source].live.size();
+            if(result.observe(longest,previous,(uint64_t)tmax))
+                std::fprintf(stderr,"Q36CHECKPOINT event=learn source=%d common_tokens=%zu previous_tokens=%zu rewrites=%llu\n",
+                    source,longest,previous,(unsigned long long)result.rewrites);
+        }
+        return result;
     }
     void checkpoint_capture() {
         if(!checkpoint_count) return;
         auto& ss=sess[(size_t)cur];
         const int i=ss.checkpoints.placement((uint64_t)pos);
         if(i<0) return;
+        // Retire before writing: a failed transfer cannot publish partial state.
+        const auto previous=ss.checkpoints.retire((size_t)i).pos;
         const auto started=Clock::now();
         checkpoint_transfer(ss,ss.checkpoint_data[(size_t)i],false);
         CK(cudaStreamSynchronize(st)); // publish metadata only after the entire state is copied
         if(kv_bank) kv_bank->checkpoint_copy(checkpoint_payload,(uint64_t)(ms_since(started)*1000));
         const auto owner=kv_pool->session((uint32_t)cur);
-        ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
+        ss.checkpoints.publish((size_t)i,{(uint64_t)pos,owner.id.generation,owner.epoch});
         if(schedule_book) schedule_book->capture(cur,(size_t)i);
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive)
+            std::fprintf(stderr,"Q36CHECKPOINT event=capture session=%d record=%d tokens=%lld replaced_tokens=%llu reason=%s copy_bytes=%llu copy_us=%llu\n",
+                cur,i,(long long)pos,(unsigned long long)previous,ss.checkpoints.capture_reason(i),
+                (unsigned long long)checkpoint_payload,(unsigned long long)(ms_since(started)*1000));
     }
     bool checkpoint_restore(int src,int index,int dst,const strata::core::KvIdlePin* donor_pin) {
         const auto* destination_lease=src==dst ? &kv_ids[(size_t)dst] : nullptr;
@@ -2992,6 +3033,7 @@ struct Engine {
         const auto started=Clock::now();
         uint64_t copied=checkpoint_payload;
         if(schedule_before_restore) schedule_before_restore(src,index);
+        if(src!=dst) b.checkpoints.clear(); // no publication during destination replacement
         checkpoint_transfer(b,a.checkpoint_data[(size_t)index],true);
         if(src!=dst) {
             const auto& g=m->g;
@@ -3028,6 +3070,9 @@ struct Engine {
         if(kv_protocol) std::printf("KVREPLAY session=%d generation=%llu epoch=%llu tokens=%llu reason=prefix_checkpoint\n",dst,
             (unsigned long long)owner.id.generation,(unsigned long long)owner.epoch,(unsigned long long)p.pos);
         std::fprintf(stderr,"Qwen3.6 prefix checkpoint: source=%d session=%d restored_tokens=%llu\n",src,dst,(unsigned long long)p.pos);
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive)
+            std::fprintf(stderr,"Q36CHECKPOINT event=restore source=%d session=%d tokens=%llu copy_bytes=%llu copy_us=%llu\n",
+                src,dst,(unsigned long long)p.pos,(unsigned long long)copied,(unsigned long long)(ms_since(started)*1000));
         return true;
     }
 
@@ -3867,7 +3912,8 @@ struct Serve {
 
     /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
     /// least recently used (never a decoding slot).
-    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                     const size_t* common_tokens=nullptr) const {
         int best = -1, free_empty = -1, lru = -1;
         size_t bl = 0;
         for (int i = 0; i < E.n_sess; ++i) {
@@ -3887,7 +3933,7 @@ struct Serve {
         if (best < 0 && imgs.empty() && E.checkpoint_count) {
             uint64_t longest=0;
             for(int i=0;i<E.n_sess;++i) {
-                const int cp=E.checkpoint_match(i,ids);
+                const int cp=E.checkpoint_match(i,ids,common_tokens ? common_tokens[i] : SIZE_MAX);
                 if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>longest) {
                     longest=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;best=i;
                 }
@@ -4012,8 +4058,14 @@ struct Serve {
             if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); return; }
         }
         stop.store(false);
+        // Reuse the actual rendered-token LCP once per slot, before admission.
+        std::array<size_t,Engine::kVerify> common_cache{};const size_t* common_tokens=nullptr;
+        if(!geni && E.checkpoint_count && E.checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive) {
+            for(int i=0;i<E.n_sess;++i) common_cache[(size_t)i]=E.checkpoint_common(i,ids);
+            common_tokens=common_cache.data();
+        }
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
-        const int s = adm ? slot : pick_session(ids, ir.imgs);
+        const int s = adm ? slot : pick_session(ids, ir.imgs,common_tokens);
         if (s < 0) {
             std::printf("ERR kv_session_busy: all inference slots are active\n"); std::fflush(stdout); return;
         }
@@ -4023,13 +4075,15 @@ struct Serve {
         int cp_src=-1, cp_index=-1;
         bool restored=false, full_donor=false;
         std::unique_ptr<strata::core::KvIdlePin> cp_pin;
+        // Keep hints local across reset; never mutate/republish donor records.
+        const auto learned = common_tokens ? E.checkpoint_learning(common_tokens) : strata::core::Q36PrefixCheckpoints::Learning{};
         if (!reuse && !geni && E.checkpoint_count) {
             // Prefer any full-state donor, exactly as before; checkpoint work is
             // only for requests the existing exact-prefix path cannot serve.
             if(adm) for(int i=0;i<E.n_sess;++i)
                 if(i!=s && !E.sess[(size_t)i].active && match_len(E.sess[(size_t)i],ids,ir.imgs)) full_donor=true;
             if(!full_donor) for(int i=0;i<E.n_sess;++i) {
-                const int cp=E.checkpoint_match(i,ids);
+                const int cp=E.checkpoint_match(i,ids,common_tokens ? common_tokens[i] : SIZE_MAX);
                 if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>reuse) {
                     reuse=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;cp_src=i;cp_index=cp;
                 }
@@ -4079,6 +4133,12 @@ struct Serve {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
+        }
+        if(!geni && E.checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive && E.checkpoint_count) {
+            ss.checkpoints.learning=learned;
+            ss.checkpoints.plan(reuse,ids.size(),(uint64_t)E.tmax);
+            std::fprintf(stderr,"Q36CHECKPOINT event=plan session=%d start_tokens=%zu target0=%llu target1=%llu\n",
+                s,reuse,(unsigned long long)ss.checkpoints.targets[0],(unsigned long long)ss.checkpoints.targets[1]);
         }
         Engine::VisionPrefillScope vision_scope(E,geni && bool(E.kv_bank));
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
@@ -4596,6 +4656,7 @@ static int q36_run(int argc, char** argv) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false, mtp_sampled = false;
     uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX, checkpoint_budget = 0, checkpoint_interval = 1024;
+    auto checkpoint_policy = strata::core::Q36PrefixCheckpoints::Policy::fixed;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4645,6 +4706,7 @@ static int q36_run(int argc, char** argv) {
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-interval") checkpoint_interval = strata::core::kv_parse_limit(next(), "--kv-checkpoint-interval");
+        else if (a == "--kv-checkpoint-policy") checkpoint_policy = strata::core::Q36PrefixCheckpoints::parse_policy(next());
         else if (a == "--kv-checkpoint-test") checkpoint_test = next();
         else if (a == "--kv-schedule-test") schedule_test = next();
         else if (a == "--kv-schedule-corrupt") schedule_corrupt = next();
@@ -4667,7 +4729,8 @@ static int q36_run(int argc, char** argv) {
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
-                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
+                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024 --kv-checkpoint-policy fixed|adaptive]\n"
+                         "       [--kv-checkpoint-test FILE]\n"
                          "       [--kv-schedule-test FILE [--kv-schedule-corrupt conv|gdn|hlast]]\n"
                          "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n"
                          "       [--vision [--kv-vision-max-tokens N] [--kv-vision-test FILE]]\n");
@@ -4693,6 +4756,8 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
     if (!kv_pool_tokens && kv_pool_bytes != UINT64_MAX)
         throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
+    if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive && !checkpoint_budget)
+        throw std::invalid_argument("--kv-checkpoint-policy adaptive requires --kv-checkpoint-mib");
     if (checkpoint_budget && !kv_pool_tokens) throw std::invalid_argument("--kv-checkpoint-mib requires --kv-pool-tokens");
     if (checkpoint_budget && checkpoint_interval > (uint64_t)ctx) throw std::invalid_argument("checkpoint interval exceeds context");
     if(!schedule_corrupt.empty() && schedule_test.empty()) throw std::invalid_argument("--kv-schedule-corrupt requires --kv-schedule-test");
@@ -4741,6 +4806,8 @@ static int q36_run(int argc, char** argv) {
     if (kv_preallocate && !m.has_mtp) throw std::runtime_error("--kv-preallocate requires the loaded Qwen3.6 MTP block");
     E.checkpoint_budget = checkpoint_budget;
     E.checkpoint_interval = checkpoint_interval;
+    E.checkpoint_policy = checkpoint_policy;
+    if(checkpoint_budget) std::fprintf(stderr,"Qwen3.6 checkpoint policy: %s\n",strata::core::Q36PrefixCheckpoints::name(checkpoint_policy));
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)

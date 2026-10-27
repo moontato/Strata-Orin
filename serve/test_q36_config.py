@@ -50,6 +50,14 @@ class Q36Config(unittest.TestCase):
         self.assertEqual(actual[actual.index('--kv-pool-tokens') + 1], '500000')
         self.assertEqual(actual[actual.index('--batch') + 1], '4')
 
+    def test_adaptive_checkpoint_policy_is_only_explicit(self):
+        self.assertNotIn('--kv-checkpoint-policy', engine_args(cfg(parallel=4)))
+        actual = engine_args(cfg(parallel=4, args=cfg()['args'] + [
+            '--kv-pool-tokens', '524288', '--kv-checkpoint-mib', '1024',
+            '--kv-checkpoint-policy', 'adaptive']))
+        self.assertEqual(actual[actual.index('--kv-checkpoint-policy') + 1], 'adaptive')
+        self.assertEqual(actual[actual.index('--kv-pool-tokens') + 1], '524288')
+
     def test_an_explicit_batch_in_the_args_wins(self):
         c = cfg(parallel=4, args=cfg()["args"] + ["--batch", "2"])
         self.assertEqual(parallel_args(c, c["args"]), [])

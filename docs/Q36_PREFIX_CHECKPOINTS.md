@@ -1,5 +1,13 @@
 # Opt-in Qwen3.6 prompt-prefix checkpoints
 
+For the vision-base integration, use the [independent schedule-matched oracle](Q36_CHECKPOINT_SCHEDULE.md)
+and [staged adaptive handoff](Q36_ADAPTIVE_INTEGRATION.md). Fixed remains default;
+`--kv-checkpoint-policy adaptive` is opt-in with the same four-payload ceiling.
+The historical gate below compares against a one-call fresh prefill, which is not
+necessarily the producer/suffix schedule. Do not use a different-schedule failure
+to diagnose restoration, relax its comparison, or repeat the closed projection
+study. Historical local compile/results below are not this integration's results.
+
 This addresses a changed retrieved-memory suffix **inside the initial system message**, not a missing conversation ID. The existing full-live-token exact-prefix path stays first. On a miss, the engine compares actual token IDs, selects the longest available retained checkpoint at or before the first differing token, restores it and reads the remaining suffix. Checkpoints do not depend on chat-role boundaries. **13,917 characters is not a token offset.**
 
 Enable only in a separate test process initially:
