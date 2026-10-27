@@ -1,5 +1,10 @@
 # Opt-in Qwen3.6 physical KV preallocation (review only)
 
+**Vision extension:** see [Q36_VISION_PREALLOCATION.md](Q36_VISION_PREALLOCATION.md)
+for the separate a9837161-based bounded vision path, current524288-token bank
+calculation and vision-only handoff. Historical text-only scope/500000 examples
+below are retained as measured/calculated provenance, not the new vision procedure.
+
 Based on sampled-MTP commit `f121cd08b17f43b219df27625fcbdf3bbf1c1204`.
 **Not GPU-qualified here. No deployment or speedup claim.** All existing defaults
 remain unchanged. Without `--kv-preallocate`, unified KV still allocates lazily
@@ -25,9 +30,11 @@ logical admission; active leases and pinned checkpoint donors are protected.
 
 Supported activation is deliberately narrow: CUDA SM87, text Qwen3.6, INT8 KV,
 four slots, MTP2, batch-MTP, explicit chunk and warmup. Sampled MTP and checkpoints
-remain separate opt-ins and retain their existing semantics. Images, other KV
-formats, other models/backends/devices, automatic chunk, no-warmup and explicit
-expert-placement overrides are refused with an actionable error. The no-model
+remain separate opt-ins and retain their existing semantics. This original
+scope was text-only; the linked vision extension adds startup-bounded ancillary
+staging for --serve without altering the KV calculator. Other KV formats,
+models/backends/devices, automatic chunk, no-warmup and explicit expert-placement
+overrides remain refused with an actionable error. The no-model
 allocator test itself can run on other CUDA VMM devices, but does not qualify
 inference there.
 

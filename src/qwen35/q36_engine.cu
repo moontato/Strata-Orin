@@ -32,6 +32,7 @@
 #include "q36_kernels.cuh"
 #include "q36_kv_int8.cuh"
 #include "strata/core/q36_prefix_checkpoint.hpp"
+#include "strata/core/q36_vision_preallocation.hpp"
 #include "strata/core/q36_sampled_mtp.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1262,6 +1263,9 @@ struct Engine {
     bool map_on = false;                // this forward's embeddings take picture rows
     std::vector<int32_t> img_map;       // the request's cell -> picture row (-1: text)
     int64_t img_prompt_cells = 0;       // the request's prompt length: cells below it use the table
+    uint64_t vision_max_rows=0; // strict mode: 0 selects context; optional explicit cap
+    strata::core::Q36VisionBudget vision_budget;
+    strata::core::Q36VisionLease vision_lease;
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
@@ -1343,8 +1347,13 @@ struct Engine {
             }
             for(auto& item:row_graphs) destroy(item.second);
         }
+        if(ok && vision) {
+            release_vision_views();
+            for(void* pointer:{(void*)d_img,(void*)d_mtab,(void*)d_map,(void*)logits_mr,(void*)pick_mr}) if(pointer && cudaFree(pointer)!=cudaSuccess) ok=false;
+            if(h_map && cudaFreeHost(h_map)!=cudaSuccess) ok=false;
+        }
         if(!ok) {
-            std::fprintf(stderr,"--kv-preallocate: shutdown synchronization/graph destruction failed; quarantining KV until process teardown\n");
+            std::fprintf(stderr,"--kv-preallocate: shutdown synchronization/graph/vision cleanup failed; quarantining KV until process teardown\n");
             for(auto& adapter:kv_adapters) adapter->quarantine();
         }
         // Members now drain adapters before destroying the bank. No captured
@@ -1592,6 +1601,9 @@ struct Engine {
             tok_m = dalloc_t<int32_t>(T);
             pos0_m = dalloc_t<int32_t>(1);
             pick_m = dalloc_t<int32_t>(1);
+            if(kv_bank && vision) { // image/text interleaving must not lazily create this ancillary scratch
+                logits_mr=dalloc((size_t)kVerify*g.n_vocab);pick_mr=dalloc_t<int32_t>(kVerify);
+            }
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
@@ -1630,6 +1642,7 @@ struct Engine {
                     ss.live.clear(); ss.imgs.clear(); ss.pos = 0; ss.rdelta = 0;
                     ss.checkpoints.clear();
                     if (cur == s) pos = 0;
+                    if(kv_bank && vision && vision_lease.owner==s) release_vision_views();
                     // Every dependent device buffer belongs to this adapter and is
                     // unmapped. Graphs and batch tables keep stable VA, not freed pointers.
                     return true;
@@ -1691,6 +1704,15 @@ struct Engine {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
             d_map = dalloc_t<int32_t>(T);
             CK(cudaHostAlloc((void**) &h_map, T * sizeof(int32_t), cudaHostAllocDefault));
+            if(kv_bank) {
+                vision_budget=strata::core::Q36VisionBudget::make((uint64_t)ctx,(uint64_t)N,(uint64_t)T,vision_max_rows);
+                vision_max_rows=vision_budget.image_rows;
+                img_cap=(size_t)(vision_budget.embedding_bytes/4);d_img=dalloc(img_cap);
+                std::fprintf(stderr,"KVVISION fixed=1 shared_prefill=1 max_image_rows=%llu image_bytes=%llu mrope_bytes=%llu map_bytes=%llu pinned_map_bytes=%llu batch_mtp_bytes=%llu encoder_workspace=external_not_in_bank\n",
+                    (unsigned long long)vision_max_rows,(unsigned long long)vision_budget.embedding_bytes,
+                    (unsigned long long)vision_budget.mrope_bytes,(unsigned long long)vision_budget.map_bytes,(unsigned long long)vision_budget.pinned_map_bytes,
+                    (unsigned long long)(m->has_mtp ? (uint64_t)kVerify*((uint64_t)g.n_vocab*4+4) : 0));
+            }
         }
         d_delta = dalloc_t<int32_t>(1);
         cur = 0;
@@ -2613,8 +2635,10 @@ struct Engine {
     // length take their rotary positions from the table, the text after it continues at cell + delta (what the pictures
     // did not use of their cells: llama.cpp's mtmd advances the text position by max(nx, ny) per picture).
     bool img_active = false;
+#include "q36_vision_staging.inc"
     void set_images(const std::vector<float>& rows, const std::vector<int32_t>& cell_row, const std::vector<int32_t>& mrope,
                     int64_t n_prompt, int32_t delta) {
+        if(kv_bank) {strict_set_images(rows,cell_row,mrope,n_prompt,delta);return;}
         const size_t need = rows.size();
         if (need > img_cap) {
             CK(cudaDeviceSynchronize());
@@ -2630,6 +2654,10 @@ struct Engine {
         set_delta(delta);
     }
     void clear_images() {
+        if(kv_bank && vision) {
+            if(vision_lease.busy()) vision_lease.check(cur);
+            release_vision_views();
+        }
         img_map.clear();
         img_active = false;
         img_prompt_cells = 0;
@@ -2642,6 +2670,11 @@ struct Engine {
         mtab_now = nullptr;
         map_on = false;
         if (!img_active) return;
+        if(kv_bank && vision) {
+            const auto owner=kv_pool->session((uint32_t)cur);
+            vision_lease.check(cur,owner.id.generation,owner.epoch);
+            if(owner.state!=strata::core::KvResidency::active) throw std::runtime_error("inactive vision prefill lease");
+        }
         if (c0 < img_prompt_cells) mtab_now = d_mtab;
         bool any = false;
         for (int j = 0; j < T; ++j) {
@@ -3525,6 +3558,17 @@ std::string build_images(const std::string& path, const std::vector<int32_t>& id
     return "";
 }
 
+// Strict mode uses bounded ancillary buffers; legacy image parsing stays unchanged.
+std::string build_images_bounded(const std::string& path,const std::vector<int32_t>& ids,Engine& e,
+                                const std::vector<uint64_t>& keys,ImgReq& r) {
+    try {
+        auto input=strata::core::q36_read_vision(path,ids,(uint64_t)e.m->g.n_embd,(uint64_t)e.ctx,e.vision_max_rows,keys);
+        r.rows=std::move(input.rows);r.cell_row=std::move(input.cell_row);r.mrope=std::move(input.mrope);r.delta=input.delta;
+        for(const auto& image:input.images) r.imgs.push_back({image.cell,image.n,image.hash});
+        return "";
+    } catch(const std::exception& error) {return error.what();}
+}
+
 // ------------------------------------------------------------------------------------------------ serve
 /// A batch slot: a session decoding (its next token is `x`, not yet in the state).
 struct Slot {
@@ -3561,6 +3605,7 @@ struct Serve {
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
+    std::function<void(int64_t)> vision_test_on_chunk; // optional developer gate only
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess), kv_batch_lease((size_t) e.n_sess, false) {
         E.kv_protocol = true;
@@ -3948,7 +3993,8 @@ struct Serve {
         if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); return; }
         ImgReq ir;
         if (geni) {
-            const std::string ve = build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
+            const std::string ve = E.kv_bank ? build_images_bounded(emb,ids,E,img_keys,ir)
+                                             : build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
             if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); return; }
         }
         stop.store(false);
@@ -4020,12 +4066,14 @@ struct Serve {
             ss.live.clear();
             ss.imgs.clear();
         }
+        Engine::VisionPrefillScope vision_scope(E,geni && bool(E.kv_bank));
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+            if(geni && vision_test_on_chunk) vision_test_on_chunk(done);
             // Only fresh/restored text-prefill lineage has a fully seeded MTP
             // prefix. Preserve the exact-prefix decode fast path unchanged.
             if(!geni && fresh>1 && (!reuse || restored)) E.checkpoint_capture();
@@ -4042,6 +4090,7 @@ struct Serve {
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
         }, restored);
+        vision_scope.finish(); // shared rows/table are not a decoding slot's persistent state
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -4053,10 +4102,15 @@ struct Serve {
             ss.live.clear();
             ss.imgs.clear();
         }
+        if(geni && E.kv_bank) E.set_delta(cut ? 0 : strata::core::q36_vision_prefix_delta(ir.mrope,ss.live.size()));
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
             E.kv_end(s);
+            if(geni && cut && E.kv_bank) {
+                strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t)s],E.kv_ids[(size_t)s]));
+                E.kv_required[(size_t)s]=0;
+            }
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) got);
             if (adm) std::printf("BADM %d 0\n", slot);
             std::fflush(stdout);
@@ -4254,6 +4308,9 @@ public:
         const auto s=text.str(); vector(std::vector<char>(s.begin(),s.end()));
     }
 };
+
+#define STRATA_Q36_VISION_PREALLOCATION_IMPL 1
+#include "q36_vision_regression.inc"
 
 // Developer-only focused GPU/model gate, not a benchmark or an HTTP feature.
 // FILE is two CSV token lines: the original prompt, then its revised system suffix.
@@ -4512,7 +4569,8 @@ int serve(Engine& E) {
 }  // namespace
 
 static int q36_run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump;
+    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump, vision_test;
+    uint64_t kv_vision_max_tokens=0;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true, kv_preallocate = false;
@@ -4562,6 +4620,8 @@ static int q36_run(int argc, char** argv) {
             kv_int8 = format == "int8";
         }
         else if (a == "--kv-preallocate") kv_preallocate = true;
+        else if (a == "--kv-vision-max-tokens") kv_vision_max_tokens=strata::core::kv_parse_limit(next(),"--kv-vision-max-tokens");
+        else if (a == "--kv-vision-test") vision_test=next();
         else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
@@ -4587,7 +4647,8 @@ static int q36_run(int argc, char** argv) {
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
                          "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
-                         "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n");
+                         "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n"
+                         "       [--vision [--kv-vision-max-tokens N] [--kv-vision-test FILE]]\n");
             return 2;
         }
     }
@@ -4616,16 +4677,21 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("--kv-checkpoint-test requires opt-in checkpoints and a unified pool");
     if (checkpoint_budget && !serve_mode && checkpoint_test.empty())
         throw std::invalid_argument("prefix checkpoints require --serve or --kv-checkpoint-test");
-    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty())
-        throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test or --mtp-sampled-test");
+    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty() && vision_test.empty())
+        throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test, --mtp-sampled-test or --kv-vision-test");
+    if(kv_vision_max_tokens && (!kv_preallocate || !vision || kv_vision_max_tokens>(uint64_t)ctx))
+        throw std::invalid_argument("--kv-vision-max-tokens requires --kv-preallocate --vision and a limit <= context");
+    if(!vision_test.empty() && (!vision || !kv_pool_tokens || batch!=4 || mtp_d!=2))
+        throw std::invalid_argument("--kv-vision-test requires --vision, unified KV, four slots and MTP2");
     if (kv_preallocate) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
         throw std::invalid_argument("--kv-preallocate requires CUDA SM87 Qwen3.6; omit it on this backend");
 #else
-        if (!kv_pool_tokens || !kv_int8 || mtp_d != 2 || batch != 4 || !batch_mtp || vision ||
+        if (!kv_pool_tokens || !kv_int8 || mtp_d != 2 || batch != 4 || !batch_mtp || (vision && !serve_mode) ||
             !emb_file.empty() || expert_slots > 0 || expert_vram >= 0 || chunk == 0 || !warm)
-            throw std::invalid_argument("--kv-preallocate supports text full-GPU Qwen3.6 only: use --kv-pool-tokens N "
-                "--kv int8 --mtp 2 --batch 4 --batch-mtp --chunk N; keep warmup, omit vision and expert placement overrides");
+            throw std::invalid_argument("--kv-preallocate supports full-GPU Qwen3.6: use --kv-pool-tokens N "
+                "--kv int8 --mtp 2 --batch 4 --batch-mtp --chunk N; keep warmup, omit --emb and expert placement overrides; "
+                "--vision uses bounded startup staging with --serve GENI/BGENI");
         int device = 0; cudaDeviceProp prop{};
         CK(cudaGetDevice(&device)); CK(cudaGetDeviceProperties(&prop, device));
         if (prop.major != 8 || prop.minor != 7)
@@ -4644,6 +4710,7 @@ static int q36_run(int argc, char** argv) {
     E.use_graph = graph;
     E.kv_int8 = kv_int8;
     E.kv_preallocate = kv_preallocate;
+    E.vision_max_rows=kv_vision_max_tokens;
     if (kv_preallocate && !m.has_mtp) throw std::runtime_error("--kv-preallocate requires the loaded Qwen3.6 MTP block");
     E.checkpoint_budget = checkpoint_budget;
     E.checkpoint_interval = checkpoint_interval;
@@ -4729,10 +4796,11 @@ static int q36_run(int argc, char** argv) {
             throw std::runtime_error("--kv-preallocate: post-warmup memory headroom exhausted; refusing READY");
         strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
     }
-    if (!checkpoint_test.empty() || !sampled_mtp_test.empty()) {
+    if (!vision_test.empty() || !checkpoint_test.empty() || !sampled_mtp_test.empty()) {
         const auto allocations=E.kv_bank ? E.kv_bank->backing_info().allocations : 0;
         const auto driver=strata::core::vmm_allocation_stats();
-        const int result=!checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
+        const int result=!vision_test.empty() ? vision_preallocation_regression(E,vision_test,test_state_dump)
+                        : !checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
                                                 : sampled_mtp_regression(E,sampled_mtp_test,test_state_dump);
         if(E.kv_bank) {
             const auto info=E.kv_pool->info();
