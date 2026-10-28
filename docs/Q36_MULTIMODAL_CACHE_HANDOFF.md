@@ -1,14 +1,72 @@
 # Qwen3.6 multimodal checkpoint handoff / fresh coding container
 
-## Delivery status — authentication blocker, no successful push
+## Delivery status — origin publication and coding-server validation VERIFIED
+
+Verified on 2026-10-28 in the actual checkout `/workspace` (container mount;
+resolve paths with `git rev-parse --show-toplevel`, not an older absolute path):
+
+- Origin: `https://github.com/moontato/Strata-Orin.git`.
+- Branch: `feature/q36-image-checkpoints`; source status was clean before this
+  documentation review.
+- Local HEAD AND live `git ls-remote --heads origin
+  refs/heads/feature/q36-image-checkpoints`:
+  **72457256fa0367660a8e0849bb19e234c6fc1711**.
+- The operator confirms the coding server fetched this branch from origin and ran
+  `python tools/q36_cpu_checks.py --negative-controls --sanitizers` successfully.
+  The available `logs/q36-dev-cpu/20261028T051337Z-15576/result.json` independently
+  records that HEAD, clean source, `PASS_CPU_ONLY`, negative controls and sanitizers.
+  Raw logs record 17/17 Release and sanitizer CTests, 86 Python tests plus 22
+  subtests, 22 mutation controls and source-preservation checks. The recorded host
+  used Python 3.13.5/GCC 14.2.0; its checkout path
+  `/mnt/external/Documents/GitHub/Strata-Orin` is historical, not this mount path.
+
+**Origin-only migration is complete.** The earlier authentication failure below
+is historical, not a current publication blocker. No new push or CPU-suite rerun
+was needed for this verification. The transport archive is now optional historical
+insurance; no original archive/worktree/artifact was removed. These CPU results
+are NOT CUDA/Orin correctness, positive GPU rewrite reuse or performance evidence.
+Image checkpoints remain disabled by default and not Orin-qualified.
+
+### Review blockers RESOLVED locally (CPU evidence); Orin qualification still pending
+
+The 2026-10-28 review found two concrete defects: the complete-state donor hook could
+observe another current slot's device rotary delta, and the gate's advertised absolute
+worker budget was not enforced outside native-child polling. Both are now fixed and
+regression-tested on this host; see
+[Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md) for the harness,
+scenario and mutation output.
+
+- New `src/qwen35/q36_restore_observation.inc` holds the observation boundary
+  contract; `Engine::copy_session` only requests an observation and the request path
+  fires it after `E.select(s)` and before the incoming upload/suffix.
+  `checkpoint_restore` observes in place. No production selection, caching, kernel,
+  schedule or sampling behaviour changed; with no developer hook nothing happens.
+- The image oracle now checks the observation boundary and producer/consumer counters
+  at every observation and verifies every observation against the independent replay.
+- `tools/q36_image_checkpoint_gate.py` became a supervisor+worker pair: one execution
+  budget (default300s, max420s) covering ALL phases enforced by a process-group kill,
+  plus a separate cleanup allowance (`--cleanup-seconds`, default20s, max60s) with an
+  owned-group-emptiness record. Only the supervisor prints a verdict, and it refuses a
+  killed or late worker. Never launch the worker without the supervisor.
+- New host controls: `tools/q36_restore_observation_harness.py`,
+  `tools/check_q36_restore_observation_negative.py` and
+  `tools/check_q36_gate_watchdog_negative.py`; the CPU runner now executes four
+  negative-control scripts. Six deterministic short-budget supervisor scenarios plus
+  verdict/slow-log-read/unowned-process checks live in `tools/test_q36_image_checkpoints.py`.
+
+This is host evidence only. Nothing was built or run on Orin, no model/service was
+started, and image checkpoints remain off by default and NOT Orin-qualified. The Orin
+recipe still requires a separately approved operator isolation window.
+
+### Historical authentication failure / recovery instructions (superseded)
 
 The normal push of portable-support commit **ad0988b66fea6cd62996c6bee42a179c37dd68b3**
 failed with `fatal: could not read Username for 'https://github.com': terminal
 prompts disabled`. The origin feature ref was absent when checked afterward.
-**Origin-only migration is NOT yet complete. No successful push/origin-branch clone
-is claimed.** Source, instructions and evidence are committed locally and preserved
-in the standalone transport bundle. If retiring this container before recovery,
-transfer the checksummed migration archive: it is REQUIRED until push succeeds.
+At that historical point, origin-only migration was not complete and no successful
+push/origin-branch clone was claimed. Source, instructions and evidence were
+committed locally and preserved in the standalone transport bundle. Archive
+transfer was required until push succeeded; that condition is now resolved.
 
 An independent full-bundle clone ofad0988b6 passed the documented fresh-venv CPU,
 Python,22 mutation and sanitizer checks; it has its OWN Git objects/refs, no
@@ -16,8 +74,9 @@ alternates/external commondir/worktree registry and `git fsck --full` passed.
 This is explicitly NOT the requested pushed-origin clone. Details/raw logs:
 `docs/validation/q36-migration/INDEPENDENT_CLONE.json` and independent-clone-*.
 
-After configuring normal GitHub authentication OUTSIDE source/Git (never copy
-credentials/tokens here), recover with the exact intended non-force refspec:
+Historical recovery instructions (already completed; do NOT repeat this push
+for the current task): after configuring normal GitHub authentication OUTSIDE
+source/Git (never copy credentials/tokens here), the intended non-force refspec was:
 
 ```bash
 git -C /workspace/tmp/image-checkpoints push origin HEAD:refs/heads/feature/q36-image-checkpoints
@@ -60,7 +119,7 @@ git -C /workspace/Strata-Orin remote set-url origin https://github.com/moontato/
   evidence and artifact generation, not a new numerical implementation. Determine
   the exact delivered support tip with `git rev-parse HEAD` and compare it to
   `git ls-remote origin refs/heads/feature/q36-image-checkpoints`; the delivery
-  report supplies the LOCAL tip and push status/hash (none if blocked). A document
+  report supplies the LOCAL tip and push status/hash (now verified above). A document
   cannot embed its own containing Git hash. Initial portable-support commit is
   ad0988b66fea6cd62996c6bee42a179c37dd68b3; later delivery-status changes do not alter
   the functional implementation.
@@ -115,17 +174,21 @@ Actual implementation:
   earlier-user rewrite history plus labelled native structural/identity controls.
   Prepared from saved actual1024-row red/blue outputs, no encoder launch. Positive
   steady after-image rewrite reuse REQUIRED; genuine zero cases stay zero.
-- `tools/q36_image_checkpoint_gate.py`: preflight, corruption/off/on sequential
-  children, absolute300s worker budget (max explicit420s), progress, fail-fast and
-  owned-group cleanup. Each arm passes its OWN independent matching-schedule
+- `tools/q36_image_checkpoint_gate.py`: supervisor+worker; preflight, corruption/off/on
+  sequential children, one execution budget (default300s, max420s) enforced over every
+  phase by a process-group kill, separate bounded cleanup allowance with an
+  owned-group-emptiness record, progress, fail-fast and a pure verdict that refuses a
+  killed or late worker. Each arm passes its OWN independent matching-schedule
   oracle; OFF/ON neutrality is not the correctness reference. Timings distinguish
   replay/reuse, prefill/request, synchronized copy cost and selected CPU metadata
   work. These are synthetic public-fixture measurements, not actual OWUI savings.
 
-**Next executable step in a new coding container:** perform the CPU setup/checks
-below, inspect Git status/diff, read `docs/Q36_IMAGE_CHECKPOINTS.md`, then review
-actual CUDA compile/readiness/oracle paths and prepare isolated Orin build/CPU
-fixture preflight. Do NOT run any model/service window without new operator
+**Current next step:** review actual CUDA compile/readiness/oracle paths and
+prepare isolated Orin build/CPU fixture preflight after resolving concrete review
+blockers. The coding-server CPU suite above is complete; do not repeat it without
+source changes or a specific concern. The setup/checks below remain reproduction
+instructions for a new environment, not an outstanding migration requirement.
+Read `docs/Q36_IMAGE_CHECKPOINTS.md` and inspect Git status/diff first. Do NOT run any model/service window without new operator
 approval. No Orin/GGUF image-checkpoint qualification was executed in this container.
 
 ## Verified context: do not repeat or misinterpret
@@ -164,15 +227,18 @@ Existing root `Dockerfile` is a runtime CUDA13.0 GPU/server image, not this SM87
 coding setup. **Do not use either for these coding checks.** They are not replaced.
 
 Tested manual environment: Debian12 x86_64, GCC/G++12.2.0, CPython3.11.2,
-CMake4.4.4, Ninja1.13.2. Project minimums: CMake3.24, C++20, runtime Python3.10+;
+CMake4.4.4, Ninja1.13.2. (This container's `.venv-q36-dev` had to be recreated with
+`python3 -m venv --clear` before `pip install -r requirements-q36-dev.txt`; put the
+venv `bin` on PATH so the runner finds its cmake/ninja. A build directory from another
+mount is rejected as a foreign cache: choose a NEW `--build-dir`.) Project minimums: CMake3.24, C++20, runtime Python3.10+;
 this focused dev lock is tested on Python3.11 (numpy2.4.6). Exact packages including
 pytest9.1.1, Jinja2/MarkupSafe, regex, numpy and Pillow and their test dependencies
 are in **requirements-q36-dev.txt**. Do not substitute an old container's venv or
 `/workspace/tmp/adaptive-integration-deps`/home PYTHONPATH. No private packages.
 
 ```bash
-# AFTER verified push (currently blocked), in a fresh Debian/Ubuntu coding container,
-# NOT on the production Orin. Before publication, clone the transferred full bundle instead:
+# Reproduction ONLY, in a fresh Debian/Ubuntu coding container, NOT production Orin.
+# Publication and the coding-server CPU suite are already verified above:
 apt-get update
 apt-get install -y --no-install-recommends git ca-certificates build-essential python3 python3-venv python3-pip
 git clone --branch feature/q36-image-checkpoints https://github.com/moontato/Strata-Orin.git /workspace/Strata-Orin
@@ -250,7 +316,7 @@ repository tests passed'.
 ## Evidence actually run and where it lives
 
 `docs/validation/q36-image-checkpoints/` preserves the implementation's small raw
-logs and VALIDATION.md in Git (origin publication blocked):17 selected CPU CTests;14 strict ASan/UBSan/leak
+logs and VALIDATION.md in Git (now published on origin):17 selected CPU CTests;14 strict ASan/UBSan/leak
 binaries +3 expected-failure text-oracle corruption cases;86 Python tests plus22
 subtests;8 new image +6 vision +8 bank mutations. Source invariants cover36 device/
 global definitions and unchanged numerical/transfer/bank/capacity/sampler/staging/
@@ -338,10 +404,10 @@ Supplemental `/workspace/tmp/q36-coding-migration-supplement.tar.gz` (+.sha256)
 preserves all pre-migration refs including the separate4815a036 historical fork,
 old37911119 review archive and inventory/proof. It contains NO venv/build/home
 cache or credentials. It also contains a CURRENT standalone full feature bundle.
-**Transfer is REQUIRED while origin push is authentication-blocked.** Once the
-feature push and a fresh origin clone are VERIFIED, this archive becomes optional
-historical insurance: all essential source/instructions/evidence are already
-committed for that push. Actual Orin GGUF/SVE/private traffic is external
+**The former required-transfer condition is resolved:** origin publication and
+coding-server validation are verified above. This archive is optional historical
+insurance: all essential source/instructions/evidence are already committed for
+that push. Keep existing copies; this is not an instruction to delete artifacts. Actual Orin GGUF/SVE/private traffic is external
 qualification input, not secretly in that archive. No originals were deleted.
 
 Regenerate a CURRENT review, including commits/patch/incremental bundle/source/

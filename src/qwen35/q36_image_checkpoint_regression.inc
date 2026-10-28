@@ -16,14 +16,23 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
     require(e.vision && e.kv_bank && e.kv_pool && e.checkpoint_count==4 && e.checkpoint_interval==1024 && e.n_sess==4 &&
         e.tmax==512 && e.vision_max_rows==1024 && e.mtp_d==2 && !e.m->hybrid,"image checkpoint gate requires strict qualified geometry");
     require(corrupt.empty() || corrupt=="conv","unsupported image corruption control");
-    Q36ScheduleBook book;e.schedule_book=&book;Serve server(e);ScheduleState restored;uint64_t restored_pos=0;bool injected=false;
+    Q36ScheduleBook book;e.schedule_book=&book;Serve server(e);bool injected=false;
+    struct Observation {uint64_t pos=0;ScheduleState state;bool verified=false;};
+    std::vector<Observation> observations;
     struct Cleanup {Engine& e;~Cleanup(){e.schedule_book=nullptr;e.schedule_restored={};e.schedule_before_restore={};}} cleanup{e};
     auto reset=[&](int s) {kv_require(e.kv_pool->reset(e.kv_ids[(size_t)s],e.kv_ids[(size_t)s]));e.kv_required[(size_t)s]=0;};
     auto reset_all=[&](){require(!server.n_active,"active image gate slot");for(int s=0;s<4;++s) reset(s);};
     e.schedule_restored=[&](int dst) {
-        const auto& recipe=book.live.at(dst);restored_pos=q36_schedule_size(recipe);
+        // Boundary contract, checked at EVERY observation: the observed slot IS the
+        // current one (so its CPU/device rotary pair belongs to it), the engine sits
+        // exactly at the restored boundary, and no new suffix has been consumed.
+        require(e.cur==dst,"image gate observed restored state for a non-current destination");
+        const auto& recipe=book.live.at(dst);const auto end=q36_schedule_size(recipe);
+        require(e.pos==(int64_t)end && e.sess[(size_t)dst].live.size()==end && e.sess[(size_t)dst].pos==(int64_t)end,
+            "image gate observed restored state outside its boundary");
         const auto seeded=q36_schedule_mtp(recipe);require(std::all_of(seeded.begin(),seeded.end(),[](bool v){return v;}),"restored image prefix has unseeded MTP cells");
-        restored=image_schedule_state(e,dst,recipe);
+        observations.push_back({end,image_schedule_state(e,dst,recipe),false});
+        require(observations.size()<=2,"image gate observed more than two restored states per request");
     };
     e.schedule_before_restore=[&](int src,int index) {
         if(corrupt.empty() || injected) return;
@@ -45,11 +54,23 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
         const int slot=fields[0][0]-'0';const auto ids=parse_ids(fields[5].c_str());
         require(ids.size()>2 && ids.size()<=6144 && turns<24,"bounded image gate input exceeded");
         std::printf("IMAGE_CHECKPOINT_PROGRESS case=%s turn=%zu phase=%s slot=%d tokens=%zu\n",group.c_str(),turns+1,fields[1].c_str(),slot,ids.size());std::fflush(stdout);
-        restored.clear();restored_pos=0;const auto before=e.kv_bank->backing_info();const auto metadata_before=e.image_metadata_us;
+        observations.clear();
+        const auto fires_before=e.restore_snapshot_fires,deferred_before=e.restore_snapshot_deferred,
+            immediate_before=e.restore_snapshot_immediate,refused_before=e.restore_snapshot_refused;
+        const auto before=e.kv_bank->backing_info();const auto metadata_before=e.image_metadata_us;
         const auto begin=Clock::now();server.request_body("BGENI "+fields[0]+" 1 img_keys="+fields[3]+" "+fields[4]+" "+fields[5]);const auto elapsed=ms_since(begin);
         require(e.cur==slot && e.sess[(size_t)slot].live==ids && e.sess[(size_t)slot].pos==(int64_t)ids.size(),"image gate request incomplete");
         const auto after=e.kv_bank->backing_info();const auto recipe=book.live.at(slot);q36_schedule_check(recipe,ids,(uint64_t)e.tmax);
+        // Exactly one observation per producer, and every observation is checked: a
+        // complete-state copy defers to the caller's select, checkpoint_restore observes
+        // in place after it has selected its destination.
+        const auto fires=e.restore_snapshot_fires-fires_before,deferred=e.restore_snapshot_deferred-deferred_before,
+            immediate=e.restore_snapshot_immediate-immediate_before,refused=e.restore_snapshot_refused-refused_before;
+        require(refused==0 && fires==deferred+immediate && fires==observations.size() && deferred<=1 && immediate<=1,
+            "image gate restored-state observation count mismatch");
         const auto reused=recipe.back().start,replayed=recipe.back().take;const auto cp=e.checkpoint_last_reused;
+        if(cp) require(immediate==1,"checkpoint reuse without an in-place restored-state observation");
+        if(!reused && !cp) require(fires==0,"restored-state observation without any restore or donor copy");
         ImgReq original;require(build_images(fields[4],ids,e.m->g.n_embd,{},original).empty(),"reference cannot reconstruct original image input");
         const auto image_begin=(uint64_t)original.imgs.front().cell,image_end=(uint64_t)(original.imgs.back().cell+original.imgs.back().n);
         if(fields[2]=="zero") {require(!reused && !cp,"legitimate zero-reuse control unexpectedly reused");++zero;}
@@ -64,7 +85,7 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
         for(int s=0;s<3;++s) if(e.kv_pool->session((uint32_t)s).state==KvResidency::idle)
             pins.push_back(std::make_unique<KvIdlePin>(e.kv_pool.get(),e.kv_ids[(size_t)s]));
         reset(3);e.kv_begin(3,ids.size()+16,true);e.select(3);e.reset();e.clear_images();
-        Q36Schedule prefix;bool checked=restored.empty();
+        Q36Schedule prefix;
         for(const auto& call:recipe) {
             require(!call.image_file.empty() && call.start==(uint64_t)e.pos && call.image_ids.size()==call.start+call.ids.size(),"missing original image call context");
             require(std::equal(call.ids.begin(),call.ids.end(),call.image_ids.begin()+(size_t)call.start),"declared suffix does not match original input");
@@ -90,11 +111,13 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
             const auto at=((size_t)e.pos-1)*3;
             e.set_delta((int32_t)((int64_t)std::max({fresh.mrope[at],fresh.mrope[at+1],fresh.mrope[at+2]})+1-e.pos));
             prefix.push_back(call);
-            if(!checked && q36_schedule_size(prefix)==restored_pos) {
-                require(schedule_compare(restored,image_schedule_state(e,3,prefix),"image_restored"),"IMAGE_CHECKPOINT_FAILURE comparison=restored exact state required");checked=true;
+            for(auto& o:observations) if(!o.verified && o.pos==q36_schedule_size(prefix)) {
+                require(schedule_compare(o.state,image_schedule_state(e,3,prefix),"image_restored"),"IMAGE_CHECKPOINT_FAILURE comparison=restored exact state required");
+                o.verified=true;
             }
         }
-        require(checked,"restored boundary absent from independent image schedule");std::vector<float> reference;e.host_logits(reference);
+        for(const auto& o:observations) require(o.verified,"restored boundary absent from independent image schedule");
+        std::vector<float> reference;e.host_logits(reference);
         require(schedule_compare(actual,image_schedule_state(e,3,recipe),"image_matching"),"IMAGE_CHECKPOINT_FAILURE comparison=final_state");
         require(schedule_logits(logits,reference,"image_matching"),"IMAGE_CHECKPOINT_FAILURE comparison=logits full exact required");
         e.sess[3].pos=e.pos;e.kv_end(3);reset(3);pins.clear();e.select(slot);
@@ -107,6 +130,7 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
             (unsigned long long)(after.checkpoint_copy_us-before.checkpoint_copy_us),(unsigned long long)(after.checkpoint_copy_bytes-before.checkpoint_copy_bytes),(unsigned long long)(e.image_metadata_us-metadata_before));std::fflush(stdout);
     }
     require(turns>=8 && zero && (!e.image_checkpoints || (positive && cross)),"missing steady rewrite reuse/cross-slot/zero coverage");
+    require(e.restore_snapshot_deferred>=1,"no cross-slot complete-state donor observation was exercised");
     require(corrupt.empty() || injected,"corruption control never reached a checkpoint");
     require(control.size()==6,"missing native cancellation control");
     const auto control_ids=parse_ids(control[5].c_str());
@@ -136,6 +160,9 @@ int image_checkpoint_regression(Engine& e,const std::string& fixture,const std::
     require(!e.kv_pool->info().mapped_bytes,"image gate leaked KV mappings");
     const auto final_driver=vmm_allocation_stats();require(final_driver.allocations==driver.allocations && final_driver.attempts==driver.attempts && final_driver.releases==driver.releases,"cancellation allocated/released physical bank handles");
     std::printf("IMAGE_CHECKPOINT_CANCEL PASS inside_invalidated=1 before_independent_exact=1 pin_checked=%d reset_invalidated=1\n",e.image_checkpoints?1:0);
+    std::printf("IMAGE_CHECKPOINT_OBSERVATIONS total=%zu deferred=%zu immediate=%zu refused=%zu balanced=%d\n",
+        e.restore_snapshot_fires,e.restore_snapshot_deferred,e.restore_snapshot_immediate,e.restore_snapshot_refused,
+        e.restore_snapshot_fires+e.restore_snapshot_refused==e.restore_snapshot_deferred+e.restore_snapshot_immediate?1:0);
 
     std::printf("IMAGE_CHECKPOINT_TEST PASS enabled=%d turns=%zu steady_after_reuse=%zu cross_slot=%zu zeros=%zu independent=1 exact=1\n",e.image_checkpoints?1:0,turns,positive,cross,zero);return 0;
 }

@@ -1253,6 +1253,7 @@ struct Engine {
     strata::core::Q36ScheduleBook* schedule_book=nullptr;
     std::function<void(int)> schedule_restored;
     std::function<void(int,int)> schedule_before_restore;
+#include "q36_restore_observation.inc"
     size_t checkpoint_count = 0;
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -3095,7 +3096,9 @@ struct Engine {
         kv_progress(dst,p.pos);
         checkpoint_last_reused=p.pos;
         if(schedule_book) schedule_book->restore(src,(size_t)index,dst);
-        if(schedule_restored) schedule_restored(dst);
+        // This path already selected dst (select(dst) above) and restored its CPU/
+        // device rotary state, so the observation boundary is correct here.
+        observe_restored_state(dst);
         if(kv_protocol) std::printf("KVREPLAY session=%d generation=%llu epoch=%llu tokens=%llu reason=prefix_checkpoint\n",dst,
             (unsigned long long)owner.id.generation,(unsigned long long)owner.epoch,(unsigned long long)p.pos);
         std::fprintf(stderr,"Qwen3.6 prefix checkpoint: source=%d session=%d restored_tokens=%llu\n",src,dst,(unsigned long long)p.pos);
@@ -3153,7 +3156,9 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
         if(schedule_book) schedule_book->copy(src,dst);
-        if(schedule_restored) schedule_restored(dst);
+        // Do NOT observe here: dst is not the current slot, so d_delta still belongs
+        // to another session. The caller fires after it has selected dst.
+        request_restore_snapshot(dst);
     }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
@@ -4123,6 +4128,7 @@ struct Serve {
         Engine::Sess& ss = E.sess[(size_t) s];
         size_t reuse = match_len(ss, ids, ir.imgs,image_source);
         E.checkpoint_last_reused=0;
+        E.discard_restore_snapshot(); // a producer's deferred observation never crosses requests
         int cp_src=-1, cp_index=-1,image_full_source=-1;
         size_t image_full_length=0;
         bool restored=false, full_donor=false;
@@ -4195,6 +4201,10 @@ struct Serve {
         cp_pin.reset(); // complete-state image donor stayed pinned THROUGH admission/copy
         if(E.cache_diagnostics) cache_diag_resolved(s,reuse,cp_src,restored);
         E.select(s);
+        // A complete-state donor copy deferred its observation to exactly here: dst is
+        // now current (its CPU/device rotary state loaded) and the incoming rows/table
+        // and suffix processing have not started. checkpoint_restore observed already.
+        E.fire_restore_snapshot();
         if (reuse == 0) {
             E.reset();
             ss.live.clear();

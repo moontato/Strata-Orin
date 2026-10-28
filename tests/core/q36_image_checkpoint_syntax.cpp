@@ -40,6 +40,7 @@ struct Engine {
  void set_delta(int32_t);void select(int);void reset();void clear_images();void host_logits(std::vector<float>&);void kv_ensure(int,uint64_t);void kv_progress(int,uint64_t);void kv_begin(int,uint64_t,bool);void kv_end(int);
  void set_images(const std::vector<float>&,const std::vector<int32_t>&,const std::vector<int32_t>&,int64_t,int32_t);
  template<class F> int64_t process(const int32_t*,int64_t,F,bool=false){return 0;}
+#include "q36_restore_observation.inc"
 #include "q36_vision_staging.inc"
 #include IMAGE_ENGINE_INC
 };

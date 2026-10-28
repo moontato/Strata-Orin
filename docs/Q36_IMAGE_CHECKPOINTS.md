@@ -1,5 +1,15 @@
 # Image-aware Qwen3.6 prefix checkpoints — opt-in, not Orin-qualified yet
 
+**2026-10-28 review blockers RESOLVED (CPU evidence only).** Origin publication
+and coding-server CPU validation are complete. Review found (a) a restored-state
+device-delta observation that could read another slot's scalar and (b) a gate whose
+advertised absolute budget was not enforced. Both are fixed and regression-tested on
+this host; see [Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md) for
+the harness, the six bounded-supervisor scenarios and the mutation controls that fail
+when either fix is reverted. This is NOT CUDA, GPU-output or Orin qualification: the
+model window commands below still require a separately approved operator isolation
+window, and the flag remains off by default.
+
 Local parent: **765068db267f8cd8f846f8ef45c9cc94f90075d5**, on4130bdfd.
 This is a continuation of the multimodal-cache diagnostics, not the older
 projection/adaptive fork. No kernel/sampler/tolerance, OWUI/frontend matching,
@@ -110,6 +120,19 @@ parity; actual old/new CUDA qualification remains pending.
 
 ## Independent correctness oracle
 
+Restored-state observation has an explicit boundary contract
+(`src/qwen35/q36_restore_observation.inc`): copy state -> request observation ->
+`select(dst)` -> fire observation -> upload the incoming rows/table -> process the
+suffix. `checkpoint_restore` observes in place after selecting its destination;
+`copy_session` defers to the caller's selection. The device rotary offset is a single
+scalar bound to the current slot, so observing a non-current destination throws and is
+counted. The gate asserts at every observation that the observed slot IS current, that
+the engine sits exactly at the restored boundary, that no observation was refused, and
+that observations match the producers one-for-one; each observation, not only the
+last, is compared against the independently replayed schedule. Host evidence and the
+mutation controls that re-create the defect live in
+[Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md).
+
 `--kv-image-checkpoint-test FILE` records original FULL declared token calls,
 original SVE file names/keys, consumed callback ends and checkpoint-suffix/MTP/head
 semantics. Original unconsumed tails remain in the recipe. A captured prefix in
@@ -151,9 +174,21 @@ changed grid and placement. Grid manipulation is explicitly synthetic, not an
 encoder result. Prior real rendered header/reasoning follow-ups are preserved as
 observed controls; zero reuse is reported honestly.
 
-One bounded worker runs convolution corruption, fallback DISABLED, then ENABLED,
-one LLM child at a time. Total worker budget (including CPU preflight) defaults300s,
-explicit maximum420s, plus at most20s owned-child reaping. Progress is emitted for
+The gate runs as a **supervisor + worker** pair. The supervisor starts the worker in
+its own process group with a shared absolute CLOCK_MONOTONIC deadline and, on expiry,
+SIGKILLs that whole group: the execution budget (default300s, explicit maximum420s,
+`--budget-seconds`) covers synchronous preflight hashing, native execution, log
+reading, comparisons and final report writing, not just the native children. Native
+arms stay inside that group so their descendants are reachable too. Bounded reaping
+gets a separate, documented **cleanup allowance** (`--cleanup-seconds`, default20s,
+maximum60s), after which `watchdog.json` records `owned_group_empty`. The worker also
+keeps cooperative budget checks around every phase. Only the supervisor prints a
+verdict, and its pure `verdict()` refuses a killed worker, a completion at/after the
+deadline, a nonzero exit, a non-empty owned group or a non-PASS report — a late
+success is never accepted. `--selftest normal|slow_preflight|hung_child|
+slow_postprocess|late_success` exercises exactly these paths with fake children and a
+throwaway staging directory. Never run the worker alone: without the supervisor the
+run has only cooperative bounds. Progress is emitted for
 preflight rows, startup/every20s and each native turn. First unexpected failure stops
 the sequence. It kills/reaps only its own groups; caller must reap the enclosing
 cgroup too. No service control, encoder, HTTP listener, projection matrix or
@@ -169,6 +204,11 @@ fixture measurements only as **synthetic performance**, never actual OWUI gains
 or a general speedup. Actual OWUI token divergence/savings remain UNMEASURED.
 
 ## Orin handoff — commands only, NOT executed here
+
+Both review blockers are fixed, but this recipe is still NOT authorized: it needs the
+reviewed isolation window and the operator-owned cgroup procedure below. Run the gate
+through its supervisor (never the worker alone) and pass the cleanup allowance
+explicitly, e.g. `--budget-seconds 300 --cleanup-seconds 20`.
 
 Use ONLY existing `/mnt/ssd/Strata-Orin/worktrees/multimodal-cache`.
 Never modify/build live `worktrees/checkpoint-policy`. All build staging, copied
