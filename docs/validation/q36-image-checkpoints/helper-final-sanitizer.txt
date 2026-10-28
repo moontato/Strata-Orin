@@ -1,0 +1,1 @@
+Q36_IMAGE_CHECKPOINT_HELPER_TEST PASS actual control methods, CPU pool/fake payload writer; NOT GPU

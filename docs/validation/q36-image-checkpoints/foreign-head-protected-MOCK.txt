@@ -1,0 +1,60 @@
+CPU GIT MOCK ONLY; NOT actual f934 content or Orin hardware evidence
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: is subject to change. To configure the initial branch name to use in all
+hint: of your new repositories, which will suppress this warning, call:
+hint: 
+hint: 	git config --global init.defaultBranch <name>
+hint: 
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint: 
+hint: 	git branch -m <name>
+Initialized empty Git repository in /tmp/pi/01a17a00-2a8e-7301-9821-5240562ee734/image-orin-fork-MOCK/.git/
+From /workspace/tmp/image-checkpoints
+ * branch              4130bdfdb43bdb273412cc3530660bd19ec14602 -> FETCH_HEAD
+HEAD is now at 4130bdfd q36: integrate opt-in adaptive retention on vision base
+[detached HEAD db45ce9b] CPU mock foreign follow-up; not f934
+ 3 files changed, 4 insertions(+)
+ create mode 100644 docs/Q36_ADAPTIVE_ORIN_VALIDATION.json
+ create mode 100644 tools/test_q36_integration_ordinary.py
+From /workspace/tmp/q36-image-checkpoints-review/q36-image-checkpoints-incremental.bundle
+ * branch              feature/q36-image-checkpoints -> FETCH_HEAD
+[detached HEAD f7a02d50] q36: add opt-in multimodal cache-miss diagnostics
+ Author: Pi coding assistant <pi@localhost>
+ Date: Wed Oct 28 01:42:51 2026 +0000
+ 17 files changed, 1682 insertions(+), 5 deletions(-)
+ create mode 100644 docs/Q36_MULTIMODAL_CACHE_DIAGNOSTICS.md
+ create mode 100644 include/strata/core/q36_cache_diagnostics.hpp
+ create mode 100644 serve/q36_cache_diagnostics.py
+ create mode 100644 src/qwen35/q36_cache_diagnostics.inc
+ create mode 100644 src/qwen35/q36_image_cache_regression.inc
+ create mode 100644 tests/core/q36_cache_diagnostic_test.cpp
+ create mode 100644 tests/core/q36_cache_native_probe_test.cpp
+ create mode 100644 tools/check_q36_cache_diagnostics_negative.py
+ create mode 100644 tools/q36_multimodal_cache_fixture.py
+ create mode 100644 tools/q36_multimodal_cache_gate.py
+ create mode 100644 tools/q36_multimodal_cache_window.sh
+ create mode 100644 tools/test_q36_multimodal_cache.py
+ create mode 100644 tools/test_q36_multimodal_cache_gate.py
+ create mode 100644 tools/test_q36_multimodal_cache_window.py
+[detached HEAD e03b4084] q36: add opt-in image-aware prefix checkpoint fallback
+ Author: Pi coding assistant <pi@localhost>
+ Date: Wed Oct 28 04:33:57 2026 +0000
+ 21 files changed, 1310 insertions(+), 46 deletions(-)
+ create mode 100644 docs/Q36_IMAGE_CHECKPOINTS.md
+ create mode 100644 include/strata/core/q36_image_checkpoint.hpp
+ create mode 100644 src/qwen35/q36_image_checkpoint.inc
+ create mode 100644 src/qwen35/q36_image_checkpoint_regression.inc
+ create mode 100644 tests/core/q36_image_checkpoint_helper_test.cpp
+ create mode 100644 tests/core/q36_image_checkpoint_syntax.cpp
+ create mode 100644 tests/core/q36_image_checkpoint_test.cpp
+ create mode 100644 tools/check_q36_image_checkpoint_negative.py
+ create mode 100644 tools/check_q36_image_preservation.py
+ create mode 100644 tools/q36_image_checkpoint_fixture.py
+ create mode 100644 tools/q36_image_checkpoint_gate.py
+ create mode 100644 tools/test_q36_image_checkpoints.py
+tools/q36_adaptive_integration_fixture.py: OK
+tools/test_q36_integration_ordinary.py: OK
+docs/Q36_ADAPTIVE_ORIN_VALIDATION.json: OK
+
+PASS feature applied atop DIFFERENT cherry-picked diagnostic HEAD; all3 MOCK follow-up files bit-identical. Actual Orin protected hashes still pending.

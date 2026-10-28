@@ -5,6 +5,13 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+## Current Qwen3.6 multimodal checkpoint development
+
+Read [docs/Q36_MULTIMODAL_CACHE_HANDOFF.md](docs/Q36_MULTIMODAL_CACHE_HANDOFF.md)
+first for the active feature branch, portable CPU setup, evidence and Orin safety
+boundaries. Do not run the installer/production Docker entrypoint for coding tests.
+Image-aware checkpoints remain opt-in and not Orin-qualified.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,

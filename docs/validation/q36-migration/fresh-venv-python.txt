@@ -1,0 +1,4 @@
+$ ['/tmp/pi/01a17a00-2a8e-7301-9821-5240562ee734/migration-venv/bin/python', '-m', 'pytest', '-q', 'tools/test_q36_adaptive_checkpoint_fixture.py', 'tools/test_q36_adaptive_integration.py', 'tools/test_q36_checkpoint_scope.py', 'tools/test_q36_image_checkpoints.py', 'tools/test_q36_kv_preallocation_bench.py', 'tools/test_q36_kv_preallocation_native_gate.py', 'tools/test_q36_multimodal_cache.py', 'tools/test_q36_multimodal_cache_gate.py', 'tools/test_q36_multimodal_cache_window.py', 'tools/test_q36_sampled_mtp_http_bench.py', 'tools/test_q36_vision_handoff.py', 'tools/test_q36_vision_preallocation.py', 'serve/test_q36_config.py', 'serve/test_unified_kv.py', 'tools/test_unified_kv_validate.py']
+.................................................. [ 58%]
+....................................                                     [100%]
+86 passed, 22 subtests passed in 37.23s

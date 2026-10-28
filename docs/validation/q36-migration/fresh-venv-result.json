@@ -1,0 +1,53 @@
+{
+  "source": "/workspace/tmp/image-checkpoints",
+  "head": "37911119e64aa97b837b2f6a920dbdc8cc3930bd",
+  "python": "3.11.2 (main, Oct  7 2026, 12:35:07) [GCC 12.2.0]",
+  "targets": [
+    "unified_kv_test",
+    "kv_preallocation_test",
+    "unified_kv_host_capability_test",
+    "q36_cache_diagnostic_test",
+    "q36_checkpoint_schedule_native_test",
+    "q36_checkpoint_schedule_test",
+    "q36_adaptive_checkpoint_test",
+    "q36_prefix_checkpoint_test",
+    "q36_sampled_mtp_test",
+    "q36_sampled_request_test",
+    "q36_vision_preallocation_test",
+    "q36_vision_staging_test",
+    "q36_image_checkpoint_test",
+    "q36_image_checkpoint_helper_test"
+  ],
+  "cases": [
+    "unified_kv_test",
+    "kv_preallocation_test",
+    "unified_kv_host_capability_test",
+    "q36_cache_diagnostic_test",
+    "q36_checkpoint_schedule_native_test",
+    "q36_checkpoint_schedule_test",
+    "q36_adaptive_checkpoint_test",
+    "q36_prefix_checkpoint_test",
+    "q36_sampled_mtp_test",
+    "q36_sampled_request_test",
+    "q36_vision_preallocation_test",
+    "q36_vision_staging_test",
+    "q36_image_checkpoint_test",
+    "q36_image_checkpoint_helper_test",
+    "q36_schedule_corrupt_conv",
+    "q36_schedule_corrupt_gdn",
+    "q36_schedule_corrupt_hlast"
+  ],
+  "status": "PASS_CPU_ONLY",
+  "sanitizers": true,
+  "negative_controls": true,
+  "packages": {
+    "cmake": "4.4.4",
+    "ninja": "1.13.2",
+    "pytest": "9.1.1",
+    "numpy": "2.4.6",
+    "Pillow": "13.0.0",
+    "regex": "2026.9.29",
+    "Jinja2": "3.1.6",
+    "MarkupSafe": "3.0.4"
+  }
+}

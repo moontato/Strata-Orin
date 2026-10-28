@@ -1,0 +1,9 @@
+$ ['/tmp/pi/01a17a00-2a8e-7301-9821-5240562ee734/migration-venv/bin/python', 'tools/check_kv_preallocation_negative.py']
+NEGATIVE_CONTROL PASS bank-exhaustion-allocates exit=-6
+NEGATIVE_CONTROL PASS recycled-pages-not-zeroed exit=-6
+NEGATIVE_CONTROL PASS bank-charged-as-fresh-memory exit=-6
+NEGATIVE_CONTROL PASS reservation-tail-not-reclaimed exit=-6
+NEGATIVE_CONTROL PASS borrowed-handle-released-on-failure exit=-6
+NEGATIVE_CONTROL PASS force-unsupported-cpu-pointer exit=-6
+NEGATIVE_CONTROL PASS attribute-zero-skips-equal-alias exit=-6
+NEGATIVE_CONTROL PASS cleanup-failure-hidden-as-unsupported exit=-6

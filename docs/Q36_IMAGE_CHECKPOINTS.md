@@ -177,10 +177,11 @@ No push/deploy/config edits or service operations are authorized by this handoff
 
 The actual diagnostic checkout includes f934b85b plus a cherry-picked diagnostic
 commit; its HEAD need NOT equal765068db. The incremental bundle requires4130bdfd
-and carries the original765068db object plus the NEW feature commit, so verification
+and carries the original765068db object plus implementation37911119 and subsequent
+portable-support/handoff commits, so verification
 does not assume the original diagnostic object was previously fetched. Importing
 that object does NOT mean replaying its commit onto the Orin branch. Preserve its source/ignored artifacts.
-Apply ONLY this archive's incremental feature commit onto that actual clean HEAD,
+Apply ONLY this archive's reviewed post765068db feature/support commits onto that actual clean HEAD,
 not a reset/merge/switch to the archive tip which would lose the Orin follow-ups.
 
 ```bash
@@ -213,9 +214,16 @@ BUNDLE="$ART/q36-image-checkpoints-incremental.bundle"
 git -C "$REPO" bundle verify "$BUNDLE"
 git -C "$REPO" fetch "$BUNDLE" refs/heads/feature/q36-image-checkpoints
 FEATURE=$(git -C "$REPO" rev-parse FETCH_HEAD)
-test "$(git -C "$REPO" rev-parse "$FEATURE^")" = 765068db267f8cd8f846f8ef45c9cc94f90075d5
+git -C "$REPO" merge-base --is-ancestor 765068db267f8cd8f846f8ef45c9cc94f90075d5 "$FEATURE"
+git -C "$REPO" merge-base --is-ancestor 37911119e64aa97b837b2f6a920dbdc8cc3930bd "$FEATURE"
+# Inspect this exact delta: implementation + portable support, NEVER diagnostics.
+git -C "$REPO" log --oneline "765068db..$FEATURE"
+RANGE=$(git -C "$REPO" rev-list --reverse "765068db..$FEATURE")
+for p in "${PROTECTED[@]}"; do
+ test -z "$(git -C "$REPO" diff --name-only 765068db "$FEATURE" -- "$p")"
+done
 git -C "$TEST" switch -c "review/image-checkpoints-$STAMP" "$OLD"
-git -C "$TEST" cherry-pick "$FEATURE" # ONLY the new commit, not its ancestry
+git -C "$TEST" cherry-pick $RANGE # reviewed feature/support commits ONLY, not diagnostics
 # Any conflict: STOP, preserve logs/ref/working tree for review. No force/reset/clean.
 (cd "$TEST" && sha256sum -c "$STAGE/image-protected-before-$STAMP.sha256")
 (cd "$TEST" && sha256sum "${PROTECTED[@]}") > "$STAGE/image-protected-after-$STAMP.sha256"

@@ -4,6 +4,10 @@
 
 # local Python environment (rebuilt in the image)
 .venv/
+.venv-q36-dev/
+# Coding/review scratch and evidence dumps are never Docker build inputs.
+/tmp/
+/logs/
 __pycache__/
 *.pyc
 .pytest_cache/

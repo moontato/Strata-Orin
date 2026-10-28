@@ -1,0 +1,17 @@
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: is subject to change. To configure the initial branch name to use in all
+hint: of your new repositories, which will suppress this warning, call:
+hint: 
+hint: 	git config --global init.defaultBranch <name>
+hint: 
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint: 
+hint: 	git branch -m <name>
+Initialized empty Git repository in /tmp/pi/01a17a00-2a8e-7301-9821-5240562ee734/image-bundle-import.git/
+From /workspace/tmp/image-checkpoints
+ * [new ref]           4130bdfdb43bdb273412cc3530660bd19ec14602 -> base
+From /workspace/tmp/q36-image-checkpoints-review/q36-image-checkpoints-incremental.bundle
+ * [new branch]        feature/q36-image-checkpoints -> review
+
+PASS original diagnostic object + single new feature commit imported against4130 only; IDs/order preserved
