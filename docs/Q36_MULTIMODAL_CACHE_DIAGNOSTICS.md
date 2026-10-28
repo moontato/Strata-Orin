@@ -1,5 +1,10 @@
 # Multi-turn image-cache misses — diagnostic stage only
 
+Follow-up implementation: [Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md).
+Its image checkpoint flag defaults OFF; the historical diagnostics/bypass below
+still describe that default. New opt-in correctness requires an independent
+image-aware schedule reference, not this OFF/ON neutrality test.
+
 Native baseline: **4130bdfdb43bdb273412cc3530660bd19ec14602**, resolved from the
 existing local repository, not GitHub's default branch. Development worktree:
 `/workspace/tmp/q36-multimodal-cache`, branch

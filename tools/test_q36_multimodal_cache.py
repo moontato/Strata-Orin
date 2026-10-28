@@ -26,12 +26,13 @@ def original(path):
 
 def test_matching_and_numeric_source_invariants():
     current = (ROOT / 'src/qwen35/q36_engine.cu').read_text(); old = original('src/qwen35/q36_engine.cu')
-    for marker in ['size_t match_len(', 'int pick_session(', 'int64_t process(', 'void forward(', 'void forward_mtp(',
-                   'void layer(', 'void run_rows(', 'void mtp_rows(', 'void preallocate_kv(', 'void checkpoint_capture(',
-                   'bool checkpoint_restore(', 'void copy_session(', 'void checkpoint_transfer(', 'int spec_window(']:
+    # Image eligibility/metadata methods intentionally evolve; numerical bodies do not.
+    for marker in ['int64_t process(', 'void forward(', 'void forward_mtp(',
+                   'void layer(', 'void run_rows(', 'void mtp_rows(', 'void preallocate_kv(',
+                   'void checkpoint_transfer(', 'int spec_window(']:
         assert body(current, marker) == body(old, marker), marker
     for path in ['include/strata/core/q36_prefix_checkpoint.hpp', 'include/strata/core/unified_kv_layout.hpp',
-                 'include/strata/core/unified_kv_vmm.hpp', 'include/strata/core/q36_vision_preallocation.hpp',
+                 'include/strata/core/unified_kv_vmm.hpp',
                  'include/strata/core/q36_sampled_mtp.hpp', 'src/qwen35/q36_kv_int8.cuh', 'src/qwen35/q36_kernels.cuh',
                  'src/qwen35/q36_vision_staging.inc', 'serve/frontend.py', 'serve/runconfig.py']:
         assert (ROOT / path).read_text() == original(path), path
@@ -44,7 +45,9 @@ def test_matching_and_numeric_source_invariants():
         else: assert not (ROOT / path).exists()
     assert 'bool cache_diagnostics = false;' in current
     assert 'if(!geni && fresh>1 && (!reuse || restored)) E.checkpoint_capture();' in current
-    assert 'if (!reuse && !geni && E.checkpoint_count)' in current
+    assert 'if (!reuse && (!geni || image_checkpoint_mode) && E.checkpoint_count)' in current
+    assert 'const bool image_checkpoint_mode=geni && E.image_checkpoints;' in current
+    assert 'bool image_checkpoints=false;' in current
 
 
 def test_prepare_and_send_bodies_unchanged_except_read_only_probe():
@@ -70,9 +73,11 @@ def test_prepare_and_send_bodies_unchanged_except_read_only_probe():
 def test_actual_native_selectors_and_new_probe_compile_execute(tmp_path):
     current = (ROOT / 'src/qwen35/q36_engine.cu').read_text()
     inc = tmp_path / 'selectors.inc'; inc.write_text(body(current, 'size_t match_len(') + '\n' + body(current, 'int pick_session('))
+    baseline = tmp_path / 'baseline-selectors.inc'; old = original('src/qwen35/q36_engine.cu')
+    baseline.write_text(body(old, 'size_t match_len(') + '\n' + body(old, 'int pick_session('))
     exe = tmp_path / 'probe'
     subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pedantic-errors', '-pthread',
-                    '-I' + str(ROOT / 'include'), '-DMATCH_INC="' + str(inc) + '"',
+                    '-I' + str(ROOT / 'include'), '-DMATCH_INC="' + str(inc) + '"', '-DBASE_MATCH_INC="' + str(baseline) + '"',
                     str(ROOT / 'tests/core/q36_cache_native_probe_test.cpp'), '-o', str(exe)], check=True, capture_output=True)
     sve = tmp_path / 'PRIVATE_PATH_SENTINEL.sve'; sve.write_bytes(struct.pack('<5i', 0x31455653, 4, 2, 2, 2) + bytes(32))
     result = subprocess.run([str(exe), str(sve)], check=True, capture_output=True, text=True)

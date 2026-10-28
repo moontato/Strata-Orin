@@ -5,6 +5,7 @@
 #include <utility>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace strata::core {
@@ -13,6 +14,11 @@ struct Q36ScheduleCall {
     uint64_t start=0, take=0;
     bool checkpoint_suffix=false;
     std::vector<uint64_t> ends; // absolute callback positions actually consumed
+    // Developer image oracle: ORIGINAL inputs only, never restored tensors,
+    // candidate M-RoPE tables, checkpoint identity or Python-normalized content.
+    std::string image_file;
+    std::vector<int32_t> image_ids;
+    std::vector<uint64_t> image_keys;
 };
 using Q36Schedule = std::vector<Q36ScheduleCall>;
 inline uint64_t q36_schedule_size(const Q36Schedule& recipe) {

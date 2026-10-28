@@ -38,7 +38,7 @@ inline int32_t q36_vision_prefix_delta(const std::vector<int32_t>& mrope,uint64_
     const auto at=(length-1)*3;
     return (int32_t)((int64_t)std::max({mrope[at],mrope[at+1],mrope[at+2]})+1-(int64_t)length);
 }
-struct Q36VisionImage {int64_t cell=0,n=0;uint64_t hash=0;};
+struct Q36VisionImage {int64_t cell=0,n=0;uint64_t hash=0;int32_t nx=0,ny=0;uint64_t rotary=0,row=0;};
 struct Q36VisionInput {
     std::vector<float> rows;std::vector<int32_t> cell_row,mrope;
     std::vector<Q36VisionImage> images;int32_t delta=0;
@@ -97,7 +97,7 @@ inline Q36VisionInput q36_read_vision(const std::string& path,const std::vector<
         // Even supplied keys cannot authorize reuse of DIFFERENT actual rows.
         hash=q36_image_hash(out.rows.data()+row*width,(size_t)r.n*width*4,hash);
         if(!keys.empty()) hash=q36_image_hash(&keys[index],8,hash);
-        out.images.push_back({(int64_t)cell,r.n,hash});
+        out.images.push_back({(int64_t)cell,r.n,hash,r.nx,r.ny,position,row});
         for(uint64_t j=0;j<(uint64_t)r.n;++j) {
             if(cell+j>=ids.size() || ids[cell+j]!=q36_image_pad) throw std::invalid_argument("image pad run does not match embedding rows");
             put(cell+j,position,position+j/(uint64_t)r.nx,position+j%(uint64_t)r.nx);out.cell_row[cell+j]=(int32_t)(row+j);

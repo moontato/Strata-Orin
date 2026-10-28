@@ -33,7 +33,7 @@ void cache_diag_before(bool adm,bool geni,int destination,const std::vector<int3
         }
         std::fprintf(stderr,"Q36CACHE search request=%llu mode=%s explicit_destination=%d incoming=%zu images=%zu observed_slots=%d total_slots=%d idle_backed_candidates=%d exact_candidates=%d checkpoint_fallback=%s detail_source=%s\n",
             (unsigned long long)cache_request,adm?"explicit_batch":"engine_selected",destination,ids.size(),ir.imgs.size(),std::min(E.n_sess,Engine::kVerify),E.n_sess,eligible,matched,
-            geni?"image_request_bypass":E.checkpoint_count?"text_enabled":"disabled",detail?"validated_rows_header_reread":"unavailable");
+            geni?(E.image_checkpoints?"image_optin_enabled":"image_request_bypass"):E.checkpoint_count?"text_enabled":"disabled",detail?"validated_rows_header_reread":"unavailable");
     } catch(...) {cache_incoming.clear();std::fprintf(stderr,"Q36CACHE unavailable stage=search\n");}
 }
 void cache_diag_selected(int slot) const noexcept {
