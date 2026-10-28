@@ -1,0 +1,11 @@
+/tmp/pi/01a180f3-7546-73d1-8096-48dc42888b2f/verify-archive/q36-image-checkpoints-review/q36-image-checkpoints-incremental.bundle is okay
+The bundle contains this ref:
+372699011a7cce6b6c9650f87af2318efc05b93a refs/heads/feature/q36-image-checkpoints
+The bundle requires this ref:
+4130bdfdb43bdb273412cc3530660bd19ec14602 
+The bundle uses this hash algorithm: sha1
+
+# imported into a fresh repo holding ONLY the prerequisite 4130bdfdb43bdb273412cc3530660bd19ec14602:
+$ git fetch <bundle> refs/heads/feature/q36-image-checkpoints
+imported tip: 372699011a7cce6b6c9650f87af2318efc05b93a tree=3724be3d62ab5eeeb55a6b0640825e6a1cc4e4fc
+IMPORT CLEAN: only prerequisite 4130bdfd needed, no other ancestry required

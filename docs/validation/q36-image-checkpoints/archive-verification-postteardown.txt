@@ -1,0 +1,8 @@
+# Review archive regenerated at tip 37269901 with tools/q36_export_review.py.
+tmp/q36-image-checkpoints-review.tar.gz sha256 4b70c24164e1f44d3c6edd756ac68a3f67073239694a10fb361ef4735d2ad828
+131 tracked files (source blobs + docs + evidence + 10 patches + bundle), 132 members
+counted in the extracted tree including SHA256SUMS itself.
+$ sha256sum -c q36-image-checkpoints-review.tar.gz.sha256  ->  OK
+$ sha256sum -c SHA256SUMS (extracted archive)              ->  all 131 entries OK
+The previous archive (tip d9de98d5, sha256 7012c546d22f55c92b0421f7199db4308b1fe1b6cb4e010ef915d996ff169861)
+is preserved, not overwritten; the exporter refuses to reuse an output name.
