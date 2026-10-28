@@ -6,10 +6,12 @@ implementation **37911119e64aa97b837b2f6a920dbdc8cc3930bd** (parent diagnostics
 coding-server CPU suite are recorded in
 [the migration handoff](Q36_MULTIMODAL_CACHE_HANDOFF.md).
 
-Two review blockers were confirmed, then **fixed and regression-tested on the CPU
-host** in the two correction commits on `feature/q36-image-checkpoints` —
+Four review blockers were confirmed, then **fixed and regression-tested on the CPU
+host** in the correction commits on `feature/q36-image-checkpoints` — R1/R2 in
 3958d620 (`observe restored state after selection and hard-bound the gate`) and
-f19e2294 (`bind the gate verdict to the run mode under the supervisor`). The flag remains
+f19e2294 (`bind the gate verdict to the run mode under the supervisor`), and R3/R4
+(supervisor teardown on SIGINT/SIGTERM/SIGHUP, and a cleanup allowance spent twice) in
+the teardown commit that adds this section. The flag remains
 **off by default**. Nothing here is CUDA, GPU-output, model or Orin qualification.
 
 ## R1 — restored-state observation could read another slot's device rotary delta (resolved)
@@ -141,6 +143,76 @@ GATE_WATCHDOG_NEGATIVE PASS supervisor_bypass leaked_owned_pids=1 exit=1
 worker without a supervisor (cooperative checks only), and `late_success_accepted`
 removes the lateness refusal. Both group mutations leave the marked owned descendant
 alive, which the real supervisor reaps.
+
+## R3 — an interrupted supervisor left its worker running (resolved)
+
+Reproduced on this host: sending SIGTERM to the supervisor during the fake
+`slow_preflight` scenario terminated it immediately (default disposition), leaving the
+worker group alive and writing **no** `watchdog.json`; SIGINT reached an
+`except BaseException: … raise` path that killed the group but escaped before the
+waiting, group-emptiness verification and the failure record.
+
+Fix: SIGINT, SIGTERM and SIGHUP are now handled by one recorder inside `supervise()`.
+Nothing is raised from a handler, so no path can escape the teardown: whatever ends the
+run (deadline, signal or an unexpected supervisor fault) goes through the same
+`teardown()` — kill the owned group, wait for the worker, kill stragglers, reap the
+leader, prove the group empty — and the failure is always written to `watchdog.json`
+(`interrupted_signals`, `passed=false`, `cleanup_complete`) with a nonzero exit. The
+worker's exit status is read with `os.waitid(..., WNOWAIT)` so the group is only ever
+signalled while its leader is still unreaped (no recycled-PGID hazard), and the leader
+is reaped before the final emptiness proof (a zombie leader no longer makes the group
+look alive). An unexpected supervisor fault now also tears the group down and records a
+failure before re-raising.
+
+This does **not** weaken the enclosing-cgroup requirement: the supervisor signals only
+the session it created, never a name or a foreign pid, and `watchdog.json` repeats
+`operator_cgroup_required=true`. The operator-owned cgroup procedure below is unchanged
+and still mandatory.
+
+Evidence (fake workers only, no engine/model/encoder/service):
+
+```text
+GATE_WATCHDOG_NEGATIVE PASS signal_teardown_removed supervisor_exit=-15 surviving_worker_pids=1 watchdog_record=False
+```
+
+That mutation removes the handler installation, and the reported defect reappears: the
+worker group survives and no record is written. The regression tests deliver each of
+SIGINT, SIGTERM and SIGHUP to a real supervisor after its worker has started and require
+nonzero exit, `passed=false`, the signal named in `interrupted_signals`,
+`owned_group_empty=true`, `worker_reaped=true`, no PASS marker, no surviving owned
+worker/child/descendant, and a foreign process left untouched.
+
+## R4 — the cleanup allowance was spent twice (resolved)
+
+`supervise()` waited up to `cleanup_seconds` for the worker and then started a **fresh**
+`cleanup_seconds` deadline for group cleanup. With a simulated stuck child (execution
+budget0.1s, cleanup allowance1s) the run took ≈2.11s — about twice the advertised
+bound.
+
+Fix: one absolute cleanup deadline, computed once when teardown begins, bounds waiting,
+reaping and the emptiness proof. `teardown()` returns the worker status, the group-kill
+status, `group_empty` and `reaped`; success is impossible unless the worker was reaped
+**and** the owned group is empty, and `verdict()` now refuses an unreaped worker
+separately from a live group.
+
+Evidence (deterministic fake worker whose reaping and group cleanup are blocked,
+allowance1.0s, `tools/check_q36_gate_watchdog_negative.py`):
+
+```text
+GATE_WATCHDOG BASELINE PASS one_cleanup_allowance_s=1.00 (limit 1.60)
+GATE_WATCHDOG_NEGATIVE PASS cleanup_rearmed teardown_s=2.00 (baseline 1.00, one allowance 1.00)
+GATE_WATCHDOG_NEGATIVE PASS no_group_kill leaked_owned_pids=1 exit=1 group_empty=False
+GATE_WATCHDOG_NEGATIVE PASS supervisor_bypass leaked_owned_pids=1 exit=1
+```
+
+`cleanup_rearmed` re-arms the allowance for the verification phase and reproduces the
+2× shape; the shipped code stays inside one allowance. The regressions also prove that
+neither an unreaped worker nor a non-empty group can be accepted whatever the worker
+reported, and that a real `hung_child` run leaves no marked owned process.
+
+Checkpoint logic, numerical comparisons and the existing timeout/mode protections
+(execution budget, deadline sharing, preflight/gate status binding, corruption arm,
+observation boundary) are unchanged by R3/R4.
 
 ## Still true from the first review
 

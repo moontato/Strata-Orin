@@ -50,9 +50,11 @@ scenario and mutation output.
   killed or late worker. Never launch the worker without the supervisor.
 - New host controls: `tools/q36_restore_observation_harness.py`,
   `tools/check_q36_restore_observation_negative.py` and
-  `tools/check_q36_gate_watchdog_negative.py`; the CPU runner now executes four
-  negative-control scripts. Six deterministic short-budget supervisor scenarios plus
-  verdict/slow-log-read/unowned-process checks live in `tools/test_q36_image_checkpoints.py`.
+  `tools/check_q36_gate_watchdog_negative.py` (now five teardown mutations plus a
+  measured one-allowance baseline); the CPU runner now executes four negative-control
+  scripts. Deterministic short-budget supervisor scenarios, per-signal teardown cases,
+  verdict/slow-log-read/unowned-process checks live in
+  `tools/test_q36_image_checkpoints.py` (20 tests).
 
 This is host evidence only. Nothing was built or run on Orin, no model/service was
 started, and image checkpoints remain off by default and NOT Orin-qualified. The Orin
@@ -198,9 +200,12 @@ Actual implementation:
   steady after-image rewrite reuse REQUIRED; genuine zero cases stay zero.
 - `tools/q36_image_checkpoint_gate.py`: supervisor+worker; preflight, corruption/off/on
   sequential children, one execution budget (default300s, max420s) enforced over every
-  phase by a process-group kill, separate bounded cleanup allowance with an
-  owned-group-emptiness record, progress, fail-fast and a pure verdict that refuses a
-  killed or late worker. Each arm passes its OWN independent matching-schedule
+  phase by a process-group kill, and ONE absolute cleanup allowance (default20s, max60s)
+  covering waiting, reaping and the owned-group emptiness proof. SIGINT/SIGTERM/SIGHUP
+  to the supervisor are recorded and routed through that same teardown, which always
+  writes the failure record and exits nonzero; the pure verdict also refuses an
+  interrupted supervisor and an unreaped worker. Only groups this run created are ever
+  signalled, so the operator-owned enclosing cgroup is still required. Each arm passes its OWN independent matching-schedule
   oracle; OFF/ON neutrality is not the correctness reference. Timings distinguish
   replay/reuse, prefill/request, synchronized copy cost and selected CPU metadata
   work. These are synthetic public-fixture measurements, not actual OWUI savings.

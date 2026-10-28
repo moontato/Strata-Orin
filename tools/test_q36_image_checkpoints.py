@@ -1,5 +1,5 @@
 """CPU/mock tests only. No actual encoder/model/service/CUDA operation."""
-import copy,json,os,re,shutil,struct,subprocess,sys,time
+import copy,json,os,re,shutil,signal,struct,subprocess,sys,time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -35,13 +35,50 @@ def run_gate(tmp_path,scenario,budget=2,cleanup=2,preflight=False):
         +(['--preflight'] if preflight else []),capture_output=True,text=True,env=env,timeout=120)
     return run,json.loads((out/'watchdog.json').read_text()),out
 
+def start_gate(tmp_path,scenario,budget,cleanup):
+    """Launch the supervisor as a real process so a signal can be delivered to IT."""
+    stage,engine,model,fixtures=staging(tmp_path)
+    out=stage/('sig-'+scenario+'-'+str(os.getpid())+'-'+str(next(counter)))
+    env=dict(os.environ,STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT=str(ROOT),PYTHONPATH=str(ROOT))
+    env.pop('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW',None)
+    proc=subprocess.Popen([sys.executable,str(ROOT/'tools/q36_image_checkpoint_gate.py'),'--engine',str(engine),
+        '--model',str(model),'--fixtures',str(fixtures),'--out',str(out),'--selftest',scenario,
+        '--budget-seconds',str(budget),'--cleanup-seconds',str(cleanup)],stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,text=True,env=env)
+    return proc,out
+
+def worker_pids(supervisor_pid):
+    """Read-only observation of the supervisor's OWN worker (never used for killing)."""
+    found=[]
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():continue
+        try:
+            cmd=Path(entry/'cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace')
+            ppid=Path(entry/'stat').read_text().split(')')[-1].split()[1]   # pid (comm) STATE ppid ...
+        except (OSError,IndexError):continue
+        if '--worker' in cmd and '--selftest' in cmd and ppid==str(supervisor_pid):found.append(int(entry.name))
+    return found
+
+def cleanup_gate(proc):
+    """Test hygiene ONLY: end the supervisor and any worker group it left behind, so a
+    failing assertion can never orphan a marked fake process (the gate itself is never
+    relied on for this cleanup path)."""
+    for pid in worker_pids(proc.pid):
+        try:os.killpg(pid,signal.SIGKILL)
+        except (ProcessLookupError,PermissionError):pass
+    if proc.poll() is None:
+        try:proc.kill()
+        except OSError:pass
+    try:proc.communicate(timeout=10)
+    except Exception:pass
+
 def owned_probes():
     found=[]
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit() or int(entry.name) in {os.getpid(),os.getppid()}:continue
         try:cmd=Path(entry/'cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace')
         except OSError:continue
-        if gate.OWNED_PROBE in cmd and entry.name!=str(os.getpid()):found.append(int(entry.name))
+        if gate.OWNED_PROBE in cmd and cmd.startswith(sys.executable) and entry.name!=str(os.getpid()):found.append(int(entry.name))
     return found
 
 def test_numeric_sampler_bank_staging_and_protected_files_unchanged():
@@ -240,6 +277,92 @@ def test_supervisor_reaps_only_its_own_group(tmp_path):
  assert owned_probes()==[]
 
 
+class StuckChild:
+    """Fake worker used to simulate BLOCKED reaping/group cleanup. Its pid is not a
+    usable process group and every OS hook below is injected, so nothing real is ever
+    signalled by these cases."""
+    pid=-1
+    def wait(self,timeout=None):raise subprocess.TimeoutExpired(cmd='fake-worker',timeout=timeout)
+
+
+def test_one_cleanup_allowance_covers_waiting_reaping_and_verification():
+ allowance=1.0
+ # (a) the worker never exits AND the owned group never empties: waiting, group killing
+ # and the emptiness proof must all finish inside ONE allowance. The previous code
+ # waited for the allowance and THEN re-armed it for cleanup (about twice the bound).
+ started=time.monotonic()
+ exit_code,status,group_empty,reaped=gate.teardown(StuckChild(),started+allowance,
+     waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
+ elapsed=time.monotonic()-started
+ assert allowance<=elapsed<allowance*1.6,(elapsed,)
+ assert exit_code is None and status=='present' and group_empty is False and reaped is False
+ # (b) the worker exits promptly but the group never empties: the SAME absolute deadline
+ # still bounds the whole teardown, so verification cannot start a fresh allowance.
+ class Exited(StuckChild):
+     def wait(self,timeout=None):return -9
+ started=time.monotonic()
+ exit_code,status,group_empty,reaped=gate.teardown(Exited(),started+allowance,initial=-9,
+     waiter=lambda:0,killer=lambda:'present',prober=lambda:'present')
+ elapsed=time.monotonic()-started
+ assert elapsed<allowance*1.6,(elapsed,)
+ assert exit_code==-9 and reaped is True and group_empty is False
+ # An incomplete cleanup or an interrupted supervisor is never accepted, whatever the
+ # worker reported.
+ for group,reap in ((False,False),(False,True),(True,False)):
+  assert gate.verdict(True,False,-9,group,'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE',
+     {'arms_completed':True},False,'',reap)[0] is False
+ assert gate.verdict(True,False,0,True,'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE',
+     {'arms_completed':True},False,'SIGTERM',True)[0] is False
+
+
+@pytest.mark.parametrize('signame',('SIGINT','SIGTERM','SIGHUP'))
+def test_signal_to_the_supervisor_tears_down_and_records_failure(tmp_path,signame):
+ # The worker is blocked in a synchronous phase, so ONLY the supervisor's teardown can
+ # end the run. SIGTERM/SIGHUP used to leave the worker group running with no record at
+ # all, and SIGINT's exception path escaped before reaping and before the record.
+ proc,out=start_gate(tmp_path,'slow_preflight',budget=20,cleanup=3)
+ try:
+  waited=0.0
+  while not worker_pids(proc.pid) and waited<15:time.sleep(0.05);waited+=0.05
+  assert worker_pids(proc.pid),'the worker never started'
+  os.kill(proc.pid,getattr(signal,signame))
+  stdout,stderr=proc.communicate(timeout=30)
+ except BaseException:
+  cleanup_gate(proc);raise
+ assert proc.returncode!=0,(signame,stdout[-300:],stderr[-300:])
+ watch=json.loads((out/'watchdog.json').read_text())      # a failure record ALWAYS exists
+ assert watch['passed'] is False and signame in watch['interrupted_signals'],watch
+ assert watch['owned_group_empty'] is True and watch['worker_reaped'] is True,watch
+ assert watch['cleanup_complete'] is True and watch['operator_cgroup_required'] is True
+ assert 'IMAGE_CHECKPOINT_GATE_SELFTEST FAIL' in stdout and 'verdict=PASS' not in stdout
+ assert 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in stdout
+ assert worker_pids(proc.pid)==[]                          # no surviving owned worker
+ assert 'action=teardown' in stderr and 'cleanup_allowance_s=3' in stderr
+
+
+def test_interrupt_during_a_hung_child_reaps_the_whole_owned_group(tmp_path):
+ unowned=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)'])   # foreign process
+ try:
+  proc,out=start_gate(tmp_path,'hung_child',budget=30,cleanup=3)   # far from expiry
+  try:
+   waited=0.0
+   while (not worker_pids(proc.pid) or not owned_probes()) and waited<15:time.sleep(0.05);waited+=0.05
+   assert worker_pids(proc.pid) and owned_probes(),'the hung child and its descendant never started'
+   os.kill(proc.pid,signal.SIGTERM)
+   stdout,stderr=proc.communicate(timeout=30)
+  finally:
+   cleanup_gate(proc)
+  assert proc.returncode!=0
+  watch=json.loads((out/'watchdog.json').read_text())
+  assert watch['passed'] is False and 'SIGTERM' in watch['interrupted_signals']
+  assert watch['owned_group_empty'] is True and watch['worker_reaped'] is True
+  assert 'verdict=PASS' not in stdout and 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in stdout
+  assert owned_probes()==[] and worker_pids(proc.pid)==[]   # worker, child AND descendant
+  assert unowned.poll() is None                             # a foreign process untouched
+ finally:
+  unowned.kill();unowned.wait()
+
+
 def test_gate_has_no_service_operations_and_separates_cleanup_from_budget():
  s=(ROOT/'tools/q36_image_checkpoint_gate.py').read_text()
  assert 'systemctl' not in s and 'systemd-run' not in s and 'pgrep' not in s
@@ -251,3 +374,12 @@ def test_gate_has_no_service_operations_and_separates_cleanup_from_budget():
  assert 'cleanup_allowance_seconds' in s and 'owned_group_empty' in s
  assert 'def verdict(' in s and "'--deadline'" in s
  assert 'budget.check(' in s and s.count('budget.check(')>=10
+ # Teardown structure: one signal path, one cleanup deadline, and the requirement that
+ # an OPERATOR-OWNED CGROUP still encloses the run (the supervisor signals ONLY its own
+ # group, so it can never replace that requirement).
+ for sig in ('signal.SIGINT','signal.SIGTERM','signal.SIGHUP'):
+  assert sig in s.split('def supervise')[1],sig
+ assert 'os.waitid' in s and 'os.WNOWAIT' in s
+ assert s.count('cleanup_deadline=time.monotonic()+a.cleanup_seconds')==1
+ assert 'operator_cgroup_required' in s and 'operator-owned' in s
+ assert 'def teardown(' in s and 'def group_kill(' in s and 'def group_probe(' in s

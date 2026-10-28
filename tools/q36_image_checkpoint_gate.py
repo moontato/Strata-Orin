@@ -3,11 +3,16 @@
 NO service/config/encoder operations. The supervisor bounds EVERY phase of the worker
 (synchronous preflight/hashing, native execution, log reading, comparisons, final
 reporting) with one execution budget (default300s, explicit maximum420s) and may
-SIGKILL the worker's whole process group during a blocking phase. Bounded process
-reaping uses a separate, documented cleanup allowance (default20s, maximum60s).
-A timeout, a killed worker or a completion at/after the deadline is always nonzero:
-a late success is never accepted. Independent correctness is native empty-state
-recomputation, not OFF/ON equality. All staging/results under strata-checkpoints.
+SIGKILL the worker's whole process group during a blocking phase. Waiting for the
+worker, reaping it and proving the owned group empty share ONE cleanup allowance
+(default20s, maximum60s); the allowance is never re-armed. SIGINT/SIGTERM/SIGHUP are
+recorded and routed through that same teardown, which always writes the failure record
+and exits nonzero. The supervisor only ever signals the group IT created (its own
+session), so an enclosing OPERATOR-OWNED CGROUP is still required to catch anything
+else. A timeout, a killed worker or a completion at/after the deadline is always
+nonzero: a late success, an uninterruptible-teardown run or an incomplete cleanup is
+never accepted. Independent correctness is native empty-state recomputation, not
+OFF/ON equality. All staging/results under strata-checkpoints.
 """
 import argparse,json,os,re,signal,subprocess,sys,time
 from pathlib import Path
@@ -163,71 +168,176 @@ def worker(a,budget):
  finally:
   (a.out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
 
-def verdict(killed,late,exit_code,group_empty,report_status,phases,preflight=False):
- """Pure decision: a killed worker, a late completion, a non-empty owned group or a
- non-PASS report can never produce a PASS. The accepted report status also depends on
- the mode, so a preflight-only report can never be counted as a numerical gate pass
- (nor a numerical gate report as preflight). Deterministic and unit-testable."""
+def verdict(killed,late,exit_code,group_empty,report_status,phases,preflight=False,interrupted='',worker_reaped=True):
+ """Pure decision: a killed worker, a late completion, a non-empty owned group, a
+ worker that was never reaped, an interrupted supervisor or a non-PASS report can
+ never produce a PASS. The accepted report status also depends on the mode, so a
+ preflight-only report can never be counted as a numerical gate pass (nor a numerical
+ gate report as preflight). Deterministic and unit-testable."""
  reasons=[]
- if killed:reasons.append('worker killed at the execution deadline')
+ if interrupted:reasons.append('supervisor interrupted by '+str(interrupted))
+ if killed and not interrupted:reasons.append('worker killed at the execution deadline')
+ if killed and interrupted:reasons.append('worker ended by the teardown of an interrupted run')
  if late:reasons.append('worker finished at or after the execution deadline')
  if exit_code!=0:reasons.append('worker exit '+str(exit_code))
+ if not worker_reaped:reasons.append('worker still unowned after the cleanup allowance')
  if not group_empty:reasons.append('owned process group still present after cleanup allowance')
  accepted='PASS_PREFLIGHT_ONLY' if preflight else 'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE'
  if report_status!=accepted:reasons.append('worker report status '+str(report_status)+' not accepted for preflight='+str(preflight))
  if not phases.get('arms_completed'):reasons.append('not every gate arm completed')
  return (not reasons),reasons
 
+CLEANUP_POLL=0.05
+
+def group_kill(child):
+ """SIGKILL ONLY the process group this supervisor created (start_new_session=True).
+ Never a process name, never a foreign pid, never a group we did not make."""
+ try:
+  os.killpg(child.pid,signal.SIGKILL);return 'present'
+ except ProcessLookupError:return 'empty'
+ except PermissionError:return 'denied'
+
+def group_probe(child):
+ """Presence probe of the owned group only (signal 0)."""
+ try:
+  os.killpg(child.pid,0);return 'present'
+ except ProcessLookupError:return 'empty'
+ except PermissionError:return 'denied'
+
+def worker_status(child):
+ """Worker exit status WITHOUT consuming it, so the leader stays unreaped and its PGID
+ cannot be recycled and signalled by accident while the group is being cleaned.
+ Returns None while the worker is still running (siginfo-style waitid result)."""
+ try:info=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+ except (ChildProcessError,NotImplementedError,AttributeError,OSError):return None
+ if info is None:return None
+ code=getattr(info,'si_code',getattr(info,'code',1));status=getattr(info,'si_status',getattr(info,'status',0))
+ if code==1:return status                                  # CLD_EXITED
+ if code in (2,3):return -status                           # CLD_KILLED / CLD_DUMPED
+ return None
+
+def teardown(child,cleanup_deadline,initial=None,poll=CLEANUP_POLL,waiter=None,killer=None,prober=None):
+ """ONE absolute deadline covers ALL cleanup: killing the owned group, waiting for the
+ worker, killing stragglers, reaping the leader and proving the group empty. The
+ allowance is never re-armed, so a run cannot spend twice the cleanup allowance.
+ Ordering avoids two hazards: the group is only ever SIGNALED while the leader is still
+ unreaped (so its PGID cannot have been recycled), and the leader is reaped before the
+ final emptiness proof (a reaped leader is no longer a group member, so it cannot make
+ the group look alive). Only probing happens after the reap. Returns
+ (exit_code_or_None, group_kill_status, group_empty, reaped); success is impossible
+ unless the worker was reaped AND the owned group is empty. The kill STATUS is
+ returned, not a bool: a group that still holds only the already-exited, not-yet-reaped
+ leader was never killed by us."""
+ waiter=waiter or (lambda:worker_status(child))
+ killer=killer or (lambda:group_kill(child))
+ prober=prober or (lambda:group_probe(child))
+ def left():return cleanup_deadline-time.monotonic()
+ def nap():time.sleep(min(poll,max(0.0,left())))
+ group_status=killer();exit_code=initial
+ if exit_code is None:
+  while True:                              # 1. wait for the worker (same deadline)
+   code=waiter()
+   if code is not None:exit_code=code;break
+   if left()<=0:break
+   nap()
+ if killer()=='present':group_status='present'  # 2. last group kill while the PGID is reserved
+ reaped=False
+ if left()>0 or exit_code is not None:
+  try:
+   code=child.wait(timeout=max(0.0,left()));reaped=True
+   if exit_code is None:exit_code=code
+  except (subprocess.TimeoutExpired,OSError,ValueError):reaped=False
+ group_empty=False
+ while True:                               # 3. prove the owned group empty (probe only)
+  state=prober()
+  if state=='empty':group_empty=True;break
+  if state=='denied' or left()<=0:break
+  nap()
+ return exit_code,group_status,group_empty,reaped
+
 def supervise(a,budget):
  """Spawn the worker in its OWN process group and hard-bound the whole run, including
- any blocking phase, with a group kill. Reaping gets its own bounded allowance."""
+ any blocking phase, with a group kill. Waiting, reaping and group verification share
+ ONE cleanup allowance. SIGINT/SIGTERM/SIGHUP are recorded (never raised): an exception
+ used to escape before reaping and before the failure record. Whatever happens, the
+ owned group is killed, reaped and verified, the failure is recorded and the exit is
+ nonzero. The supervisor signals only its own group, so the enclosing operator-owned
+ cgroup remains a requirement, not something this code replaces."""
  out=a.out
  log=open(out/'worker-stdout.txt','wb')
- # The worker shares this absolute deadline: its own cooperative checks and the
- # supervisor's group kill then end at the same instant.
- child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),*sys.argv[1:],'--worker','--deadline',repr(budget.deadline)],
-  stdin=subprocess.DEVNULL,stdout=log,stderr=sys.stderr,start_new_session=True)
- killed=False;deadline_seen=False
+ recorded=[False]
+ def write_record(**fields):
+  fields.setdefault('operator_cgroup_required',True)   # the operator still owns the enclosing cgroup
+  (out/'watchdog.json').write_text(json.dumps(fields,indent=2)+'\n');recorded[0]=True
+ interrupted=[]
+ def record(signum,frame):interrupted.append(signum)   # recorded, never raised
+ previous={}
+ for sig,name in ((signal.SIGINT,'SIGINT'),(signal.SIGTERM,'SIGTERM'),(signal.SIGHUP,'SIGHUP')):
+  try:previous[sig]=signal.signal(sig,record)
+  except (ValueError,OSError):pass   # not the main thread: keep the old disposition
  try:
-  while child.poll() is None:
+  child=None
+  # The worker shares this absolute deadline: its own cooperative checks and the
+  # supervisor's group kill then end at the same instant.
+  child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),*sys.argv[1:],'--worker','--deadline',repr(budget.deadline)],
+   stdin=subprocess.DEVNULL,stdout=log,stderr=sys.stderr,start_new_session=True)
+  killed=False;deadline_seen=False;exit_code=None
+  SIGNAL_NAMES={signal.SIGINT:'SIGINT',signal.SIGTERM:'SIGTERM',signal.SIGHUP:'SIGHUP'}
+  while exit_code is None:
+   exit_code=worker_status(child)     # non-consuming: the PGID stays reserved
+   if exit_code is not None:break
    if budget.expired():
     deadline_seen=True
     if not killed:
      print(f'IMAGE_GATE_PROGRESS stage=watchdog action=killpg elapsed_s={int(a.budget_seconds-budget.left())}',flush=True,file=sys.stderr)
-     try:os.killpg(child.pid,signal.SIGKILL)
-     except ProcessLookupError:pass
-     killed=True
+     killed=killed or group_kill(child)=='present'
+    break
+   if interrupted:
+    deadline_seen=True
+    SIGNAL_NAMES={signal.SIGINT:'SIGINT',signal.SIGTERM:'SIGTERM',signal.SIGHUP:'SIGHUP'}
+    print('IMAGE_GATE_PROGRESS stage=watchdog action=teardown signal='+
+     ','.join(SIGNAL_NAMES.get(s,'SIG'+str(s)) for s in interrupted)+
+     ' cleanup_allowance_s='+str(a.cleanup_seconds),flush=True,file=sys.stderr)
     break
    time.sleep(min(0.25,max(0.0,budget.left())))
+  # ONE cleanup deadline for waiting + reaping + group proof: no second allowance.
+  cleanup_deadline=time.monotonic()+a.cleanup_seconds
+  exit_code,group_status,group_empty,reaped=teardown(child,cleanup_deadline,exit_code)
+  # 'killed' means the supervisor had to end a run that did NOT finish on its own; a
+  # group that only held the already-exited leader was never killed by us.
+  killed=killed or deadline_seen or bool(interrupted) or (group_status=='present' and exit_code is None)
+  signals=','.join(sorted({SIGNAL_NAMES.get(s,'SIG'+str(s)) for s in interrupted}))
+  late=(deadline_seen and not interrupted) or (exit_code==0 and budget.expired())
+  report={}
+  try:report=json.loads((out/'result.json').read_text())
+  except (OSError,ValueError):report={'status':'MISSING'}
+  phases=dict(arms_completed=all((out/(arm+'.exit.json')).is_file() for arm in ('negative-conv','disabled','enabled')) and not a.preflight and not a.selftest,
+   preflight=bool(a.preflight),selftest=bool(a.selftest))
+  if a.preflight or a.selftest:phases['arms_completed']=True
+  passed,reasons=verdict(killed,late,exit_code if exit_code is not None else -1,group_empty,report.get('status'),phases,
+   a.preflight,signals,reaped)
+  write_record(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
+   killed=killed,deadline_crossed=late,worker_exit=exit_code,worker_reaped=reaped,owned_group_empty=group_empty,
+   cleanup_complete=group_empty and reaped,worker_report_status=report.get('status'),interrupted_signals=signals,
+   passed=passed,reasons=reasons)
  except BaseException as exc:
-  # Interrupted supervisor: the owned group must still go down before returning.
-  try:os.killpg(child.pid,signal.SIGKILL)
-  except ProcessLookupError:pass
-  killed=True;raise
- finally:log.close()
- try:exit_code=child.wait(timeout=min(20,max(0,a.cleanup_seconds)))
- except subprocess.TimeoutExpired:
-  exit_code=None
- # Bounded cleanup allowance: the group must end up empty, separately from the budget.
- cleanup_deadline=time.monotonic()+a.cleanup_seconds;group_empty=False
- while time.monotonic()<cleanup_deadline:
-  try:os.killpg(child.pid,0)
-  except ProcessLookupError:group_empty=True;break
-  except PermissionError:group_empty=False;break
-  try:os.killpg(child.pid,signal.SIGKILL)
-  except ProcessLookupError:group_empty=True;break
-  time.sleep(0.1)
- late=deadline_seen or (exit_code==0 and budget.expired())
- report={}
- try:report=json.loads((out/'result.json').read_text())
- except (OSError,ValueError):report={'status':'MISSING'}
- phases=dict(arms_completed=all((out/(arm+'.exit.json')).is_file() for arm in ('negative-conv','disabled','enabled')) and not a.preflight and not a.selftest,
-  preflight=bool(a.preflight),selftest=bool(a.selftest))
- if a.preflight or a.selftest:phases['arms_completed']=True
- passed,reasons=verdict(killed,late,exit_code if exit_code is not None else -1,group_empty,report.get('status'),phases,a.preflight)
- (out/'watchdog.json').write_text(json.dumps(dict(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
-  killed=killed,deadline_crossed=late,worker_exit=exit_code,owned_group_empty=group_empty,worker_report_status=report.get('status'),
-  passed=passed,reasons=reasons),indent=2)+'\n')
+  # A supervisor fault must still tear the owned group down and leave a failure record;
+  # it can never be mistaken for a passing run. The exception is still surfaced.
+  exit_code=None;group_empty=False;reaped=False
+  if child is not None:
+   try:exit_code,_,group_empty,reaped=teardown(child,time.monotonic()+a.cleanup_seconds)
+   except Exception:pass
+  if not recorded[0]:
+   write_record(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
+    killed=True,deadline_crossed=False,worker_exit=exit_code,worker_reaped=reaped,owned_group_empty=group_empty,
+    cleanup_complete=group_empty and reaped,worker_report_status='MISSING',interrupted_signals='',
+    passed=False,reasons=['supervisor error '+type(exc).__name__+': '+str(exc)[:200]])
+  raise
+ finally:
+  log.close()
+  for sig,handler in previous.items():
+   try:signal.signal(sig,handler)
+   except (ValueError,OSError):pass
  label='IMAGE_CHECKPOINT_GATE_SELFTEST' if a.selftest else 'IMAGE_CHECKPOINT_ORIN_GATE'
  if passed:
   # A selftest never relays a production marker: only the supervisor's labelled

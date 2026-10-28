@@ -179,13 +179,23 @@ its own process group with a shared absolute CLOCK_MONOTONIC deadline and, on ex
 SIGKILLs that whole group: the execution budget (default300s, explicit maximum420s,
 `--budget-seconds`) covers synchronous preflight hashing, native execution, log
 reading, comparisons and final report writing, not just the native children. Native
-arms stay inside that group so their descendants are reachable too. Bounded reaping
-gets a separate, documented **cleanup allowance** (`--cleanup-seconds`, default20s,
-maximum60s), after which `watchdog.json` records `owned_group_empty`. The worker also
+arms stay inside that group so their descendants are reachable too. Bounded cleanup
+uses ONE absolute **cleanup allowance** (`--cleanup-seconds`, default20s, maximum60s)
+that covers waiting for the worker, killing the owned group, reaping it and proving it
+empty; it is never re-armed, so a run cannot spend twice the allowance in teardown.
+`watchdog.json` records `owned_group_empty`, `worker_reaped` and `cleanup_complete`.
+The worker also
 keeps cooperative budget checks around every phase. Only the supervisor prints a
 verdict, and its pure `verdict()` refuses a killed worker, a completion at/after the
-deadline, a nonzero exit, a non-empty owned group or a non-PASS report — a late
-success is never accepted. The accepted report status also depends on the mode:
+deadline, a nonzero exit, a non-empty owned group, a worker that was never reaped, an
+interrupted supervisor or a non-PASS report — a late success is never accepted.
+SIGINT, SIGTERM and SIGHUP delivered to the supervisor are recorded and routed through
+that SAME teardown: the owned worker and group are killed, reaped and verified, the run
+is written up as a failure (`interrupted_signals`, `passed=false`) and the exit is
+nonzero; a signal can never skip the record or turn into a pass. The group is only ever
+signalled while its leader is still unreaped (the leader's exit status is read with
+`WNOWAIT`), and the leader is reaped before the final emptiness proof, so a recycled
+PGID can never be signalled by accident. The accepted report status also depends on the mode:
 `--preflight` can only report `PASS_PREFLIGHT_ONLY` and prints
 `IMAGE_CHECKPOINT_PREFLIGHT PASS model_not_started=1`, never the numerical-gate
 marker. `--selftest normal|slow_preflight|hung_child|
@@ -193,8 +203,10 @@ slow_postprocess|late_success` exercises exactly these paths with fake children 
 throwaway staging directory. Never run the worker alone: without the supervisor the
 run has only cooperative bounds. Progress is emitted for
 preflight rows, startup/every20s and each native turn. First unexpected failure stops
-the sequence. It kills/reaps only its own groups; caller must reap the enclosing
-cgroup too. No service control, encoder, HTTP listener, projection matrix or
+the sequence. It signals/reaps only the groups it created (the worker's own session and
+the arms inside it), so the operator must still own and reap the enclosing cgroup;
+`watchdog.json` restates this as `operator_cgroup_required=true`. No service control,
+encoder, HTTP listener, projection matrix or
 sampling suite is launched. Fixtures <=24 turns, each <=6144 expanded cells.
 
 `IMAGE_CHECKPOINT_MEASURE` reports reused/replayed cells, checkpoint boundary,
