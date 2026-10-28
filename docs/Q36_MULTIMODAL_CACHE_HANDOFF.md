@@ -171,12 +171,35 @@ native-test or build-tree file changed — the change is three Python files and 
 the full CPU suite was deliberately NOT re-run; see
 `docs/validation/q36-image-checkpoints/VALIDATION.md` addendum4.
 
+Exported for the next step at tip **3e78a6df63ddee1ddf9540e4614ecbec1ff93b49**
+(`tmp/q36-export-20261028T142339Z/q36-image-checkpoints-review.tar.gz`, sha256
+`f258efeed44f06a233836c1b10b8f9f174385c5d0d16c7385af70dec6d4d2df8`, 151 files): all 151
+stored member hashes verify, the 13 exported post-765068db patches replay onto
+765068db into tree `67469010e037cde9e0a8876aadfbdc885d7b5e2e`, identical to this HEAD's
+tree, and the incremental bundle requires only `4130bdfd` and imports to the same tree.
+A focused transfer bundle for the HTTP step lives at
+`tmp/q36-image-http-smoke-transfer.tar.gz` (sha256
+`c3d92894022e61454973b52dcd12574ebe969a8c5d5b749359431e18280f11e6`): the one harness file
+(`e57c7a37b359138b4234c0ee322641acbbd17cd7a3ef0e908b776c59d9722756`, byte-identical to the
+committed blob), `docs/Q36_IMAGE_HTTP_SMOKE.md`, `ORIN_HTTP_SMOKE_COMMANDS.txt` (transfer,
+`--plan-only`, preflight, window run pinned to the candidate hash, restore/verify) and
+`SHA256SUMS`. The operator's Orin evidence archive is kept at
+`tmp/q36-image-checkpoint-orin-evidence-20261028T115523Z.tar.gz` (sha256
+`79d614ac303c71a9bb8c2ac0e63a8a9ab620f787d570dcab3fc1a86a7edad732`, confirmed on receipt);
+the earlier `tmp/q36-image-checkpoints-review*` archive from tip96d1a00b (sha256
+`7b811c04…`) is what the Orin build actually applied, and is kept unmodified. That export
+is pinned to 3e78a6df; the one later commit 219b09bf changes only this paragraph's wording
+and is therefore NOT inside it — regenerate with the command at the end of this document if
+an archive of the newest tip is needed.
+
 Still pending: the HTTP smoke window itself (transfer commands, `--plan-only`, `--preflight`
 and the window command are in `docs/Q36_IMAGE_HTTP_SMOKE.md`; the operator isolation window
-and the manager-owned cgroup procedure are unchanged and still required), the eight
-correction/evidence commits above plus this harness still being LOCAL (origin tip remains
-72457256), and any broader sampling, front-end savings, encoder co-residency or performance
-qualification.
+and the manager-owned cgroup procedure are unchanged and still required), every commit
+above origin tip **72457256** (the correction/evidence commits, the review-archive
+verification, and now `1248bc09` the HTTP smoke harness with `3e78a6df`/`cf377095` its
+documentation) still being **LOCAL — no push was performed in this session**, and the
+branch is not merged anywhere, and any broader sampling, front-end savings, encoder
+co-residency or performance qualification.
 
 ### Historical authentication failure / recovery instructions (superseded)
 
