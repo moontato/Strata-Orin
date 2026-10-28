@@ -78,7 +78,18 @@ bounded-supervisor scenarios and the restored-state harness ladder are copied un
 identical tree `d67a44ef0749000155b1d4779515fe058260faab`, and the incremental
 bundle (prerequisite 4130bdfd only) imports the tip with the same tree and order.
 
-The two correction commits (3958d620, f19e2294) are LOCAL on
+The teardown corrections were then re-validated from a clean tree at
+5d793938fbae4a2940a582fb9dc511dafa1b05ae with the same runner (`PASS_CPU_ONLY`,
+logs/q36-dev-cpu/20261028T082122Z-6987): 14 binaries/17 ctest cases at 100% in the
+release and sanitized builds, 99 Python tests plus 22 subtests, and five
+gate-teardown mutations (a supervisor with no signal teardown leaves a live worker
+and no record; a re-armed cleanup allowance takes2.00s against a1.00s baseline).
+Raw outputs are stored with the `-teardown` suffix in
+`docs/validation/q36-image-checkpoints/` (see its `VALIDATION.md` addendum2), along
+with the per-signal teardown records in `gate-signals-teardown.txt` and a 7-patch
+replay reproducing tree c6e372e8e8017aa75293fa09d7113f5b582dff47.
+
+The correction commits (3958d620, f19e2294, 5d793938) are LOCAL on
 `feature/q36-image-checkpoints`. No push was performed in this session, so origin
 publication for them is still pending; the earlier verified origin tip is 72457256.
 

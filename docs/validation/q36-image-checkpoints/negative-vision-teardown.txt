@@ -1,0 +1,7 @@
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_vision_negative.py']
+VISION_NEGATIVE_CONTROL PASS unbounded-rows exit=-6
+VISION_NEGATIVE_CONTROL PASS overwrite-active-staging exit=-6
+VISION_NEGATIVE_CONTROL PASS ignore-stale-epoch exit=-6
+VISION_NEGATIVE_CONTROL PASS zero-retained-rope-offset exit=-6
+VISION_NEGATIVE_CONTROL PASS allow-nan-embeddings exit=-6
+VISION_NEGATIVE_CONTROL PASS trust-key-ignore-actual-rows exit=-6

@@ -122,3 +122,48 @@ stay disabled by default and NOT Orin-qualified.
 
 Review/handoff: docs/Q36_IMAGE_CHECKPOINTS.md. Archive import/patch replay/tree/
 checksum verification logs accompany the packaged revision.
+
+## Addendum2: supervisor teardown corrections (tip5d793938fbae4a2940a582fb9dc511dafa1b05ae)
+
+Two independently reproduced teardown defects were fixed.
+(1) SIGINT/SIGTERM/SIGHUP delivered to the gate supervisor left its worker group
+running and wrote **no** `watchdog.json` (SIGTERM/SIGHUP took the default
+disposition; SIGINT raised past the reaping, group verification and the record).
+One recorded teardown path now handles every ending, always writes the failure
+record and exits nonzero.
+(2) The cleanup allowance was waited out and then **re-armed** for group cleanup
+(measured2.11s with a0.1s execution budget and a1s allowance). One absolute
+cleanup deadline now bounds waiting, reaping and the emptiness proof.
+
+Re-validated from a CLEAN tree at5d793938with
+`tools/q36_cpu_checks.py --build-dir build-q36-dev-cpu-final3 --negative-controls
+--sanitizers --jobs 3`:`PASS_CPU_ONLY`, logs/q36-dev-cpu/20261028T082122Z-6987.
+Raw outputs are copied here with the`-teardown`suffix (earlier logs untouched):
+
+- 14 Release CPU binaries/17 ctest cases:100% passed in BOTH the release and the
+  ASan/UBSan build. release-*-teardown.txt, sanitized-*-teardown.txt.
+- 99 Python tests plus22 subtests (up from94+22), adding three per-signal teardown
+  regressions (SIGINT/SIGTERM/SIGHUP to a real supervisor after its worker starts),
+  a hung-child interrupt that must reap worker+child+marked descendant, a
+  blocked-reaping case proving one allowance, and a foreign-process-untouched
+  check. python-teardown.txt.
+- Negative controls:8 image,6 vision,8 bank,3 restored-observation and now FIVE
+  gate-teardown mutations. Every mutant fails as required:
+  `signal_teardown_removed supervisor_exit=-15 surviving_worker_pids=1
+  watchdog_record=False`,`cleanup_rearmed teardown_s=2.00` against a
+  `one_cleanup_allowance_s=1.00` baseline, plus no_group_kill, late_success_accepted
+  and supervisor_bypass. negative-gate_watchdog-teardown.txt,
+  gate-signals-teardown.txt.
+- gate-signals-teardown.txt records each signal case: supervisor exit1,
+  `interrupted_signals` named, `owned_group_empty=true`, `worker_reaped=true`,
+  `cleanup_complete=true`, no PASS marker, no surviving owned worker or marked
+  descendant, and an unrelated process left running.
+- All7 feature patches replayed onto765068db reproduce tree
+c6e372e8e8017aa75293fa09d7113f5b582dff47 exactly (patch-replay-teardown.txt); the
+incremental bundle imports the tip against4130bdfd only
+(bundle-import-teardown.txt).
+
+Checkpoint logic, numerical comparisons, tolerances and the existing execution
+budget/preflight/mode protections are untouched by these two fixes. Host/CPU
+evidence only: no CUDA, GPU, model, encoder, service, cgroup or Orin operation.
+Image checkpoints remain disabled by default and NOT Orin-qualified.

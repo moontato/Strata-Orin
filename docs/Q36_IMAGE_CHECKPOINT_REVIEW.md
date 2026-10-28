@@ -175,6 +175,8 @@ Evidence (fake workers only, no engine/model/encoder/service):
 GATE_WATCHDOG_NEGATIVE PASS signal_teardown_removed supervisor_exit=-15 surviving_worker_pids=1 watchdog_record=False
 ```
 
+(copied as `docs/validation/q36-image-checkpoints/gate-signals-teardown.txt`, which
+also prints the per-signal `watchdog.json` fields and the surviving-process checks).
 That mutation removes the handler installation, and the reported defect reappears: the
 worker group survives and no record is written. The regression tests deliver each of
 SIGINT, SIGTERM and SIGHUP to a real supervisor after its worker has started and require
@@ -206,7 +208,8 @@ GATE_WATCHDOG_NEGATIVE PASS supervisor_bypass leaked_owned_pids=1 exit=1
 ```
 
 `cleanup_rearmed` re-arms the allowance for the verification phase and reproduces the
-2× shape; the shipped code stays inside one allowance. The regressions also prove that
+2× shape; the shipped code stays inside one allowance (measured1.00s for a1.0s
+allowance with both reaping and cleanup blocked). The regressions also prove that
 neither an unreaped worker nor a non-empty group can be accepted whatever the worker
 reported, and that a real `hung_child` run leaves no marked owned process.
 

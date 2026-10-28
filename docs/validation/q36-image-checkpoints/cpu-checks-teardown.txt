@@ -1,0 +1,84 @@
+python3 tools/q36_cpu_checks.py --build-dir build-q36-dev-cpu-final3 --negative-controls --sanitizers --jobs 3
+HEAD=5d793938fbae4a2940a582fb9dc511dafa1b05ae branch=feature/q36-image-checkpoints
+tracked worktree: git status --porcelain --untracked-files=all was EMPTY before the run (the review archive is generated AFTER these checks, outside the worktree)
+runner PASS line: Q36_CPU_CHECKS PASS_CPU_ONLY logs=logs/q36-dev-cpu/20261028T082122Z-6987
+
+result.json:
+{
+ "source": "/workspace",
+ "head": "5d793938fbae4a2940a582fb9dc511dafa1b05ae",
+ "source_dirty": false,
+ "checker_sha256": "5ab09675df270b94ba0082fe358bfb05d4016a96c7830c62d17e6d67c72ad047",
+ "python": "3.11.2 (main, Oct  7 2026, 12:35:07) [GCC 12.2.0]",
+ "targets": 14,
+ "cases": 17,
+ "status": "PASS_CPU_ONLY",
+ "sanitizers": true,
+ "negative_controls": true,
+ "packages": {
+  "cmake": "4.4.4",
+  "ninja": "1.13.2",
+  "pytest": "9.1.1",
+  "numpy": "2.4.6",
+  "Pillow": "13.0.0",
+  "regex": "2026.9.29",
+  "Jinja2": "3.1.6",
+  "MarkupSafe": "3.0.4"
+ }
+}
+
+release ctest:
+ 100% tests passed out of 17
+
+sanitized ctest:
+ 100% tests passed out of 17
+
+python:
+ 99 passed, 22 subtests passed in 122.13s (0:02:02)
+
+negative controls (four scripts):
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_image_checkpoint_negative.py']
+IMAGE_CHECKPOINT_NEGATIVE PASS trust_keys_not_bytes exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS omit_grid exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS omit_placement exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS permit_incomplete_image exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS ignore_point_readiness exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS ignore_point_delta exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS drop_early_legal_boundary exit=-6
+IMAGE_CHECKPOINT_NEGATIVE PASS capture_unseeded_MTP exit=-6
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_vision_negative.py']
+VISION_NEGATIVE_CONTROL PASS unbounded-rows exit=-6
+VISION_NEGATIVE_CONTROL PASS overwrite-active-staging exit=-6
+VISION_NEGATIVE_CONTROL PASS ignore-stale-epoch exit=-6
+VISION_NEGATIVE_CONTROL PASS zero-retained-rope-offset exit=-6
+VISION_NEGATIVE_CONTROL PASS allow-nan-embeddings exit=-6
+VISION_NEGATIVE_CONTROL PASS trust-key-ignore-actual-rows exit=-6
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_kv_preallocation_negative.py']
+NEGATIVE_CONTROL PASS bank-exhaustion-allocates exit=-6
+NEGATIVE_CONTROL PASS recycled-pages-not-zeroed exit=-6
+NEGATIVE_CONTROL PASS bank-charged-as-fresh-memory exit=-6
+NEGATIVE_CONTROL PASS reservation-tail-not-reclaimed exit=-6
+NEGATIVE_CONTROL PASS borrowed-handle-released-on-failure exit=-6
+NEGATIVE_CONTROL PASS force-unsupported-cpu-pointer exit=-6
+NEGATIVE_CONTROL PASS attribute-zero-skips-equal-alias exit=-6
+NEGATIVE_CONTROL PASS cleanup-failure-hidden-as-unsupported exit=-6
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_restore_observation_negative.py']
+RESTORE_OBSERVATION BASELINE PASS placement=1 harness=0 exit=0
+RESTORE_OBSERVATION_NEGATIVE PASS observe_at_copy_time placement_exit=1 harness_exit=-6
+RESTORE_OBSERVATION_NEGATIVE PASS fire_before_select placement_exit=1
+RESTORE_OBSERVATION_NEGATIVE PASS guard_removed exit=1
+RESTORE_OBSERVATION_NEGATIVE PASS host-only boundary controls; NOT GPU qualification
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_gate_watchdog_negative.py']
+GATE_WATCHDOG BASELINE PASS one_cleanup_allowance_s=1.00 (limit 1.60)
+GATE_WATCHDOG_NEGATIVE PASS no_group_kill leaked_owned_pids=1 exit=1 group_empty=False
+GATE_WATCHDOG_NEGATIVE PASS late_success_accepted
+GATE_WATCHDOG_NEGATIVE PASS supervisor_bypass leaked_owned_pids=1 exit=1
+GATE_WATCHDOG_NEGATIVE PASS cleanup_rearmed teardown_s=2.00 (baseline 1.00, one allowance 1.00)
+GATE_WATCHDOG_NEGATIVE PASS signal_teardown_removed supervisor_exit=-15 surviving_worker_pids=1 watchdog_record=False
+GATE_WATCHDOG_NEGATIVE PASS supervisor bounds and teardown only; fake children; NOT an Orin gate result
+
+source preservation tail:
+ABSENT in local parent/preserved absent; actual Orin hash must be checked there: docs/Q36_ADAPTIVE_ORIN_VALIDATION.json
+PASS source preservation only; NOT CUDA/SASS/default-output or native image-oracle execution
+
+HOST/CPU ONLY: no CUDA/HIP/SYCL compiler, no model, no GPU, no service, no Orin operation.
