@@ -24,14 +24,15 @@ def staging(tmp_path):
         'model':{'path':str(model),'size':model.stat().st_size,'mtime_ns':model.stat().st_mtime_ns}})+'\n')
     return stage,engine,model,stage/'fixtures'
 
-def run_gate(tmp_path,scenario,budget=2,cleanup=2):
+def run_gate(tmp_path,scenario,budget=2,cleanup=2,preflight=False):
     stage,engine,model,fixtures=staging(tmp_path)
     out=stage/('run-'+scenario+'-'+str(os.getpid())+'-'+str(next(counter)))
     env=dict(os.environ,STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT=str(ROOT),PYTHONPATH=str(ROOT))
     env.pop('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW',None)
     run=subprocess.run([sys.executable,str(ROOT/'tools/q36_image_checkpoint_gate.py'),'--engine',str(engine),
         '--model',str(model),'--fixtures',str(fixtures),'--out',str(out),'--selftest',scenario,
-        '--budget-seconds',str(budget),'--cleanup-seconds',str(cleanup)],capture_output=True,text=True,env=env,timeout=120)
+        '--budget-seconds',str(budget),'--cleanup-seconds',str(cleanup)]
+        +(['--preflight'] if preflight else []),capture_output=True,text=True,env=env,timeout=120)
     return run,json.loads((out/'watchdog.json').read_text()),out
 
 def owned_probes():
@@ -178,6 +179,36 @@ def test_supervisor_verdict_never_accepts_a_late_or_killed_success():
   passed,reasons=gate.verdict(**case)
   assert passed is False and reasons,(field,value)
  assert gate.verdict(**{**clean,'phases':{'arms_completed':False}})[0] is False
+ # The accepted report status depends on the mode: a preflight-only report is never a
+ # numerical gate pass, and a numerical gate report is never accepted for preflight.
+ assert gate.verdict(**{**clean,'report_status':'PASS_PREFLIGHT_ONLY','preflight':True})[0] is True
+ assert gate.verdict(**{**clean,'report_status':'PASS_PREFLIGHT_ONLY'})[0] is False
+ assert gate.verdict(**{**clean,'preflight':True})[0] is False
+
+
+def test_preflight_runs_under_the_supervisor_and_stays_cpu_only(tmp_path):
+    # A real (non-selftest) preflight is Orin-only by design: ROOT must equal the
+    # reviewed multimodal-cache worktree and results must live under the Orin staging
+    # path. Here the supervisor's preflight VERDICT path is exercised with the labelled
+    # selftest staging, which never starts an engine, model or encoder.
+    run,watch,_=run_gate(tmp_path,'normal',preflight=True)
+    assert run.returncode==0,run.stderr[-400:]
+    assert 'IMAGE_CHECKPOINT_PREFLIGHT PASS model_not_started=1' in run.stdout
+    assert 'SUPERVISOR PASS' in run.stdout
+    # Preflight is labelled CPU-only and can never look like a numerical gate pass.
+    assert 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in run.stdout
+    assert watch['passed'] is True and watch['worker_report_status']=='PASS_PREFLIGHT_ONLY'
+
+
+def test_real_preflight_is_refused_outside_the_reviewed_orin_checkout(tmp_path):
+    # ROOT here is the coding checkout, not the reviewed multimodal-cache worktree, so
+    # an unsupervised/real preflight must be refused instead of quietly running.
+    stage,engine,model,fixtures=staging(tmp_path)
+    run=subprocess.run([sys.executable,str(ROOT/'tools/q36_image_checkpoint_gate.py'),'--engine',str(engine),
+        '--model',str(model),'--fixtures',str(fixtures),'--out',str(tmp_path/'real-out'),'--preflight'],
+        capture_output=True,text=True,env=dict(os.environ,STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT=str(ROOT),
+        PYTHONPATH=str(ROOT)),timeout=60)
+    assert run.returncode!=0 and 'multimodal-cache' in (run.stderr+run.stdout)
 
 
 def test_supervisor_bounds_every_scenario(tmp_path):

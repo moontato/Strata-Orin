@@ -163,15 +163,18 @@ def worker(a,budget):
  finally:
   (a.out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
 
-def verdict(killed,late,exit_code,group_empty,report_status,phases):
+def verdict(killed,late,exit_code,group_empty,report_status,phases,preflight=False):
  """Pure decision: a killed worker, a late completion, a non-empty owned group or a
- non-PASS report can never produce a PASS. Deterministic and unit-testable."""
+ non-PASS report can never produce a PASS. The accepted report status also depends on
+ the mode, so a preflight-only report can never be counted as a numerical gate pass
+ (nor a numerical gate report as preflight). Deterministic and unit-testable."""
  reasons=[]
  if killed:reasons.append('worker killed at the execution deadline')
  if late:reasons.append('worker finished at or after the execution deadline')
  if exit_code!=0:reasons.append('worker exit '+str(exit_code))
  if not group_empty:reasons.append('owned process group still present after cleanup allowance')
- if report_status!='PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE':reasons.append('worker report status '+str(report_status))
+ accepted='PASS_PREFLIGHT_ONLY' if preflight else 'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE'
+ if report_status!=accepted:reasons.append('worker report status '+str(report_status)+' not accepted for preflight='+str(preflight))
  if not phases.get('arms_completed'):reasons.append('not every gate arm completed')
  return (not reasons),reasons
 
@@ -221,7 +224,7 @@ def supervise(a,budget):
  phases=dict(arms_completed=all((out/(arm+'.exit.json')).is_file() for arm in ('negative-conv','disabled','enabled')) and not a.preflight and not a.selftest,
   preflight=bool(a.preflight),selftest=bool(a.selftest))
  if a.preflight or a.selftest:phases['arms_completed']=True
- passed,reasons=verdict(killed,late,exit_code if exit_code is not None else -1,group_empty,report.get('status'),phases)
+ passed,reasons=verdict(killed,late,exit_code if exit_code is not None else -1,group_empty,report.get('status'),phases,a.preflight)
  (out/'watchdog.json').write_text(json.dumps(dict(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
   killed=killed,deadline_crossed=late,worker_exit=exit_code,owned_group_empty=group_empty,worker_report_status=report.get('status'),
   passed=passed,reasons=reasons),indent=2)+'\n')

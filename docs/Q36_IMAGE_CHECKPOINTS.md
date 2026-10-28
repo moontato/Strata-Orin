@@ -185,7 +185,10 @@ maximum60s), after which `watchdog.json` records `owned_group_empty`. The worker
 keeps cooperative budget checks around every phase. Only the supervisor prints a
 verdict, and its pure `verdict()` refuses a killed worker, a completion at/after the
 deadline, a nonzero exit, a non-empty owned group or a non-PASS report — a late
-success is never accepted. `--selftest normal|slow_preflight|hung_child|
+success is never accepted. The accepted report status also depends on the mode:
+`--preflight` can only report `PASS_PREFLIGHT_ONLY` and prints
+`IMAGE_CHECKPOINT_PREFLIGHT PASS model_not_started=1`, never the numerical-gate
+marker. `--selftest normal|slow_preflight|hung_child|
 slow_postprocess|late_success` exercises exactly these paths with fake children and a
 throwaway staging directory. Never run the worker alone: without the supervisor the
 run has only cooperative bounds. Progress is emitted for

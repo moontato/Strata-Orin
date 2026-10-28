@@ -100,6 +100,12 @@ Evidence, host-only (no CUDA compile, no GPU):
   completion at/after the deadline, nonzero worker exit, non-empty owned group,
   non-PASS worker report, or an incomplete arm set. A late success is never accepted,
   and a selftest never relays a production marker.
+- The accepted report status is bound to the mode: a `--preflight` run can only report
+  `PASS_PREFLIGHT_ONLY` (it prints `IMAGE_CHECKPOINT_PREFLIGHT PASS
+  model_not_started=1`, never the numerical-gate marker), and a numerical-gate report
+  is never accepted for a preflight run. A real (non-selftest) preflight still refuses
+  to run unless `ROOT` is the reviewed multimodal-cache worktree with results under the
+  Orin staging path, so host runs cannot masquerade as Orin preflight.
 
 Deterministic short-budget scenarios (fake children only; no engine, model, encoder
 or service; `--selftest`, throwaway staging):
