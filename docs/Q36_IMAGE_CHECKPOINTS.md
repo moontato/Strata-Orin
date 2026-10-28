@@ -195,13 +195,21 @@ is written up as a failure (`interrupted_signals`, `passed=false`) and the exit 
 nonzero; a signal can never skip the record or turn into a pass. The group is only ever
 signalled while its leader is still unreaped (the leader's exit status is read with
 `WNOWAIT`), and the leader is reaped before the final emptiness proof, so a recycled
-PGID can never be signalled by accident. The accepted report status also depends on the mode:
+PGID can never be signalled by accident. Cleanup progress is persistent per run: the
+deadline is created once and shared by the normal, signal and fault paths, teardown is
+idempotent, and once the leader is reaped the former group is only probed, never
+signalled again. If the result itself cannot be written (disk full, I/O error), the run
+reports `stage=record action=failed` on stderr, prints
+`FAIL result_record_failed_<type>`, exits nonzero and never restarts cleanup or reports a
+pass. The accepted report status also depends on the mode:
 `--preflight` can only report `PASS_PREFLIGHT_ONLY` and prints
 `IMAGE_CHECKPOINT_PREFLIGHT PASS model_not_started=1`, never the numerical-gate
 marker. `--selftest normal|slow_preflight|hung_child|
 slow_postprocess|late_success` exercises exactly these paths with fake children and a
-throwaway staging directory. Never run the worker alone: without the supervisor the
-run has only cooperative bounds. Progress is emitted for
+throwaway staging directory; `--fault record|crash`, accepted only together with
+`--selftest`, injects the two recording faults (a watchdog write that fails after
+cleanup, and a supervisor failure after the worker was reaped). Never run the worker
+alone: without the supervisor the run has only cooperative bounds. Progress is emitted for
 preflight rows, startup/every20s and each native turn. First unexpected failure stops
 the sequence. It signals/reaps only the groups it created (the worker's own session and
 the arms inside it), so the operator must still own and reap the enclosing cgroup;

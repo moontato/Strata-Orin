@@ -1,0 +1,32 @@
+$ git rev-parse HEAD
+exit=0
+025e13df40cf7e923045cb06315bda7a1a1a44be
+$ git diff --name-only d9de98d5..HEAD
+exit=0
+tools/check_q36_gate_watchdog_negative.py
+tools/q36_image_checkpoint_gate.py
+tools/test_q36_image_checkpoints.py
+$ git diff --quiet d9de98d5..HEAD -- src include tests CMakeLists.txt
+exit=0
+native engine/C++/test-tree byte-identical since d9de98d5: exit=0
+$ git diff --name-only d9de98d5..HEAD -- tools/q36_image_checkpoint_gate.py
+exit=0
+tools/q36_image_checkpoint_gate.py
+$ git status --porcelain
+exit=0
+?? tmp/
+
+worker-side numerical/acceptance code in the gate, unchanged by this commit (counts):
+  'IMAGE_CHECKPOINT_FAILURE comparison=restored': 1
+  'IMAGE_CHECKPOINT_CORRUPT category=conv': 1
+  'IMAGE_CHECKPOINT_TEST PASS': 3
+  "independent')!='1'": 1
+  'exact': 4
+  'no tolerance waiver': 1
+  '--kv-image-checkpoints': 2
+  '--kv-image-checkpoint-corrupt': 1
+  '--kv-image-checkpoint-test': 2
+  git diff of the gate in this commit touches no line containing: none (0 lines)
+  tools/test_q36_integration_ordinary.py present locally: False (Orin-only, never fabricated)
+  docs/Q36_ADAPTIVE_ORIN_VALIDATION.json present locally: False (Orin-only, never fabricated)
+f934 protected tools/q36_adaptive_integration_fixture.py sha256: f77b0d6ff8934ab60e9eeca1c274a2104dd157c9dbed08befc23dda254548320

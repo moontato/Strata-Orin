@@ -6,12 +6,14 @@ implementation **37911119e64aa97b837b2f6a920dbdc8cc3930bd** (parent diagnostics
 coding-server CPU suite are recorded in
 [the migration handoff](Q36_MULTIMODAL_CACHE_HANDOFF.md).
 
-Four review blockers were confirmed, then **fixed and regression-tested on the CPU
-host** in the correction commits on `feature/q36-image-checkpoints` — R1/R2 in
+Four review blockers and one follow-up teardown defect were confirmed, then **fixed and
+regression-tested on the CPU host** in the correction commits on
+`feature/q36-image-checkpoints` — R1/R2 in
 3958d620 (`observe restored state after selection and hard-bound the gate`) and
-f19e2294 (`bind the gate verdict to the run mode under the supervisor`), and R3/R4
+f19e2294 (`bind the gate verdict to the run mode under the supervisor`), R3/R4
 (supervisor teardown on SIGINT/SIGTERM/SIGHUP, and a cleanup allowance spent twice) in
-the teardown commit that adds this section. The flag remains
+5d793938, and R5 (cleanup restarted after the worker was already reaped) in
+025e13df. The flag remains
 **off by default**. Nothing here is CUDA, GPU-output, model or Orin qualification.
 
 ## R1 — restored-state observation could read another slot's device rotary delta (resolved)
@@ -216,6 +218,54 @@ reported, and that a real `hung_child` run leaves no marked owned process.
 Checkpoint logic, numerical comparisons and the existing timeout/mode protections
 (execution budget, deadline sharing, preflight/gate status binding, corruption arm,
 observation boundary) are unchanged by R3/R4.
+
+## R5 — cleanup was restarted after the worker had already been reaped (resolved)
+
+Reproduced against d9de98d5 with the real supervisor and a fake worker: normal teardown
+finished and reaped the worker leader, the `watchdog.json` write then failed (ENOSPC
+class), and `supervise()` fell into its fault handler, which called `teardown()` **again
+with a fresh `cleanup_seconds` deadline**. That second pass group-signalled the worker's
+PGID although its leader had already been reaped — at that point the PGID may belong to
+an unrelated process — and the run could spend a second cleanup allowance.
+
+Fix: cleanup progress is now a persistent `CleanupState` per run. Its absolute deadline
+is created once and reused by the normal, signal and exceptional paths; `teardown()` is
+idempotent (`state.complete` returns the recorded result unchanged); and the ownership
+guard `if state.reaped: return state.group_status` means a group whose leader is gone is
+only ever **probed**, never signalled, even mid-cleanup. A result that cannot be written
+is reported to stderr (`stage=record action=failed`, `action=no_restart
+cleanup_state_final=1`), printed as `FAIL result_record_failed_<type>` and exits nonzero
+without re-running cleanup; the worker's own PASS can never become a supervisor PASS.
+
+Fault injection through the real supervisor (`--fault record|crash`, selftest-only, fake
+children; `gate-fault-injection-postteardown.txt`):
+
+```text
+FAULT scenario=normal fault=record exit=1 elapsed_s=0.56 watchdog_record=False owned_probes_after=[]
+  IMAGE_CHECKPOINT_GATE_SELFTEST FAIL result_record_failed_NotADirectoryError
+FAULT scenario=normal fault=crash exit=1 elapsed_s=0.57 watchdog_record=True
+  watchdog: passed=false worker_reaped=true owned_group_empty=true cleanup_complete=true
+FAULT scenario=hung_child fault=record exit=1 elapsed_s=3.11 watchdog_record=False owned_probes_after=[]
+```
+
+Mutation controls (now seven, `tools/check_q36_gate_watchdog_negative.py`):
+
+```text
+GATE_WATCHDOG BASELINE PASS one_cleanup_allowance_s=1.00 (limit 1.60) reentry_s=0.00 signals_after_reap=0 probes_after_reap=1 result_unchanged=True
+GATE_WATCHDOG_NEGATIVE PASS cleanup_rearmed teardown_s=2.00 (baseline 1.00, one allowance 1.00)
+GATE_WATCHDOG_NEGATIVE PASS cleanup_state_rearmed reentry_s=1.00 (baseline 0.00, one allowance 1.00)
+GATE_WATCHDOG_NEGATIVE PASS post_reap_signal signals_after_reap=2 probes=1 (real supervisor: 0 signals)
+```
+
+`post_reap_signal` removes the ownership guard and signals twice; `cleanup_state_rearmed`
+bypasses the persistent state (the shape of the old fault path) and spends a second
+allowance on re-entry. The shipped code signals nothing after a reap and re-entry costs
+0.00s. Regressions cover: write failure after completed cleanup, an exception after
+reaping (safety-net record still written with `passed=false`), no group signal after
+reaping, no renewed allowance, `--fault` refused outside selftest, and the R3/R4 signal,
+timeout and unrelated-process protections unchanged (31 Python tests in
+python-postteardown.txt). No C++, CUDA or numerical file changed in 025e13df, so the full
+CPU suite was deliberately not re-run; see the validation addendum.
 
 ## Still true from the first review
 

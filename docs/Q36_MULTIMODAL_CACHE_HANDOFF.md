@@ -50,11 +50,12 @@ scenario and mutation output.
   killed or late worker. Never launch the worker without the supervisor.
 - New host controls: `tools/q36_restore_observation_harness.py`,
   `tools/check_q36_restore_observation_negative.py` and
-  `tools/check_q36_gate_watchdog_negative.py` (now five teardown mutations plus a
-  measured one-allowance baseline); the CPU runner now executes four negative-control
-  scripts. Deterministic short-budget supervisor scenarios, per-signal teardown cases,
+  `tools/check_q36_gate_watchdog_negative.py` (now seven teardown mutations plus a
+  measured one-allowance baseline and a post-reap signalling probe); the CPU runner now
+  executes four negative-control scripts. Deterministic short-budget supervisor
+  scenarios, per-signal teardown cases,
   verdict/slow-log-read/unowned-process checks live in
-  `tools/test_q36_image_checkpoints.py` (20 tests).
+  `tools/test_q36_image_checkpoints.py` (23 tests).
 
 This is host evidence only. Nothing was built or run on Orin, no model/service was
 started, and image checkpoints remain off by default and NOT Orin-qualified. The Orin
@@ -89,7 +90,25 @@ Raw outputs are stored with the `-teardown` suffix in
 with the per-signal teardown records in `gate-signals-teardown.txt` and a 7-patch
 replay reproducing tree c6e372e8e8017aa75293fa09d7113f5b582dff47.
 
-The correction commits (3958d620, f19e2294, 5d793938) are LOCAL on
+A third, narrower correction followed in 025e13df40cf7e923045cb06315bda7a1a1a44be:
+a `watchdog.json` write that failed AFTER normal teardown had reaped the worker leader
+fell into the supervisor fault path, which re-ran teardown with a fresh cleanup
+allowance and group-signalled a PGID whose leader was already gone. Cleanup progress is
+now a persistent per-run state — one absolute deadline reused by the normal, signal and
+fault paths, an idempotent teardown, and a guard that only probes (never signals) a group
+whose leader was reaped — and an unrecordable result is reported on stderr, exits nonzero
+and never restarts cleanup or prints a pass. Because `git diff --quiet d9de98d5..HEAD --
+src include tests CMakeLists.txt` exits0 (no C++/CUDA/native-test/build-tree file and no
+line of the gate's numerical or acceptance code changed), the full CPU suite was
+deliberately NOT re-run; the narrower evidence is stored with the `-postteardown` suffix
+(31 Python tests, seven gate-teardown mutations, three real-supervisor fault-injection
+cases: `record exit=1 elapsed_s=0.56 watchdog_record=False`,
+`crash exit=1 watchdog passed=false worker_reaped=true owned_group_empty=true`,
+`hung_child record exit=1 elapsed_s=3.11` with no second cleanup round and no surviving
+owned process). See `docs/validation/q36-image-checkpoints/VALIDATION.md` addendum3 and
+the R5 section of `docs/Q36_IMAGE_CHECKPOINT_REVIEW.md`.
+
+The correction commits (3958d620, f19e2294, 5d793938, 025e13df) are LOCAL on
 `feature/q36-image-checkpoints`. No push was performed in this session, so origin
 publication for them is still pending; the earlier verified origin tip is 72457256.
 
@@ -215,7 +234,11 @@ Actual implementation:
   covering waiting, reaping and the owned-group emptiness proof. SIGINT/SIGTERM/SIGHUP
   to the supervisor are recorded and routed through that same teardown, which always
   writes the failure record and exits nonzero; the pure verdict also refuses an
-  interrupted supervisor and an unreaped worker. Only groups this run created are ever
+  interrupted supervisor and an unreaped worker. Cleanup progress is persistent per run:
+  one deadline shared by the normal, signal and fault paths, an idempotent teardown, and
+  a group whose leader was reaped is only probed, never signalled again; a result that
+  cannot be written exits nonzero without restarting cleanup. Only groups this run
+  created are ever
   signalled, so the operator-owned enclosing cgroup is still required. Each arm passes its OWN independent matching-schedule
   oracle; OFF/ON neutrality is not the correctness reference. Timings distinguish
   replay/reuse, prefill/request, synchronized copy cost and selected CPU metadata

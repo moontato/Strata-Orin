@@ -167,3 +167,51 @@ Checkpoint logic, numerical comparisons, tolerances and the existing execution
 budget/preflight/mode protections are untouched by these two fixes. Host/CPU
 evidence only: no CUDA, GPU, model, encoder, service, cgroup or Orin operation.
 Image checkpoints remain disabled by default and NOT Orin-qualified.
+
+## Addendum3: post-teardown error path (tip025e13df40cf7e923045cb06315bda7a1a1a44be)
+
+One Python-only correction (025e13df): after normal teardown had reaped the worker
+leader, a failed `watchdog.json` write fell into the supervisor fault path, which ran
+`teardown()` again with a FRESH cleanup allowance and group-signalled a PGID whose leader
+was already gone. Cleanup progress is now a persistent per-run state (one absolute
+deadline reused by the normal, signal and fault paths, idempotent teardown, and a guard
+that only probes a group whose leader was reaped); a result that cannot be recorded is
+reported on stderr, exits nonzero and never restarts cleanup or prints a pass.
+
+`git diff --quiet d9de98d5..HEAD -- src include tests CMakeLists.txt` exits0: no C++,
+CUDA/HIP/SYCL, engine, native-test or build-tree file changed, and no line of the gate's
+numerical/acceptance code (corruption arm, independent exact recomputation, no-tolerance
+wording, engine flags) is touched. The full CPU suite was therefore **deliberately not
+re-run**; the previously recorded `PASS_CPU_ONLY` run
+(logs/q36-dev-cpu/20261028T082122Z-6987, tip5d793938) still covers the unchanged native
+tree, and nothing in this commit can alter it. Raw outputs are copied here with the
+`-postteardown`suffix:
+
+- source-and-scope-postteardown.txt — HEAD, the three changed files, the byte-identical
+  native tree check, numerical-token proof, f934 protected-file sha256
+  f77b0d6ff8934ab60e9eeca1c274a2104dd157c9dbed08befc23dda254548320, and the two
+  Orin-only f934 files still absent locally (never fabricated).
+- python-postteardown.txt — 31 passed (23 image-checkpoint + 8 multimodal-cache),
+  including new regressions: watchdog write failure after completed cleanup, an
+  exception after leader reaping (safety-net record still `passed=false` with
+  `worker_reaped=true owned_group_empty=true cleanup_complete=true`), teardown
+  idempotence, no group signal once the leader is reaped, no renewed allowance, and
+  `--fault` refused outside `--selftest`. The R3/R4 signal (SIGINT/SIGTERM/SIGHUP),
+  timeout, hung-child reaping and foreign-process protections still pass.
+- gate-fault-injection-postteardown.txt — real supervisor, fake children:
+  `fault=record exit=1 elapsed_s=0.56 watchdog_record=False`,
+  `fault=crash exit=1 elapsed_s=0.57 watchdog_record=True`,
+  `hung_child fault=record exit=1 elapsed_s=3.11` (budget3s + one cleanup allowance, no
+  second round), no surviving marked owned process in any case.
+- negative-gate_watchdog-postteardown.txt — baseline plus SEVEN mutations, all biting:
+  `one_cleanup_allowance_s=1.00 reentry_s=0.00 signals_after_reap=0 probes_after_reap=1
+  result_unchanged=True`; `cleanup_rearmed teardown_s=2.00`;
+  `cleanup_state_rearmed reentry_s=1.00`;
+  `post_reap_signal signals_after_reap=2 (real supervisor: 0 signals)`; plus
+  no_group_kill, late_success_accepted, supervisor_bypass, signal_teardown_removed.
+- negative-image_checkpoint-postteardown.txt and
+  negative-restore_observation-postteardown.txt — the two neighbouring controls that
+  read the same gate module re-run clean (8 image mutations, 3 observation mutations).
+
+Host/CPU evidence only: no CUDA, GPU, model, encoder, service, cgroup or Orin operation.
+Image checkpoints remain disabled by default and NOT Orin-qualified.
