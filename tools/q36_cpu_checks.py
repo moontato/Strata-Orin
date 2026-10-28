@@ -62,7 +62,7 @@ def main():
   run('python',[sys.executable,'-m','pytest','-q',*tests,'serve/test_q36_config.py','serve/test_unified_kv.py','tools/test_unified_kv_validate.py'])
   run('source-preservation',[sys.executable,'tools/check_q36_image_preservation.py'])
   if a.negative_controls:
-   for name in ('image_checkpoint','vision','restore_observation','gate_watchdog'):
+   for name in ('image_checkpoint','vision','restore_observation','gate_watchdog','image_http_smoke'):
     run('negative-'+name,[sys.executable,'tools/check_q36_'+name+'_negative.py'])
    run('negative-bank',[sys.executable,'tools/check_kv_preallocation_negative.py'])
   if a.sanitizers:suite(build.with_name(build.name+'-sanitized'),True)
