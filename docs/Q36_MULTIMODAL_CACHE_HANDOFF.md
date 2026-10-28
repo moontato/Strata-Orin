@@ -58,6 +58,28 @@ This is host evidence only. Nothing was built or run on Orin, no model/service w
 started, and image checkpoints remain off by default and NOT Orin-qualified. The Orin
 recipe still requires a separately approved operator isolation window.
 
+Validation actually run after the corrections, from a clean tree at
+f19e22941276cdc7d63f0bd84839626c22f2c7df:
+
+    python3 tools/q36_cpu_checks.py --build-dir build-q36-dev-cpu-final \
+      --negative-controls --sanitizers --jobs 3
+    Q36_CPU_CHECKS PASS_CPU_ONLY logs=logs/q36-dev-cpu/20261028T064821Z-2583
+
+14 Release CPU binaries / 17 ctest cases pass in BOTH the release and the
+ASan/UBSan build (3 expected-failure text schedule-oracle controls included), 94
+Python tests plus 22 subtests pass, and four negative-control scripts run: 8 image,
+6 vision and 8 bank metadata mutations, 3 restored-observation mutations and 3
+gate-watchdog mutations, every mutant failing as required. Raw outputs, the five
+bounded-supervisor scenarios and the restored-state harness ladder are copied under
+`docs/validation/q36-image-checkpoints/` with the `-correction` suffix
+(see its `VALIDATION.md` addendum). The 5-patch series replays onto 765068db with an
+identical tree `d67a44ef0749000155b1d4779515fe058260faab`, and the incremental
+bundle (prerequisite 4130bdfd only) imports the tip with the same tree and order.
+
+The two correction commits (3958d620, f19e2294) are LOCAL on
+`feature/q36-image-checkpoints`. No push was performed in this session, so origin
+publication for them is still pending; the earlier verified origin tip is 72457256.
+
 ### Historical authentication failure / recovery instructions (superseded)
 
 The normal push of portable-support commit **ad0988b66fea6cd62996c6bee42a179c37dd68b3**

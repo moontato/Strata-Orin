@@ -7,8 +7,9 @@ coding-server CPU suite are recorded in
 [the migration handoff](Q36_MULTIMODAL_CACHE_HANDOFF.md).
 
 Two review blockers were confirmed, then **fixed and regression-tested on the CPU
-host** in the correction commit on `feature/q36-image-checkpoints`
-(`q36: bound restored-state observation and gate execution budget`). The flag remains
+host** in the two correction commits on `feature/q36-image-checkpoints` —
+3958d620 (`observe restored state after selection and hard-bound the gate`) and
+f19e2294 (`bind the gate verdict to the run mode under the supervisor`). The flag remains
 **off by default**. Nothing here is CUDA, GPU-output, model or Orin qualification.
 
 ## R1 — restored-state observation could read another slot's device rotary delta (resolved)
@@ -38,7 +39,10 @@ A pending snapshot is discarded at the start of every request. Firing while `dst
 not current throws and is counted (`restore_snapshot_refused`). With no hook installed
 (a normal engine run) nothing is requested, counted or thrown.
 
-Evidence, host-only (no CUDA compile, no GPU):
+Evidence, host-only (no CUDA compile, no GPU), copied under
+`docs/validation/q36-image-checkpoints/` (`restore-observation-correction.txt`,
+`gate-scenarios-correction.txt`, `negative-*-correction.txt`,
+`cpu-checks-correction.txt`):
 
 - `python3 tools/q36_restore_observation_harness.py` extracts the **real**
   `copy_session` tail from `src/qwen35/q36_engine.cu`, compiles it with the **real**
@@ -158,8 +162,9 @@ provenance assertion when coverage is extended.
 No Orin path is mounted on this host; nothing below was run. See
 [Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md) for the exact commands.
 
-1. Re-run the focused CPU checks on the delivered commit (done locally: see
-   `docs/validation/q36-image-checkpoints/`), then build on Orin.
+1. CPU checks on the delivered commit are done (`PASS_CPU_ONLY` at f19e2294, raw
+   outputs in `docs/validation/q36-image-checkpoints/*-correction.txt`); re-run them
+   on Orin alongside the CUDA build.
 2. Read-only inventory of the isolated multimodal-cache worktree; protect the three
    f934 follow-up files; preserve the actual diagnostic HEAD/ref/bundle; apply only
    the reviewed post-765068db range plus this fix. Never touch the live

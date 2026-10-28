@@ -79,6 +79,46 @@ are existing /workspace/tmp/adaptive-integration-deps, not production packages):
     python3 tools/check_q36_vision_negative.py
     python3 tools/check_kv_preallocation_negative.py
     python3 tools/check_q36_image_preservation.py
+    python3 tools/q36_cpu_checks.py --build-dir build-q36-dev-cpu-final --negative-controls --sanitizers
+    python3 tools/q36_restore_observation_harness.py
+    python3 tools/check_q36_restore_observation_negative.py
+    python3 tools/check_q36_gate_watchdog_negative.py
+
+## Addendum: review corrections (same branch, tip f19e22941276cdc7d63f0bd84839626c22f2c7df)
+
+Both review blockers (restored-state observation timing, unenforced execution
+budget) were fixed and re-validated on this host from a CLEAN tree with
+`tools/q36_cpu_checks.py --build-dir build-q36-dev-cpu-final --negative-controls
+--sanitizers --jobs 3`:`PASS_CPU_ONLY`, logs/q36-dev-cpu/20261028T064821Z-2583.
+Raw outputs are copied here with the`-correction`suffix; the2026-10-24 logs above
+remain the implementation-time record and are not overwritten.
+
+- 14 Release CPU binaries/17 ctest cases:100% passed in BOTH the release and the
+  ASan/UBSan build, including the3 expected-failure text schedule-oracle controls.
+  release-ctest-correction.txt, sanitized-ctest-correction.txt.
+- 94 Python tests plus22 subtests (up from86+22), adding the restored-state
+  placement/harness checks, the supervised preflight cases, the pure-verdict mode
+  checks and the six bounded-supervisor cases. python-correction.txt.
+- Negative controls are now four scripts:8 image,6 vision and8 bank metadata
+  mutations, plus3 new restored-observation mutations and3 new gate-watchdog
+  mutations. Every mutant failed as required and the baseline stayed clean.
+  negative-*-correction.txt.
+- Restored-state host harness (real copy_session tail + real boundary primitives,
+  inert CUDA stubs) and its mutation ladder: restore-observation-correction.txt.
+- Five bounded supervisor scenarios (execution budget2s, separate cleanup
+  allowance2s): normal exits0 within budget; slow preflight, hung child plus its
+  marked descendant, slow postprocessing and a deliberately late success are all
+  killed at the deadline with owned_group_empty=1. gate-scenarios-correction.txt.
+- All5 feature patches replayed onto765068db reproduce tree
+d67a44ef0749000155b1d4779515fe058260faab exactly (patch-replay-correction.txt).
+The incremental bundle (prerequisite4130bdfd only) imports tip f19e2294 with the
+same tree and preserved object order (bundle-import-correction.txt).
+
+Limitations are unchanged and this addendum adds none: declaration-only C++17
+stand-ins and the inert-CUDA host harness are NOT compilation of the actual CUDA
+translation unit; the supervisor selftest children are NOT gate arms; no model,
+encoder, GPU, service, cgroup or Orin operation was performed. Image checkpoints
+stay disabled by default and NOT Orin-qualified.
 
 Review/handoff: docs/Q36_IMAGE_CHECKPOINTS.md. Archive import/patch replay/tree/
 checksum verification logs accompany the packaged revision.

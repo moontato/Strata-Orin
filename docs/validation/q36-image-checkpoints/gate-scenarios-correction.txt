@@ -1,0 +1,23 @@
+python3 tools/q36_image_checkpoint_gate.py --selftest <scenario> --budget-seconds 2 --cleanup-seconds 2 (throwaway staging under $TMPDIR, fake children marked $'#Q36OWNEDPROBE')
+HEAD=f19e22941276cdc7d63f0bd84839626c22f2c7df
+
+scenario=normal exit=0 killed=False deadline_crossed=False worker_exit=0 owned_group_empty=True worker_report_status=PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE
+  reasons: (none)
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST verdict=PASS selftest=normal
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST_SUPERVISOR PASS budget_s=2 cleanup_allowance_s=2 owned_group_empty=1
+scenario=slow_preflight exit=1 killed=True deadline_crossed=True worker_exit=-9 owned_group_empty=True worker_report_status=MISSING
+  reasons: worker killed at the execution deadline; worker finished at or after the execution deadline; worker exit -9; worker report status MISSING not accepted for preflight=False
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST FAIL worker_killed_at_the_execution_deadline worker_finished_at_or_after_the_execution_deadline worker_exit_-9 worker_report_status_MISSING_not_accepted_for_preflight=False
+scenario=hung_child exit=1 killed=True deadline_crossed=True worker_exit=-9 owned_group_empty=True worker_report_status=MISSING
+  reasons: worker killed at the execution deadline; worker finished at or after the execution deadline; worker exit -9; worker report status MISSING not accepted for preflight=False
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST FAIL worker_killed_at_the_execution_deadline worker_finished_at_or_after_the_execution_deadline worker_exit_-9 worker_report_status_MISSING_not_accepted_for_preflight=False
+scenario=slow_postprocess exit=1 killed=True deadline_crossed=True worker_exit=-9 owned_group_empty=True worker_report_status=MISSING
+  reasons: worker killed at the execution deadline; worker finished at or after the execution deadline; worker exit -9; worker report status MISSING not accepted for preflight=False
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST FAIL worker_killed_at_the_execution_deadline worker_finished_at_or_after_the_execution_deadline worker_exit_-9 worker_report_status_MISSING_not_accepted_for_preflight=False
+scenario=late_success exit=1 killed=True deadline_crossed=True worker_exit=-9 owned_group_empty=True worker_report_status=MISSING
+  reasons: worker killed at the execution deadline; worker finished at or after the execution deadline; worker exit -9; worker report status MISSING not accepted for preflight=False
+  stdout: IMAGE_CHECKPOINT_GATE_SELFTEST FAIL worker_killed_at_the_execution_deadline worker_finished_at_or_after_the_execution_deadline worker_exit_-9 worker_report_status_MISSING_not_accepted_for_preflight=False
+
+Supervisor verdict is the only printed verdict; a selftest never relays the production marker;
+execution budget 2s with a separate 2s cleanup allowance; fake children only (marked, group-reaped).
+HOST/CPU ONLY: no engine, model, encoder, GPU, service or Orin operation was started.

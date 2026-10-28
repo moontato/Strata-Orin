@@ -1,0 +1,5 @@
+$ ['/workspace/.venv-q36-dev/bin/python', 'tools/check_q36_gate_watchdog_negative.py']
+GATE_WATCHDOG_NEGATIVE PASS no_group_kill leaked_owned_pids=1 exit=1 group_empty=False
+GATE_WATCHDOG_NEGATIVE PASS late_success_accepted
+GATE_WATCHDOG_NEGATIVE PASS supervisor_bypass leaked_owned_pids=1 exit=1
+GATE_WATCHDOG_NEGATIVE PASS supervisor bounds only; fake children; NOT an Orin gate result
