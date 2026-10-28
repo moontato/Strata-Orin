@@ -213,5 +213,65 @@ tree, and nothing in this commit can alter it. Raw outputs are copied here with 
   negative-restore_observation-postteardown.txt — the two neighbouring controls that
   read the same gate module re-run clean (8 image mutations, 3 observation mutations).
 
-Host/CPU evidence only: no CUDA, GPU, model, encoder, service, cgroup or Orin operation.
-Image checkpoints remain disabled by default and NOT Orin-qualified.
+## Addendum4: HTTP integration smoke harness (tip96d1a00b, three new Python files + docs)
+
+The operator's bounded numerical window on Orin PASSED and its archive is kept in
+`tmp/q36-image-checkpoint-orin-evidence-20261028T115523Z.tar.gz`; the numbers are recorded
+in `docs/Q36_IMAGE_CHECKPOINTS.md` (**What the Orin numerical window measured**) and
+`docs/Q36_MULTIMODAL_CACHE_HANDOFF.md`. What follows is the CPU/host evidence for the new
+HTTP integration harness (`tools/q36_image_http_smoke.py`, documented in
+`docs/Q36_IMAGE_HTTP_SMOKE.md`). It was exercised ONLY against a loopback stand-in that
+replays `serve/server.py`'s endpoint and engine-log shapes: no model, encoder, GPU, engine
+binary, service, cgroup or Orin operation was involved, and it re-verifies no GPU tensor
+(the completed native oracle above owns that).
+
+Evidence stored with the `-http-smoke` suffix:
+
+- source-and-scope-http-smoke.txt — HEAD96d1a00b, origin tip72457256, the three new files
+  with their sha256, `git diff --quiet HEAD -- src include tests CMakeLists.txt` exit0
+  (no C++/CUDA, native-test or build-tree file changed and the reviewed numerical gate/oracle
+  code has no changed line), the protected f934 local copy sha256
+  f77b0d6ff8934ab60e9eeca1c274a2104dd157c9dbed08befc23dda254548320, and the two Orin-only
+  f934 files still absent locally (never fabricated).
+- python-http-smoke.txt — 70 passed: 39 new HTTP-smoke tests (plan and conversation
+  semantics, temporary-config isolation and flag mapping, engine-log parsing and
+  correlation, required-vs-reported split, mode-bound markers, burst attribution, the
+  recycled-PID guard, ten stand-in scenarios, signal teardown, record-failure path,
+  plan-only/preflight guards, `--fault` refused outside `--selftest`) plus the 23
+  image-checkpoint and 8 multimodal-cache tests.
+- smoke-selftest-matrix-http-smoke.txt — per scenario exit/elapsed/watchdog: `normal exit=0
+  elapsed_ms=2108`, `divergence exit=0` (reported, not required),
+  `hung_server exit=0 elapsed_ms=16863` and `stuck_group exit=0 elapsed_ms=16879` (the arm
+  server ignores `SIGTERM`, so the owned group is killed and proven empty; graceful=false
+  recorded), and `slow_server(window=20s) exit=1 elapsed_ms=20217 killed=True worker_exit=-9
+  server_groups_empty=True kinds=['killed_owned_group']` — a worker killed mid-arm leaves no
+  model stand-in behind. Semantic refusals: `no_encoder`, `zero_stable_reuse`, `no_restore`,
+  `engine_error`, `cross_talk`, `missing_record` all exit1 with the named required check
+  listed and no marker. `plan-only` and `preflight` print only their own markers
+  (`real_marker_leaked=0`) and produce zero engine logs (nothing was started). After the
+  whole matrix: `surviving stand-in listeners: []`.
+- smoke-signals-faults-http-smoke.txt — real supervisor: `SIGINT mid-arm exit=1
+  elapsed_ms=6210` through the single teardown (`interrupted=SIGINT killed=True
+  worker_reaped=True group_empty=True server_groups_empty=True
+  kinds=['killed_owned_group']`, no pass line); `fault=record exit=1 watchdog_record=False
+  pass_lines=0` with `action=no_restart cleanup_state_final=1`; `fault=crash exit=1
+  supervisor_error_RuntimeError` with the leftover group reaped; `--fault` outside
+  `--selftest` refused.
+- negative-image_http_smoke-http-smoke.txt — six mutation controls, each run against the
+  mutated AND the committed harness, all biting: flag on every arm, per-client attribution of
+  a concurrent burst, reuse requirement dropped, server groups not reaped (a listener
+  survives only under the mutation), pass marker not mode-bound, window guard removed.
+- negative-image_checkpoint/-vision/-restore_observation/-gate_watchdog/-bank-http-smoke.txt
+  — the five neighbouring controls re-run clean after the harness landed.
+
+Because the change is three Python files plus documentation, and
+`git diff --quiet HEAD -- src include tests CMakeLists.txt` exits0, the full CPU suite was
+deliberately NOT re-run; `tools/q36_cpu_checks.py` picks the new test file up through its
+`tools/test_q36_*.py` glob and now also runs `negative-image_http_smoke`, so the next full
+run covers both.
+
+Host/CPU evidence only: no CUDA, GPU, model, encoder, service, cgroup or Orin operation in
+this addendum. The numerical engine/oracle IS Orin-qualified (see the Orin sections); the
+HTTP integration path on Orin, broader sampling, actual front-end savings, encoder
+co-residency and performance distributions remain pending. `--kv-image-checkpoints` stays
+disabled by default.

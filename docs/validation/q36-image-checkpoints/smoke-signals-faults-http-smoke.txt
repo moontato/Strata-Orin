@@ -1,0 +1,16 @@
+real-supervisor signal and record-fault paths for the HTTP smoke, 2026-10-28T14:14:15Z (fake stand-in only)
+SIGINT mid-arm: exit=1 elapsed_ms=6210
+  HTTP_SMOKE_PROGRESS stage=watchdog action=teardown signal=SIGINT cleanup_allowance_s=15
+  IMAGE_HTTP_SMOKE_SELFTEST FAIL supervisor_interrupted_by_SIGINT worker_ended_by_the_teardown_of_an_interrupted_run worker_exit_-9 worker_report_status_MISSING_not_accepted_for_mode_selftest:slow_server not_every_arm_completed
+  watchdog passed=False interrupted=SIGINT killed=True worker_reaped=True group_empty=True server_groups_empty=True kinds=['killed_owned_group']
+fault=record exit=1 elapsed_ms=2104 watchdog_record=False pass_lines=0
+  HTTP_SMOKE_PROGRESS stage=record action=failed error=NotADirectoryError: [Errno 20] Not a directory: '/tmp/pi/01a180f3-7546-73d1-8096-48dc42888b2f/smoke/stage/f-record/record-fault/watchdog.json'
+  HTTP_SMOKE_PROGRESS stage=record action=no_restart cleanup_state_final=1 operator_cgroup_required=1
+  IMAGE_HTTP_SMOKE_SELFTEST FAIL result_record_failed_NotADirectoryError
+fault=crash exit=1 elapsed_ms=2103 watchdog_record=True pass_lines=0
+  IMAGE_HTTP_SMOKE_SELFTEST FAIL supervisor_error_RuntimeError
+fault injection refused outside --selftest:
+  q36_image_http_smoke.py: error: the HTTP smoke starts a model and encoder, so it runs only in the approved Orin window: set STRATA_IMAGE_HTTP_REVIEW_WINDOW=1 and bring the live services down through the manager first
+surviving stand-in listeners after signals and faults: []
+fault injection outside --selftest (plan-only mode, which needs no window):
+  q36_image_http_smoke.py: error: fault injection requires --selftest

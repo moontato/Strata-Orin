@@ -112,6 +112,72 @@ The correction commits (3958d620, f19e2294, 5d793938, 025e13df) are LOCAL on
 `feature/q36-image-checkpoints`. No push was performed in this session, so origin
 publication for them is still pending; the earlier verified origin tip is 72457256.
 
+### Orin numerical gate PASSED (operator window); HTTP integration smoke prepared locally
+
+The operator ran the bounded numerical window on Orin and the archive of it is in
+`tmp/q36-image-checkpoint-orin-evidence-20261028T115523Z.tar.gz`. Applied state as recorded
+by that archive: source tip **96d1a00b11c8393179c49e24696efee29a3eaa66** imported from the
+regenerated review archive (`7b811c04aa3a7b87a56b445cd254aeec2f5ca3f5d3d0b8e2ffc998ffc426e0a8`)
+and applied onto the actual Orin HEAD **549df89938fe0b2c23c70f2c4ce76ea33d6bedd4**, with the
+three f934 protected files byte-identical before and after (`tools/q36_adaptive_integration_fixture.py`
+`33be6fe86e39dbe63072ff3c02c235a4931f0b328b5fab00a932a3b1e0afee4d`,
+`tools/test_q36_integration_ordinary.py` `17f1afa2233d006548eac4e3cbb4ab63d9c8649dddd13cef623c8a1c4526e759`,
+`docs/Q36_ADAPTIVE_ORIN_VALIDATION.json` `7aed1065e1b777197461a05862c19d69b74f42f9f826fa014ba76221da52794d`),
+build `/mnt/ssd/tmp/strata-checkpoints/build-image-checkpoints-96d1a00b`, candidate binary
+`eb5ef5de8f7f36de9bd25206d59ec2161a4fb5548e3f74246483a344f8544c3f`, all staging under
+`/mnt/ssd/tmp/strata-checkpoints`. Result: `PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE`,
+watchdog `worker_exit=0 worker_reaped=1 owned_group_empty=1 cleanup_complete=1 passed=1`
+under a 420 s budget and 20 s cleanup allowance; 17 `IMAGE_CHECKPOINT_MEASURE` lines each
+`independent=1 exact=1` in both arms; `KV_PREALLOCATION_MODEL PASS physical_allocations=3924
+driver_allocations=3924 mapped_bytes=0` with `checkpoint_operations=47
+checkpoint_copy_bytes=3622502400`; real earlier-user rewrite `reused=3584 replayed=124`
+with `prefill_ms` 4918 → 341; the corrupted-conviction arm refused at
+`IMAGE_CHECKPOINT_FAILURE comparison=restored exact state required`; and the short
+`rendered_header_reasoning` rewrites measured `reused=0 replayed=1060`, an acknowledged
+limit rather than a defect. `actual_OWUI` is still `token divergence and savings UNMEASURED`.
+
+The next bounded step is the **HTTP integration** layer, and its harness is now prepared
+and validated on this coding host only: `tools/q36_image_http_smoke.py`
+(documented in `docs/Q36_IMAGE_HTTP_SMOKE.md`). It starts a temporary loopback server with
+its own config and port (the production port and config are refused), exercises the
+resident encoder with a real image part, carries `content`/`reasoning_content`/`tool_calls`
+from each reply into later requests of the same conversation, records slot/session choice
+from the engine's own `strata serve`/`KVCACHE`/`KVREPLAY`/`strata batch` lines correlated
+with `/metrics` records, and covers stable image history, an earlier-user rewrite after the
+image, an early system rewrite, changed image pixels, two bursts of four clients, and
+text-only generation after images. Arms: deployed baseline, candidate with the flag off,
+candidate with the flag on; rendered-token divergence and rewrite/pixel reuse directions are
+REPORTED, the encoder-reidency, correlation, flag-isolation, restore-observation, burst
+attribution/slot-distinctness and reuse-direction checks are REQUIRED. It reuses the
+reviewed watchdog (`Budget`, `CleanupState`, one window deadline, one cleanup allowance,
+one teardown for signals, `CleanupState`-final post-reap behaviour, record-failure path)
+and additionally registers every server process group it starts (`owned-groups.jsonl`) so a
+killed worker cannot leave a model or encoder running — reaped only while the recorded
+kernel start time still matches, so a recycled pid is never signalled. It never re-checks
+GPU tensor exactness (that is the completed oracle above) and never prints a marker the
+mode it ran does not own.
+
+Focused local validation (no model, no encoder, no GPU, no service; a loopback stand-in
+replays the endpoint and engine-log shapes): 39 tests in `tools/test_q36_image_http_smoke.py`
+plus the 23+8 neighbouring image-checkpoint/multimodal-cache tests, and six mutation
+controls in `tools/check_q36_image_http_smoke_negative.py` (flag on every arm, per-client
+attribution of a concurrent burst, reuse requirement dropped, server groups not reaped,
+pass marker not mode-bound, window guard removed) — each control runs the mutated AND the
+committed harness and passes only when the mutation misbehaves and the committed build
+keeps refusing. `tools/q36_cpu_checks.py` now runs the new control (`negative-image_http_smoke`)
+and picks up the new test file through its `tools/test_q36_*.py` glob. Because
+`git diff --quiet 96d1a00b..HEAD -- src include tests CMakeLists.txt` exits0 (no C++/CUDA,
+native-test or build-tree file changed — the change is three Python files and documentation),
+the full CPU suite was deliberately NOT re-run; see
+`docs/validation/q36-image-checkpoints/VALIDATION.md` addendum4.
+
+Still pending: the HTTP smoke window itself (transfer commands, `--plan-only`, `--preflight`
+and the window command are in `docs/Q36_IMAGE_HTTP_SMOKE.md`; the operator isolation window
+and the manager-owned cgroup procedure are unchanged and still required), the eight
+correction/evidence commits above plus this harness still being LOCAL (origin tip remains
+72457256), and any broader sampling, front-end savings, encoder co-residency or performance
+qualification.
+
 ### Historical authentication failure / recovery instructions (superseded)
 
 The normal push of portable-support commit **ad0988b66fea6cd62996c6bee42a179c37dd68b3**

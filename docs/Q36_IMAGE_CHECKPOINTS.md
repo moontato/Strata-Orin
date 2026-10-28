@@ -1,14 +1,23 @@
-# Image-aware Qwen3.6 prefix checkpoints — opt-in, not Orin-qualified yet
+# Image-aware Qwen3.6 prefix checkpoints — opt-in; Orin numerical gate passed, HTTP layer pending
 
-**2026-10-28 review blockers RESOLVED (CPU evidence only).** Origin publication
-and coding-server CPU validation are complete. Review found (a) a restored-state
-device-delta observation that could read another slot's scalar and (b) a gate whose
-advertised absolute budget was not enforced. Both are fixed and regression-tested on
-this host; see [Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md) for
-the harness, the six bounded-supervisor scenarios and the mutation controls that fail
-when either fix is reverted. This is NOT CUDA, GPU-output or Orin qualification: the
-model window commands below still require a separately approved operator isolation
-window, and the flag remains off by default.
+**2026-10-28 review blockers RESOLVED, and the bounded numerical Orin gate PASSED.**
+Origin publication and coding-server CPU validation are complete. Review found (a) a
+restored-state device-delta observation that could read another slot's scalar and (b) a
+gate whose advertised absolute budget was not enforced. Both are fixed and
+regression-tested on this host; see [Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md)
+for the harness, the six bounded-supervisor scenarios and the mutation controls that fail
+when either fix is reverted.
+
+The numerical window has since been run on Orin: `PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE`
+with `IMAGE_CHECKPOINT_MEASURE … independent=1 exact=1` on all 17 measurement lines, the
+constant-allocation proof `KV_PREALLOCATION_MODEL PASS physical_allocations=3924`, and the
+corrupted-conviction arm refused at `IMAGE_CHECKPOINT_FAILURE comparison=restored exact
+state required` (see **What the Orin numerical window measured** below). That qualifies the
+**engine and oracle only**. The HTTP integration layer — encoder through the OpenAI endpoint,
+carried replies, slot choice from correlated engine logs — has a prepared harness but has
+**not** been run on Orin: [Q36_IMAGE_HTTP_SMOKE.md](Q36_IMAGE_HTTP_SMOKE.md). The flag stays
+off by default, and the model-window commands below still need a separately approved
+operator isolation window.
 
 Local parent: **765068db267f8cd8f846f8ef45c9cc94f90075d5**, on4130bdfd.
 This is a continuation of the multimodal-cache diagnostics, not the older
@@ -225,6 +234,32 @@ proof construction and selected identity searches (NOT all host overhead).
 Reference work/comparison is OUTSIDE those request timings. Compare steady public
 fixture measurements only as **synthetic performance**, never actual OWUI gains
 or a general speedup. Actual OWUI token divergence/savings remain UNMEASURED.
+
+## What the Orin numerical window measured (2026-10-28, operator window)
+
+Run in the existing multimodal-cache worktree with all build staging under
+`/mnt/ssd/tmp/strata-checkpoints`: imported source tip `96d1a00b11c8393179c49e24696efee29a3eaa66`
+applied onto the actual Orin HEAD `549df89938fe0b2c23c70f2c4ce76ea33d6bedd4` (the f934
+follow-ups preserved, their hashes recorded as `33be6fe8…`, `17f1afa2…`, `7aed1065…`),
+CUDA 13.2 / SM87 build, candidate binary `eb5ef5de8f7f36de9bd25206d59ec2161a4fb5548e3f74246483a344f8544c3f`,
+17 CTests, then the bounded gate under a 420 s execution budget and a 20 s cleanup
+allowance: `worker_reaped=1 owned_group_empty=1 cleanup_complete=1 passed=1`.
+
+* 17 `IMAGE_CHECKPOINT_MEASURE` lines, every one `independent=1 exact=1`, in both the
+  disabled and enabled arms (17 requests each).
+* Real earlier-user rewrite: first turn `reused=0 replayed=3708 prefill_ms=4918`, then
+  `reused=3584 replayed=124 prefill_ms=345` warm and `prefill_ms=341` steady.
+* Constant allocation across the whole run: `physical_allocations=3924`,
+  `driver_allocations=3924`, `mapped_bytes=0`, `KV_PREALLOCATION_MODEL PASS`, with
+  `checkpoint_operations=47 checkpoint_copy_bytes=3622502400`.
+* The corrupted-conviction arm is refused, not tolerated:
+  `IMAGE_CHECKPOINT_FAILURE comparison=restored exact state required`.
+* Acknowledged limit, measured not assumed: the short `rendered_header_reasoning` rewrites
+  reuse zero (`reused=0 replayed=1060`), while the real rendered rewrite reuses 3584.
+
+This is engine/oracle qualification. GPU tensor exactness inside the **HTTP** path, reuse
+through `serve/`, and any front-end savings remain separate: the pass marker records
+`actual_OWUI token divergence and savings UNMEASURED`.
 
 ## Orin handoff — commands only, NOT executed here
 

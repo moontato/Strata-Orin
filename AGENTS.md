@@ -10,7 +10,9 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 Read [docs/Q36_MULTIMODAL_CACHE_HANDOFF.md](docs/Q36_MULTIMODAL_CACHE_HANDOFF.md)
 first for the active feature branch, portable CPU setup, evidence and Orin safety
 boundaries. Do not run the installer/production Docker entrypoint for coding tests.
-Image-aware checkpoints remain opt-in and not Orin-qualified.
+Image-aware checkpoints remain opt-in; the native numerical gate passed its bounded Orin
+window, and the HTTP integration step (its own bounded harness, not yet run on Orin) is in
+[docs/Q36_IMAGE_HTTP_SMOKE.md](docs/Q36_IMAGE_HTTP_SMOKE.md).
 
 ## Installing Strata for a user
 
@@ -26,6 +28,9 @@ offers the same steps as tools.
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
+- The bounded HTTP image-checkpoint smoke runs against a loopback stand-in without a model:
+  `python -m pytest tools/test_q36_image_http_smoke.py`, and its guards are checked by
+  `python tools/check_q36_image_http_smoke_negative.py`.
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
   measurement.
 

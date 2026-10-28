@@ -1,4 +1,4 @@
-# Qwen3.6 image-checkpoint review — resolved, Orin qualification still pending
+# Qwen3.6 image-checkpoint review — resolved; Orin numerical gate PASSED, HTTP layer pending
 
 Reviewed published support tip **72457256fa0367660a8e0849bb19e234c6fc1711** and
 implementation **37911119e64aa97b837b2f6a920dbdc8cc3930bd** (parent diagnostics
@@ -14,7 +14,12 @@ f19e2294 (`bind the gate verdict to the run mode under the supervisor`), R3/R4
 (supervisor teardown on SIGINT/SIGTERM/SIGHUP, and a cleanup allowance spent twice) in
 5d793938, and R5 (cleanup restarted after the worker was already reaped) in
 025e13df. The flag remains
-**off by default**. Nothing here is CUDA, GPU-output, model or Orin qualification.
+**off by default**. The numerical engine/oracle has since passed its bounded Orin window
+(`PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE`, all 17 `IMAGE_CHECKPOINT_MEASURE` lines
+`independent=1 exact=1`; numbers in
+[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md)). The **HTTP integration** layer on
+Orin is still pending, with its harness prepared and host-tested here —
+[Q36_IMAGE_HTTP_SMOKE.md](Q36_IMAGE_HTTP_SMOKE.md).
 
 ## R1 — restored-state observation could read another slot's device rotary delta (resolved)
 
@@ -284,8 +289,13 @@ provenance assertion when coverage is extended.
 
 ## Bounded Orin qualification — preparation, NOT execution
 
-No Orin path is mounted on this host; nothing below was run. See
-[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md) for the exact commands.
+No Orin path is mounted on this host; nothing below was run by me. Steps 1–5 were since
+executed by the operator and PASSED (numbers and hashes in
+[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md) and
+[Q36_MULTIMODAL_CACHE_HANDOFF.md](Q36_MULTIMODAL_CACHE_HANDOFF.md)); they are kept here
+as the procedure that was followed. Step 6 is now the HTTP integration step:
+[Q36_IMAGE_HTTP_SMOKE.md](Q36_IMAGE_HTTP_SMOKE.md). See
+[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md) for the exact numerical commands.
 
 1. CPU checks on the delivered commit are done (`PASS_CPU_ONLY` at f19e2294, raw
    outputs in `docs/validation/q36-image-checkpoints/*-correction.txt`); re-run them
