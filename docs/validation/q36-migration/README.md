@@ -25,7 +25,14 @@ original review archive (inside the migration supplement), not hidden runtime
 inputs. The final result logs and essential source/mutation/sanitizer/provenance
 proofs are committed here; original build dirs, binaries and venvs are not.
 
-Origin-clone verification is performed after the normal feature-branch push and
-recorded as a separate delivery proof; it must use the actual network origin,
-not --shared/local alternates. Docker daemon unavailable: the dev Dockerfile was
-inspected, while the equivalent manual fresh-venv setup was actually executed.
+Origin push FAILED authentication (could not read Username; prompts disabled).
+No origin feature-branch clone or successful push is claimed. INDEPENDENT_CLONE.json
+and independent-clone-* record a clean full-BUNDLE clone atad0988b6, with its own
+object store/no alternates or external Git paths, git fsck success, fresh pinned
+venv and all17 CPU/sanitizer cases,86 Python tests +22 subtests and22 mutations
+passing. Exporter also generated/verified a current review from that clone.
+This validates portable source/setup but is NOT the required fresh network-origin
+clone. Repeat that check after authentication/push recovery. Until then, transfer
+of the standalone bundle/migration archive is REQUIRED, not optional.
+Docker daemon unavailable: the dev Dockerfile was inspected; manual fresh-venv
+setup was actually executed. No actual GPU/GGUF/service operations occurred.

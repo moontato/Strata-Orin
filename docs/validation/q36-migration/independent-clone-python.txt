@@ -1,0 +1,10 @@
+$ ['/workspace/tmp/q36-migration-clean-clone/.venv-q36-dev/bin/python', '-m', 'pytest', '-q', 'tools/test_q36_adaptive_checkpoint_fixture.py', 'tools/test_q36_adaptive_integration.py', 'tools/test_q36_checkpoint_scope.py', 'tools/test_q36_image_checkpoints.py', 'tools/test_q36_kv_preallocation_bench.py', 'tools/test_q36_kv_preallocation_native_gate.py', 'tools/test_q36_multimodal_cache.py', 'tools/test_q36_multimodal_cache_gate.py', 'tools/test_q36_multimodal_cache_window.py', 'tools/test_q36_sampled_mtp_http_bench.py', 'tools/test_q36_vision_handoff.py', 'tools/test_q36_vision_preallocation.py', 'serve/test_q36_config.py', 'serve/test_unified_kv.py', 'tools/test_unified_kv_validate.py']
+.................................................. [ 58%]
+....................................                                     [100%]
+=============================== warnings summary ===============================
+conftest.py:1
+  /workspace/tmp/q36-migration-clean-clone/conftest.py:1: DeprecationWarning: invalid escape sequence '\S'
+    """pytest: setup.py's data-folder migration (#198) saves the data folder it settled on in the user's settings file
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+86 passed, 1 warning, 22 subtests passed in 37.00s

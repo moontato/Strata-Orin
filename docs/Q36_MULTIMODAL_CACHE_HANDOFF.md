@@ -1,5 +1,50 @@
 # Qwen3.6 multimodal checkpoint handoff / fresh coding container
 
+## Delivery status — authentication blocker, no successful push
+
+The normal push of portable-support commit **ad0988b66fea6cd62996c6bee42a179c37dd68b3**
+failed with `fatal: could not read Username for 'https://github.com': terminal
+prompts disabled`. The origin feature ref was absent when checked afterward.
+**Origin-only migration is NOT yet complete. No successful push/origin-branch clone
+is claimed.** Source, instructions and evidence are committed locally and preserved
+in the standalone transport bundle. If retiring this container before recovery,
+transfer the checksummed migration archive: it is REQUIRED until push succeeds.
+
+An independent full-bundle clone ofad0988b6 passed the documented fresh-venv CPU,
+Python,22 mutation and sanitizer checks; it has its OWN Git objects/refs, no
+alternates/external commondir/worktree registry and `git fsck --full` passed.
+This is explicitly NOT the requested pushed-origin clone. Details/raw logs:
+`docs/validation/q36-migration/INDEPENDENT_CLONE.json` and independent-clone-*.
+
+After configuring normal GitHub authentication OUTSIDE source/Git (never copy
+credentials/tokens here), recover with the exact intended non-force refspec:
+
+```bash
+git -C /workspace/tmp/image-checkpoints push origin HEAD:refs/heads/feature/q36-image-checkpoints
+git -C /workspace/tmp/image-checkpoints ls-remote --heads origin refs/heads/feature/q36-image-checkpoints
+# Require the returned hash to equal local git rev-parse HEAD. Then perform a NEW
+# network clone and the setup/checks below; bundle-clone proof is not a substitute.
+```
+
+If the old container is gone, first clone `feature-q36-image-checkpoints-full.bundle`
+from the transferred archive into `/workspace/Strata-Orin`, set origin to the URL
+below, then run the same explicit push refspec from that clone. The full bundle
+has NO prerequisite repository/old object-store requirement. Originals were retained.
+
+```bash
+# Transfer the archive AND .sha256 into /workspace/tmp on the new container first.
+cd /workspace/tmp
+sha256sum -c q36-coding-migration-supplement.tar.gz.sha256
+tar -xzf q36-coding-migration-supplement.tar.gz
+(cd q36-migration-preservation && sha256sum -c SHA256SUMS)
+git clone --branch feature/q36-image-checkpoints \
+ /workspace/tmp/q36-migration-preservation/feature-q36-image-checkpoints-full.bundle \
+ /workspace/Strata-Orin
+git -C /workspace/Strata-Orin remote set-url origin https://github.com/moontato/Strata-Orin.git
+# Then follow the venv/build/test steps below. Configure authentication and push
+# only this feature branch before retiring the last copy of the transport archive.
+```
+
 ## Start here: repository and exact implementation
 
 - Project/origin: **https://github.com/moontato/Strata-Orin.git**.
@@ -15,7 +60,10 @@
   evidence and artifact generation, not a new numerical implementation. Determine
   the exact delivered support tip with `git rev-parse HEAD` and compare it to
   `git ls-remote origin refs/heads/feature/q36-image-checkpoints`; the delivery
-  report supplies that hash. A document cannot embed its own containing Git hash.
+  report supplies the LOCAL tip and push status/hash (none if blocked). A document
+  cannot embed its own containing Git hash. Initial portable-support commit is
+  ad0988b66fea6cd62996c6bee42a179c37dd68b3; later delivery-status changes do not alter
+  the functional implementation.
 
 The old session's shell CWD `/workspace` was **feature/unified-kv** at
 `dd543a34ae73040d1ddb74410dd177db85383884`, NOT the active task tree. The task
@@ -25,8 +73,8 @@ external commondir. No replacement of that original repository was necessary.
 Three older worktrees were in `/home/pi/Documents/GitHub`; their source was clean,
 verified against workspace Git blobs and reachable from the feature ancestry.
 Those original directories were NOT deleted. Their absolute worktree-registry
-backlinks are historical, NOT instructions to recreate them. A normal origin clone
-below is independent and needs none of those paths.
+backlinks are historical, NOT instructions to recreate them. After successful
+publication, a normal origin clone below is independent and needs none of those paths.
 
 See `docs/validation/q36-migration/INVENTORY.json` for exact nine-worktree paths,
 branches, HEADs, status, common-dir checks and outside-source verification counts.
@@ -123,7 +171,8 @@ are in **requirements-q36-dev.txt**. Do not substitute an old container's venv o
 `/workspace/tmp/adaptive-integration-deps`/home PYTHONPATH. No private packages.
 
 ```bash
-# In a fresh Debian/Ubuntu coding container, not on the production Orin:
+# AFTER verified push (currently blocked), in a fresh Debian/Ubuntu coding container,
+# NOT on the production Orin. Before publication, clone the transferred full bundle instead:
 apt-get update
 apt-get install -y --no-install-recommends git ca-certificates build-essential python3 python3-venv python3-pip
 git clone --branch feature/q36-image-checkpoints https://github.com/moontato/Strata-Orin.git /workspace/Strata-Orin
@@ -201,7 +250,7 @@ repository tests passed'.
 ## Evidence actually run and where it lives
 
 `docs/validation/q36-image-checkpoints/` preserves the implementation's small raw
-logs and VALIDATION.md on origin:17 selected CPU CTests;14 strict ASan/UBSan/leak
+logs and VALIDATION.md in Git (origin publication blocked):17 selected CPU CTests;14 strict ASan/UBSan/leak
 binaries +3 expected-failure text-oracle corruption cases;86 Python tests plus22
 subtests;8 new image +6 vision +8 bank mutations. Source invariants cover36 device/
 global definitions and unchanged numerical/transfer/bank/capacity/sampler/staging/
@@ -288,14 +337,16 @@ none is left as an undisclosed required untracked file.
 Supplemental `/workspace/tmp/q36-coding-migration-supplement.tar.gz` (+.sha256)
 preserves all pre-migration refs including the separate4815a036 historical fork,
 old37911119 review archive and inventory/proof. It contains NO venv/build/home
-cache or credentials. Transfer is **OPTIONAL for this task**: source, instructions
-and essential validation are on origin; the bundle is archival insurance for
-other historical branches, not a dependency of the new container. Actual Orin
-GGUF/SVE/private traffic is external qualification input, not secretly in that
-archive. No originals were deleted.
+cache or credentials. It also contains a CURRENT standalone full feature bundle.
+**Transfer is REQUIRED while origin push is authentication-blocked.** Once the
+feature push and a fresh origin clone are VERIFIED, this archive becomes optional
+historical insurance: all essential source/instructions/evidence are already
+committed for that push. Actual Orin GGUF/SVE/private traffic is external
+qualification input, not secretly in that archive. No originals were deleted.
 
 Regenerate a CURRENT review, including commits/patch/incremental bundle/source/
-committed evidence/checksums, entirely from a full clean origin clone:
+committed evidence/checksums, entirely from a full clean clone (origin after
+publication, or the standalone bundle while authentication remains blocked):
 
 ```bash
 python tools/q36_export_review.py --out /workspace/tmp/q36-export-$(date -u +%Y%m%dT%H%M%SZ)

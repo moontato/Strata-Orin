@@ -46,7 +46,7 @@ def main():
   target=directory/'source'/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(git('show','HEAD:'+name_))
  (directory/'ORIN_HANDOFF.md').write_bytes(git('show','HEAD:docs/Q36_IMAGE_CHECKPOINTS.md'))
  (directory/'MIGRATION_HANDOFF.md').write_bytes(git('show','HEAD:docs/Q36_MULTIMODAL_CACHE_HANDOFF.md'))
- (directory/'README.md').write_text('# Image checkpoints portable review\n\nTip '+head+'; feature delta starts at '+BASE+'.\n\nBundle prerequisite '+PREREQUISITE+'; it includes original diagnostic objects,\nimplementation37911119 and subsequent portable-support/handoff commits.\nDo not replay diagnostics onto the actual Orin follow-up. See ORIN_HANDOFF.md\nand MIGRATION_HANDOFF.md. Source/essential instructions/evidence are on origin;\nthis archive is optional transport, NOT a deployment or CUDA qualification.\n')
+ (directory/'README.md').write_text('# Image checkpoints portable review\n\nTip '+head+'; feature delta starts at '+BASE+'.\n\nBundle prerequisite '+PREREQUISITE+'; it includes original diagnostic objects,\nimplementation37911119 and subsequent portable-support/handoff commits.\nDo not replay diagnostics onto the actual Orin follow-up. See ORIN_HANDOFF.md\nand MIGRATION_HANDOFF.md. Source/instructions/evidence are committed; origin\npublication must be verified separately. This archive is optional only AFTER\na successful push/clean-origin-clone check; otherwise preserve source transport.\nNOT a deployment or CUDA qualification.\n')
  files=sorted(x for x in directory.rglob('*') if x.is_file())
  (directory/'SHA256SUMS').write_text(''.join(digest(x.read_bytes())+'  '+str(x.relative_to(directory))+'\n' for x in files))
  with tarfile.open(archive,'w:gz') as t:t.add(directory,arcname=directory.name)
