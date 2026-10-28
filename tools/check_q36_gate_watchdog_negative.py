@@ -14,8 +14,10 @@ GROUP_KILL='os.killpg(child.pid,signal.SIGKILL)'
 LATE_REASON=" if late:reasons.append('worker finished at or after the execution deadline')\n"
 SUPERVISE=' return supervise(a,Budget(a.budget_seconds))'
 HANDLER='try:previous[sig]=signal.signal(sig,record)'
-PROBE_LOOP=" group_empty=False\n while True:                               # 3. prove the owned group empty (probe only)"
-RE_ARM=' cleanup_deadline=time.monotonic()+1.0   # MUTATION: the allowance is re-armed\n'
+PROBE_LOOP=" state.exit_code=exit_code\n while True:                               # 3. prove the owned group empty (probe only)\n"
+RE_ARM=" deadline=time.monotonic()+1.0   # MUTATION: the allowance is re-armed\n"
+RE_ARM_STATE='  if self.deadline is None:self.deadline=time.monotonic()+self.allowance'
+POST_REAP='  if state.reaped:return state.group_status'
 
 class StuckChild:
     """Fake worker: blocked reaping, blocked group cleanup. pid is not a usable group,
@@ -23,11 +25,38 @@ class StuckChild:
     pid=-1
     def wait(self,timeout=None):raise subprocess.TimeoutExpired(cmd='fake-worker',timeout=timeout)
 
+class FinishedChild:
+    """Fake worker that already exited and was reaped normally."""
+    pid=-1
+    def wait(self,timeout=None):return 0
+
 def cleanup_seconds(module,allowance=1.0):
  """Elapsed teardown time for a worker that never exits and a group that never empties."""
  started=time.monotonic()
- module.teardown(StuckChild(),started+allowance,waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
+ module.teardown(module.CleanupState(StuckChild(),allowance),
+     waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
  return time.monotonic()-started
+
+def reentry_seconds(module,allowance=1.0):
+ """Teardown twice over the SAME state (the error path that used to restart cleanup):
+ the second call must spend no new allowance."""
+ state=module.CleanupState(StuckChild(),allowance)
+ module.teardown(state,waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
+ started=time.monotonic()
+ module.teardown(state,waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
+ return time.monotonic()-started
+
+def group_signals(module):
+ """Teardown over a worker whose leader was ALREADY reaped by the earlier normal path
+ (state.reaped set, cleanup not finished). The ownership guard must stop every signal:
+ the former PGID may already belong to an unrelated process."""
+ state=module.CleanupState(FinishedChild(),1.0);kills=[];probes=[]
+ state.reaped=True
+ first=module.teardown(state,waiter=lambda:0,killer=lambda:(kills.append(1),'present')[1],
+     prober=lambda:(probes.append(1),'empty')[1])
+ second=module.teardown(state,killer=lambda:(kills.append(2),'present')[1],
+     prober=lambda:(probes.append(2),'empty')[1])
+ return len(kills),len(probes),first==second
 
 def settle(seconds=0.4):
  """Give an un-reaped owned group a moment to become visible/orphan before judging."""
@@ -102,10 +131,19 @@ def run():
   if source.count(GROUP_KILL)!=1 or source.count(LATE_REASON)!=1 or source.count(SUPERVISE)!=1:
    raise RuntimeError('watchdog mutation anchors changed')
   if source.count(HANDLER)!=1 or source.count(PROBE_LOOP)!=1:raise RuntimeError('teardown mutation anchors changed')
-  # Baseline: one cleanup allowance really bounds waiting + reaping + verification.
+  if source.count(POST_REAP)!=1 or source.count(RE_ARM_STATE)!=1:raise RuntimeError('cleanup-state mutation anchors changed')
+  if source.count('if state.complete:return state.result()')!=1:raise RuntimeError('idempotence anchor changed')
+  # Baseline: one cleanup allowance really bounds waiting + reaping + verification, a
+  # re-entered teardown costs nothing more, and nothing is signalled after the reap.
   real=cleanup_seconds(gate)
   if not 1.0<=real<1.6:raise RuntimeError('baseline teardown spent %.2fs for a 1.0s allowance'%real)
-  print('GATE_WATCHDOG BASELINE PASS one_cleanup_allowance_s=%.2f (limit 1.60)'%real)
+  real_reentry=reentry_seconds(gate)
+  if real_reentry>=0.3:raise RuntimeError('baseline re-entry spent %.2fs of a new allowance'%real_reentry)
+  real_kills,real_probes,real_same=group_signals(gate)
+  if real_kills!=0 or real_probes==0 or not real_same:raise RuntimeError('baseline signals a group after reaping')
+  if real_reentry>=0.3:raise RuntimeError('baseline re-entry spent %.2fs of a new allowance'%real_reentry)
+  print('GATE_WATCHDOG BASELINE PASS one_cleanup_allowance_s=%.2f (limit 1.60) reentry_s=%.2f '
+        'signals_after_reap=%d probes_after_reap=%d result_unchanged=%s'%(real,real_reentry,real_kills,real_probes,real_same))
   # Mutation 1: the supervisor never group-kills -> a hung descendant leaks and the
   # owned group is reported non-empty.
   run,watch=run_mutated(source.replace(GROUP_KILL,'pass  # MUTATION: no group kill'),
@@ -135,6 +173,22 @@ def run():
   slow=cleanup_seconds(module)
   if slow<1.8:raise RuntimeError('MUTATION ESCAPED: re-armed cleanup still took only %.2fs'%slow)
   print('GATE_WATCHDOG_NEGATIVE PASS cleanup_rearmed teardown_s=%.2f (baseline %.2f, one allowance 1.00)'%(slow,real))
+  # Mutation 4b: the persistent state is bypassed (the old error path: re-entered
+  # teardown with a FRESH deadline) -> a second cleanup round spends a second allowance.
+  module=load_mutated(source.replace(RE_ARM_STATE,'  self.deadline=time.monotonic()+self.allowance')
+     .replace('if state.complete:return state.result()','pass  # MUTATION: no idempotence guard'),
+     'mutated_state_rearm.py',temp)
+  rearm_reentry=reentry_seconds(module)
+  if rearm_reentry<0.8:raise RuntimeError('MUTATION ESCAPED: re-entry still spent only %.2fs'%rearm_reentry)
+  print('GATE_WATCHDOG_NEGATIVE PASS cleanup_state_rearmed reentry_s=%.2f (baseline %.2f, one allowance 1.00)'%(rearm_reentry,real_reentry))
+  # Mutation 4c: remove the post-reap ownership guard -> a second teardown signals the
+  # former worker group again although its leader was already reaped (the PGID may by
+  # then belong to an unrelated process).
+  module=load_mutated(source.replace(POST_REAP,'  if False:pass  # MUTATION: no ownership guard'),'mutated_post_reap.py',temp)
+  mut_kills,mut_probes,mut_same=group_signals(module)
+  if mut_kills==0:raise RuntimeError('MUTATION ESCAPED: no group signal after reaping')
+  print('GATE_WATCHDOG_NEGATIVE PASS post_reap_signal signals_after_reap=%d probes=%d (real supervisor: %d signals)'
+        %(mut_kills,mut_probes,real_kills))
   # Mutation 5: the supervisor installs no signal teardown -> the worker group survives
   # an interruption and no failure record is written.
   gate_path=Path(temp)/'mutated_signal.py';gate_path.write_text(source.replace(HANDLER,'try:previous[sig]=signal.signal(sig,signal.SIG_DFL)'))
@@ -181,7 +235,7 @@ def run():
     try:os.killpg(pid,signal.SIGKILL)
     except (ProcessLookupError,PermissionError):pass
   kill_probes()
- print('GATE_WATCHDOG_NEGATIVE PASS supervisor bounds and teardown only; fake children; NOT an Orin gate result')
+ print('GATE_WATCHDOG_NEGATIVE PASS supervisor bounds, cleanup state and teardown only; fake children; NOT an Orin gate result')
 
 def main():
  try:run()

@@ -216,10 +216,28 @@ def worker_status(child):
  if code in (2,3):return -status                           # CLD_KILLED / CLD_DUMPED
  return None
 
-def teardown(child,cleanup_deadline,initial=None,poll=CLEANUP_POLL,waiter=None,killer=None,prober=None):
+class CleanupState:
+ """Persistent cleanup progress for ONE run.
+ The absolute cleanup deadline is created once and reused by every later call (normal
+ path, signal path or an exceptional path), so no path can re-arm the allowance. It
+ also remembers whether the leader was reaped: after that, the former group is NEVER
+ signalled again, because its PGID may already belong to another process."""
+ def __init__(self,child,allowance):
+  self.child=child;self.allowance=allowance;self.deadline=None
+  self.exit_code=None;self.group_status='empty';self.group_empty=False
+  self.reaped=False;self.complete=False
+ def begin(self):
+  if self.deadline is None:self.deadline=time.monotonic()+self.allowance
+  return self.deadline
+ def result(self):return self.exit_code,self.group_status,self.group_empty,self.reaped
+
+def teardown(state,poll=CLEANUP_POLL,waiter=None,killer=None,prober=None):
  """ONE absolute deadline covers ALL cleanup: killing the owned group, waiting for the
  worker, killing stragglers, reaping the leader and proving the group empty. The
  allowance is never re-armed, so a run cannot spend twice the cleanup allowance.
+ Idempotent: calling it again after cleanup finished (for example from an error path
+ while writing the result) changes nothing, spends no new allowance and, once the
+ leader is reaped, sends NO further signal to the former group.
  Ordering avoids two hazards: the group is only ever SIGNALED while the leader is still
  unreaped (so its PGID cannot have been recycled), and the leader is reaped before the
  final emptiness proof (a reaped leader is no longer a group member, so it cannot make
@@ -228,32 +246,42 @@ def teardown(child,cleanup_deadline,initial=None,poll=CLEANUP_POLL,waiter=None,k
  unless the worker was reaped AND the owned group is empty. The kill STATUS is
  returned, not a bool: a group that still holds only the already-exited, not-yet-reaped
  leader was never killed by us."""
+ child=state.child
+ if state.complete:return state.result()
+ deadline=state.begin()
  waiter=waiter or (lambda:worker_status(child))
  killer=killer or (lambda:group_kill(child))
  prober=prober or (lambda:group_probe(child))
- def left():return cleanup_deadline-time.monotonic()
+ def left():return deadline-time.monotonic()
  def nap():time.sleep(min(poll,max(0.0,left())))
- group_status=killer();exit_code=initial
+ def signal_group():
+  # Ownership guard: after the leader is reaped we can no longer prove the PGID is ours.
+  if state.reaped:return state.group_status
+  status=killer()
+  if status=='present':state.group_status='present'
+  return status
+ signal_group();exit_code=state.exit_code
  if exit_code is None:
   while True:                              # 1. wait for the worker (same deadline)
    code=waiter()
    if code is not None:exit_code=code;break
    if left()<=0:break
    nap()
- if killer()=='present':group_status='present'  # 2. last group kill while the PGID is reserved
- reaped=False
+  state.exit_code=exit_code
+ signal_group()                            # 2. last group kill while the PGID is reserved
  if left()>0 or exit_code is not None:
   try:
-   code=child.wait(timeout=max(0.0,left()));reaped=True
+   code=child.wait(timeout=max(0.0,left()));state.reaped=True
    if exit_code is None:exit_code=code
-  except (subprocess.TimeoutExpired,OSError,ValueError):reaped=False
- group_empty=False
+  except (subprocess.TimeoutExpired,OSError,ValueError):state.reaped=False
+ state.exit_code=exit_code
  while True:                               # 3. prove the owned group empty (probe only)
-  state=prober()
-  if state=='empty':group_empty=True;break
-  if state=='denied' or left()<=0:break
+  status=prober()
+  if status=='empty':state.group_empty=True;break
+  if status=='denied' or left()<=0:break
   nap()
- return exit_code,group_status,group_empty,reaped
+ state.complete=True
+ return state.result()
 
 def supervise(a,budget):
  """Spawn the worker in its OWN process group and hard-bound the whole run, including
@@ -265,10 +293,26 @@ def supervise(a,budget):
  cgroup remains a requirement, not something this code replaces."""
  out=a.out
  log=open(out/'worker-stdout.txt','wb')
+ label='IMAGE_CHECKPOINT_GATE_SELFTEST' if a.selftest else 'IMAGE_CHECKPOINT_ORIN_GATE'
  recorded=[False]
  def write_record(**fields):
   fields.setdefault('operator_cgroup_required',True)   # the operator still owns the enclosing cgroup
-  (out/'watchdog.json').write_text(json.dumps(fields,indent=2)+'\n');recorded[0]=True
+  target=out/'watchdog.json'
+  if getattr(a,'fault',None)=='record':
+   # Fault injection (selftest only): writing under a regular file reproduces the
+   # "the result could not be recorded" (ENOSPC/EIO class) failure deterministically.
+   (out/'record-fault').write_text('fault injection marker\n')
+   target=out/'record-fault'/'watchdog.json'
+  target.write_text(json.dumps(fields,indent=2)+'\n');recorded[0]=True
+ def record_failed(exc):
+  # A run whose result cannot be written is NOT a pass and must not restart cleanup:
+  # the cleanup state is already final, so this only reports and forces a nonzero exit.
+  for line in ('IMAGE_GATE_PROGRESS stage=record action=failed error='+type(exc).__name__+': '+str(exc)[:200],
+   'IMAGE_GATE_PROGRESS stage=record action=no_restart cleanup_state_final=1 operator_cgroup_required=1'):
+   try:print(line,flush=True,file=sys.stderr)
+   except Exception:pass
+  try:print(label+' FAIL result_record_failed_'+type(exc).__name__,flush=True)
+  except Exception:pass
  interrupted=[]
  def record(signum,frame):interrupted.append(signum)   # recorded, never raised
  previous={}
@@ -282,6 +326,7 @@ def supervise(a,budget):
   child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),*sys.argv[1:],'--worker','--deadline',repr(budget.deadline)],
    stdin=subprocess.DEVNULL,stdout=log,stderr=sys.stderr,start_new_session=True)
   killed=False;deadline_seen=False;exit_code=None
+  cleanup=CleanupState(child,a.cleanup_seconds)   # ONE cleanup state and deadline for this run
   SIGNAL_NAMES={signal.SIGINT:'SIGINT',signal.SIGTERM:'SIGTERM',signal.SIGHUP:'SIGHUP'}
   while exit_code is None:
    exit_code=worker_status(child)     # non-consuming: the PGID stays reserved
@@ -294,15 +339,15 @@ def supervise(a,budget):
     break
    if interrupted:
     deadline_seen=True
-    SIGNAL_NAMES={signal.SIGINT:'SIGINT',signal.SIGTERM:'SIGTERM',signal.SIGHUP:'SIGHUP'}
     print('IMAGE_GATE_PROGRESS stage=watchdog action=teardown signal='+
      ','.join(SIGNAL_NAMES.get(s,'SIG'+str(s)) for s in interrupted)+
      ' cleanup_allowance_s='+str(a.cleanup_seconds),flush=True,file=sys.stderr)
     break
    time.sleep(min(0.25,max(0.0,budget.left())))
-  # ONE cleanup deadline for waiting + reaping + group proof: no second allowance.
-  cleanup_deadline=time.monotonic()+a.cleanup_seconds
-  exit_code,group_status,group_empty,reaped=teardown(child,cleanup_deadline,exit_code)
+  # ONE cleanup deadline for waiting + reaping + group proof: no second allowance, and
+  # the SAME state is reused if an error path needs cleanup again.
+  cleanup.exit_code=exit_code            # status already seen without consuming it
+  exit_code,group_status,group_empty,reaped=teardown(cleanup)
   # 'killed' means the supervisor had to end a run that did NOT finish on its own; a
   # group that only held the already-exited leader was never killed by us.
   killed=killed or deadline_seen or bool(interrupted) or (group_status=='present' and exit_code is None)
@@ -316,29 +361,48 @@ def supervise(a,budget):
   if a.preflight or a.selftest:phases['arms_completed']=True
   passed,reasons=verdict(killed,late,exit_code if exit_code is not None else -1,group_empty,report.get('status'),phases,
    a.preflight,signals,reaped)
-  write_record(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
-   killed=killed,deadline_crossed=late,worker_exit=exit_code,worker_reaped=reaped,owned_group_empty=group_empty,
-   cleanup_complete=group_empty and reaped,worker_report_status=report.get('status'),interrupted_signals=signals,
-   passed=passed,reasons=reasons)
- except BaseException as exc:
-  # A supervisor fault must still tear the owned group down and leave a failure record;
-  # it can never be mistaken for a passing run. The exception is still surfaced.
-  exit_code=None;group_empty=False;reaped=False
-  if child is not None:
-   try:exit_code,_,group_empty,reaped=teardown(child,time.monotonic()+a.cleanup_seconds)
-   except Exception:pass
-  if not recorded[0]:
+  if getattr(a,'fault',None)=='crash':
+   # Fault injection (selftest only): an unexpected failure AFTER cleanup finished.
+   raise RuntimeError('fault injection: post-teardown supervisor failure')
+  try:
    write_record(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
-    killed=True,deadline_crossed=False,worker_exit=exit_code,worker_reaped=reaped,owned_group_empty=group_empty,
-    cleanup_complete=group_empty and reaped,worker_report_status='MISSING',interrupted_signals='',
-    passed=False,reasons=['supervisor error '+type(exc).__name__+': '+str(exc)[:200]])
+    killed=killed,deadline_crossed=late,worker_exit=exit_code,worker_reaped=reaped,owned_group_empty=group_empty,
+    cleanup_complete=group_empty and reaped,worker_report_status=report.get('status'),interrupted_signals=signals,
+    passed=passed,reasons=reasons)
+  except OSError as record_exc:
+   # The owned group is already cleaned. A failure while RECORDING the result must never
+   # look like a pass, must not re-run cleanup and must not re-signal a reaped group.
+   record_failed(record_exc)
+   return 1
+ except BaseException as exc:
+  # A supervisor fault must still leave a failure record. The cleanup state is shared
+  # and teardown is idempotent, so this can never spend a new allowance or signal a
+  # group whose leader was already reaped.
+  if child is not None:
+   try:teardown(cleanup)
+   except Exception:pass
+   exit_code,_,group_empty,reaped=cleanup.result()
+  else:exit_code=None;group_empty=False;reaped=False
+  if not recorded[0]:
+   try:
+    write_record(execution_budget_seconds=a.budget_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
+     killed=killed or cleanup.group_status=='present',deadline_crossed=False,worker_exit=exit_code,
+     worker_reaped=reaped,owned_group_empty=group_empty,cleanup_complete=group_empty and reaped,
+     worker_report_status='MISSING',interrupted_signals='',passed=False,
+     reasons=['supervisor error '+type(exc).__name__+': '+str(exc)[:200]])
+   except OSError as record_exc:
+    record_failed(record_exc)   # labels the run as failed and notes cleanup is final
+    raise
+  # Label the failure on stdout as well, so an operator never sees a silent run; the
+  # exception is re-raised afterwards for the log.
+  try:print(label+' FAIL supervisor_error_'+type(exc).__name__,flush=True)
+  except Exception:pass
   raise
  finally:
   log.close()
   for sig,handler in previous.items():
    try:signal.signal(sig,handler)
    except (ValueError,OSError):pass
- label='IMAGE_CHECKPOINT_GATE_SELFTEST' if a.selftest else 'IMAGE_CHECKPOINT_ORIN_GATE'
  if passed:
   # A selftest never relays a production marker: only the supervisor's labelled
   # verdict is printed, so a fake arm can never look like a real gate pass.
@@ -360,6 +424,7 @@ def main():
  p.add_argument('--cleanup-seconds',type=int,default=CLEANUP_ALLOWANCE_DEFAULT)
  p.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
  p.add_argument('--selftest',choices=SELFTESTS,help=argparse.SUPPRESS)
+ p.add_argument('--fault',choices=('record','crash'),help=argparse.SUPPRESS)
  p.add_argument('--deadline',type=float,help=argparse.SUPPRESS)
  a=p.parse_args()
  global STAGE,REVIEW
@@ -367,6 +432,7 @@ def main():
   # Bounds checks ONLY: selftest arms run fake children, never an engine, model,
   # encoder or service, so they may use a throwaway staging directory.
   REVIEW=ROOT;STAGE=a.out.resolve().parent
+ if getattr(a,'fault',None) and not a.selftest:p.error('fault injection requires --selftest')
  if ROOT!=REVIEW or (not a.preflight and not a.selftest and os.environ.get('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW')!='1'):p.error('only approved existing multimodal-cache checkout/window')
  if not 1<=a.budget_seconds<=EXECUTION_BUDGET_MAX:p.error(f'execution budget must be 1..{EXECUTION_BUDGET_MAX}s')
  if not 1<=a.cleanup_seconds<=CLEANUP_ALLOWANCE_MAX:p.error(f'cleanup allowance must be 1..{CLEANUP_ALLOWANCE_MAX}s')

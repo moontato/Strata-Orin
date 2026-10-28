@@ -263,6 +263,14 @@ def test_supervisor_bounds_every_scenario(tmp_path):
   assert 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in run.stdout and 'verdict=PASS' not in run.stdout,scenario
   assert 'IMAGE_CHECKPOINT_GATE_SELFTEST FAIL' in run.stdout,scenario
  assert 'IMAGE_CHECKPOINT_GATE_SELFTEST_SUPERVISOR PASS' in run_gate(tmp_path,'normal',budget=6)[0].stdout
+ # Fault injection (--fault) is selftest-only and can never appear in a real gate run.
+ assert 'fault injection requires --selftest' in (ROOT/'tools/q36_image_checkpoint_gate.py').read_text()
+ stage,engine,model,fixtures=staging(tmp_path)
+ run=subprocess.run([sys.executable,str(ROOT/'tools/q36_image_checkpoint_gate.py'),'--engine',str(engine),
+     '--model',str(model),'--fixtures',str(fixtures),'--out',str(stage/'faultrefused'),
+     '--preflight','--fault','record'],capture_output=True,text=True,
+     env=dict(os.environ,STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT=str(ROOT)))
+ assert run.returncode==2 and 'fault injection requires --selftest' in run.stderr,run.stderr[-200:]
 
 
 def test_supervisor_reaps_only_its_own_group(tmp_path):
@@ -291,7 +299,8 @@ def test_one_cleanup_allowance_covers_waiting_reaping_and_verification():
  # and the emptiness proof must all finish inside ONE allowance. The previous code
  # waited for the allowance and THEN re-armed it for cleanup (about twice the bound).
  started=time.monotonic()
- exit_code,status,group_empty,reaped=gate.teardown(StuckChild(),started+allowance,
+ stuck=gate.CleanupState(StuckChild(),allowance)
+ exit_code,status,group_empty,reaped=gate.teardown(stuck,
      waiter=lambda:None,killer=lambda:'present',prober=lambda:'present')
  elapsed=time.monotonic()-started
  assert allowance<=elapsed<allowance*1.6,(elapsed,)
@@ -301,11 +310,12 @@ def test_one_cleanup_allowance_covers_waiting_reaping_and_verification():
  class Exited(StuckChild):
      def wait(self,timeout=None):return -9
  started=time.monotonic()
- exit_code,status,group_empty,reaped=gate.teardown(Exited(),started+allowance,initial=-9,
+ exit_code,status,group_empty,reaped=gate.teardown(gate.CleanupState(Exited(),allowance),
      waiter=lambda:0,killer=lambda:'present',prober=lambda:'present')
  elapsed=time.monotonic()-started
  assert elapsed<allowance*1.6,(elapsed,)
- assert exit_code==-9 and reaped is True and group_empty is False
+ # The status already seen without consuming it (waitid) wins, and the leader is reaped.
+ assert exit_code==0 and reaped is True and group_empty is False
  # An incomplete cleanup or an interrupted supervisor is never accepted, whatever the
  # worker reported.
  for group,reap in ((False,False),(False,True),(True,False)):
@@ -313,6 +323,96 @@ def test_one_cleanup_allowance_covers_waiting_reaping_and_verification():
      {'arms_completed':True},False,'',reap)[0] is False
  assert gate.verdict(True,False,0,True,'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE',
      {'arms_completed':True},False,'SIGTERM',True)[0] is False
+
+
+def test_teardown_is_idempotent_and_never_signals_a_reaped_group():
+ """The old error path re-ran teardown with a FRESH deadline after cleanup had already
+ reaped the leader, which signalled a PGID we could no longer prove we owned."""
+ class Finished:
+     pid=-1
+     def wait(self,timeout=None):return 0
+ state=gate.CleanupState(Finished(),1.0)
+ signals=[];probes=[]
+ first=gate.teardown(state,waiter=lambda:0,
+     killer=lambda:(signals.append('first'),'present')[1],
+     prober=lambda:(probes.append('first'),'empty')[1])
+ assert first==(0,'present',True,True) and signals==['first','first']
+ kills=len(signals);deadline=state.deadline
+ started=time.monotonic()
+ second=gate.teardown(state,waiter=lambda:0,
+     killer=lambda:(signals.append('after_reap'),'present')[1],
+     prober=lambda:(probes.append('after_reap'),'empty')[1])
+ elapsed=time.monotonic()-started
+ assert second==first                                   # the recorded result is unchanged
+ assert signals==['first','first'] and 'after_reap' not in signals   # NO signal after reaping
+ assert probes==['first'] and state.deadline==deadline  # no probing storm, no new deadline
+ assert elapsed<0.2,(elapsed,)                          # and no renewed cleanup allowance
+ # A cleanup that FAILED to reap keeps its recorded failure and still gets no new time.
+ stuck=gate.CleanupState(StuckChild(),0.2)
+ stuck_signals=[]
+ recorded=gate.teardown(stuck,waiter=lambda:None,killer=lambda:(stuck_signals.append(1),'present')[1],
+     prober=lambda:'present')
+ assert recorded[2] is False and recorded[3] is False
+ before=len(stuck_signals)
+ started=time.monotonic()
+ again=gate.teardown(stuck,killer=lambda:(stuck_signals.append(2),'present')[1],prober=lambda:'present')
+ assert again==recorded and time.monotonic()-started<0.2 and len(stuck_signals)==before
+ # The ownership guard alone also holds: a state whose leader is already reaped gets
+ # probing only, never a signal, even when cleanup had not finished.
+ pre=gate.CleanupState(Finished(),0.5);pre.reaped=True
+ kills=[];probes=[]
+ gate.teardown(pre,waiter=lambda:0,killer=lambda:(kills.append(1),'present')[1],
+     prober=lambda:(probes.append(1),'empty')[1])
+ assert kills==[] and probes==[1]              # probed, never signalled
+ assert not gate.verdict(True,False,-1,False,'PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE',
+     {'arms_completed':True},False,'',recorded[3])[0]
+
+
+def run_gate_fault(tmp_path,scenario,fault,budget=6,cleanup=2):
+ """Run the supervisor with a selftest-only fault injected (hidden --fault option);
+ returns the run, the results directory and the wall time."""
+ stage,engine,model,fixtures=staging(tmp_path)
+ out=stage/('fault-'+scenario+'-'+fault+'-'+str(os.getpid())+'-'+str(next(counter)))
+ env=dict(os.environ,STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT=str(ROOT),PYTHONPATH=str(ROOT))
+ env.pop('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW',None)
+ started=time.monotonic()
+ run=subprocess.run([sys.executable,str(ROOT/'tools/q36_image_checkpoint_gate.py'),
+     '--engine',str(engine),'--model',str(model),'--fixtures',str(fixtures),'--out',str(out),
+     '--selftest',scenario,'--budget-seconds',str(budget),'--cleanup-seconds',str(cleanup),
+     '--fault',fault],capture_output=True,text=True,env=env,timeout=120)
+ return run,out,time.monotonic()-started
+
+
+def test_record_failure_after_completed_cleanup_never_passes_or_restarts(tmp_path):
+ """A watchdog.json write that fails after cleanup finished (ENOSPC-class) used to fall
+ into the supervisor fault path and re-run teardown with a fresh deadline, signalling a
+ group whose leader had already been reaped."""
+ run,out,elapsed=run_gate_fault(tmp_path,'normal','record',budget=6,cleanup=2)
+ assert run.returncode!=0
+ assert 'IMAGE_CHECKPOINT_GATE_SELFTEST FAIL result_record_failed_' in run.stdout,run.stdout
+ assert 'stage=record action=failed error=' in run.stderr and 'action=no_restart cleanup_state_final=1' in run.stderr
+ assert not (out/'watchdog.json').exists()               # the record really could not be written
+ assert (out/'record-fault').is_file()                   # the fault was injected, not a silent pass
+ assert json.loads((out/'result.json').read_text())['status']=='PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE'
+ # A worker PASS can never become a supervisor PASS when the result cannot be recorded.
+ assert 'verdict=PASS' not in run.stdout and 'SUPERVISOR PASS' not in run.stdout
+ assert 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in run.stdout
+ assert elapsed<3.0,(elapsed,)                           # cleanup was not run a second time
+ assert owned_probes()==[]
+
+
+def test_exception_after_leader_reaping_records_failure_without_new_cleanup(tmp_path):
+ run,out,elapsed=run_gate_fault(tmp_path,'normal','crash',budget=6,cleanup=2)
+ assert run.returncode!=0
+ watch=json.loads((out/'watchdog.json').read_text())     # the safety-net record still exists
+ assert watch['passed'] is False and watch['reasons'][0].startswith('supervisor error RuntimeError')
+ assert watch['worker_reaped'] is True and watch['owned_group_empty'] is True
+ assert watch['cleanup_complete'] is True
+ assert 'IMAGE_CHECKPOINT_GATE_SELFTEST FAIL supervisor_error_RuntimeError' in run.stdout
+ assert 'RuntimeError: fault injection: post-teardown supervisor failure' in run.stderr
+ assert 'verdict=PASS' not in run.stdout and 'IMAGE_CHECKPOINT_ORIN_GATE PASS' not in run.stdout
+ assert elapsed<3.0,(elapsed,)                           # the shared state added no new allowance
+ assert owned_probes()==[]
 
 
 @pytest.mark.parametrize('signame',('SIGINT','SIGTERM','SIGHUP'))
@@ -380,6 +480,11 @@ def test_gate_has_no_service_operations_and_separates_cleanup_from_budget():
  for sig in ('signal.SIGINT','signal.SIGTERM','signal.SIGHUP'):
   assert sig in s.split('def supervise')[1],sig
  assert 'os.waitid' in s and 'os.WNOWAIT' in s
- assert s.count('cleanup_deadline=time.monotonic()+a.cleanup_seconds')==1
  assert 'operator_cgroup_required' in s and 'operator-owned' in s
- assert 'def teardown(' in s and 'def group_kill(' in s and 'def group_probe(' in s
+ assert 'def teardown(state' in s and 'def group_kill(' in s and 'def group_probe(' in s
+ # Cleanup state is persistent: one deadline for the run, reused by every path, and a
+ # permanent guard that a reaped leader's former group is never signalled again.
+ assert 'class CleanupState' in s and 'if self.deadline is None:' in s
+ assert s.count('self.deadline=time.monotonic()+self.allowance')==1
+ assert 'if state.reaped:return state.group_status' in s and 'if state.complete:return state.result()' in s
+ assert 'def record_failed(' in s and 'result_record_failed_' in s and 'action=no_restart' in s
