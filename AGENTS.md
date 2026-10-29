@@ -7,12 +7,17 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
 ## Current Qwen3.6 multimodal checkpoint development
 
+The serial HTTP smoke has now passed on Orin. Read
+[docs/Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](docs/Q36_IMAGE_HTTP_SERIAL_HANDOFF.md)
+for the current result, scope and next coding-only integration work. Production
+image checkpoints remain off; HTTP concurrency remains unqualified.
+
 Read [docs/Q36_MULTIMODAL_CACHE_HANDOFF.md](docs/Q36_MULTIMODAL_CACHE_HANDOFF.md)
 first for the active feature branch, portable CPU setup, evidence and Orin safety
 boundaries. Do not run the installer/production Docker entrypoint for coding tests.
-Image-aware checkpoints remain opt-in; the native numerical gate passed its bounded Orin
-window, and the HTTP integration step (its own bounded harness, not yet run on Orin) is in
-[docs/Q36_IMAGE_HTTP_SMOKE.md](docs/Q36_IMAGE_HTTP_SMOKE.md).
+Image-aware checkpoints remain opt-in; the native numerical gate and the bounded serial
+HTTP smoke passed on Orin. See [docs/Q36_IMAGE_HTTP_SMOKE.md](docs/Q36_IMAGE_HTTP_SMOKE.md)
+for scope and limits.
 
 ## Installing Strata for a user
 

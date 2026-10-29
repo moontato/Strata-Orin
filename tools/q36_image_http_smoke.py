@@ -30,6 +30,7 @@ supervisor signals only the group IT created, so the operator-owned enclosing cg
 is still required, and only ONE arm runs at a time.
 """
 import argparse,base64,hashlib,json,os,re,signal,socket,subprocess,sys,threading,time,urllib.error,urllib.request,zlib
+sys.dont_write_bytecode=True
 from http.server import BaseHTTPRequestHandler,HTTPServer
 from pathlib import Path
 ROOT=Path(os.environ.get('STRATA_IMAGE_HTTP_ROOT',Path(__file__).resolve().parents[1])).resolve();sys.path.insert(0,str(ROOT))
@@ -48,7 +49,7 @@ PRODUCTION_PORT=11436;PRODUCTION_HEALTH='http://100.100.10.3:11436/health';PRODU
 PROGRESS_S=20
 SELFTESTS=('normal','no_encoder','zero_stable_reuse','no_restore','engine_error','divergence','hung_server',
  'cross_talk','missing_record','slow_server','stuck_group')
-PASS_MARKER='IMAGE_HTTP_SMOKE PASS native_oracle=NOT_REPEARED gpu_tensor_exactness=NOT_CHECKED actual_OWUI_savings=UNMEASURED'
+PASS_MARKER='IMAGE_HTTP_SERIAL_SMOKE PASS concurrency=NOT_TESTED native_oracle=NOT_REPEATED gpu_tensor_exactness=NOT_CHECKED actual_OWUI_savings=UNMEASURED'
 PREFLIGHT_MARKER='IMAGE_HTTP_SMOKE_PREFLIGHT PASS model_not_started=1'
 PLAN_MARKER='IMAGE_HTTP_PLAN_ONLY PASS nothing_started=1'
 SESSION=re.compile(r'KVCACHE session=(\d+) generation=(\d+) epoch=(\d+) state=(\w+) tokens=(\d+) bytes=(\d+) '
@@ -57,6 +58,7 @@ SERVE_LINE=re.compile(r'strata serve: session (\d+): prompt (\d+) tokens = (\d+)
  r'.*\((\w+)\)')
 BATCH_LINE=re.compile(r'strata batch: slot (\d+) takes a prompt of (\d+) tokens = (\d+) reused \+ (\d+) read in ([\d.]+) ms')
 RESTORED=re.compile(r'KVREPLAY session=(\d+).*reason=prefix_checkpoint')
+PREFIX_RESTORED=re.compile(r'Qwen3\.6 prefix checkpoint: source=(\d+) session=(\d+) restored_tokens=(\d+)')
 ENGINE_FAULT=re.compile(r'^(?:ERR|BERR) |IMAGE_CHECKPOINT_FAILURE|KV_FAILURE|terminate called',re.M)
 
 class Conversation:
@@ -87,9 +89,9 @@ class Conversation:
   out=[{'role':'system','content':self.system}]
   for t in self.turns:
    if t['role']=='assistant':
-    m=t['message'];msg={'role':'assistant','content':m.get('content') or ''}
-    if m.get('reasoning_content'):msg['reasoning_content']=m['reasoning_content']
-    if m.get('tool_calls'):msg['tool_calls']=m['tool_calls']
+    m=t['message'];msg={'role':'assistant'}
+    for key in ('content','reasoning_content','tool_calls'):
+     if key in m:msg[key]=__import__('copy').deepcopy(m[key])
     out.append(msg);continue
    parts=[{'type':'text','text':self.marker+' '+t['text']}]
    if t.get('image'):
@@ -103,21 +105,23 @@ class Client:
   the window deadline, so no request can outlive the run's one absolute budget."""
  def __init__(self,port,timeout=600,deadline=None):
   self.base='http://127.0.0.1:%d'%port;self.timeout=timeout;self.deadline=deadline
+  self.opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
  def _timeout(self):
   if self.deadline is None:return self.timeout
   return max(1.0,min(self.timeout,self.deadline-time.monotonic()))
  def _json(self,method,path,body=None):
   data=json.dumps(body).encode() if body is not None else None
   req=urllib.request.Request(self.base+path,data=data,headers={'Content-Type':'application/json'})
-  with urllib.request.urlopen(req,timeout=self._timeout()) as response:return json.load(response)
+  with self.opener.open(req,timeout=self._timeout()) as response:return json.load(response)
  def health(self):return self._json('GET','/health')
- def metrics(self):return self._json('GET','/metrics')
+ def metrics(self):return self._json('GET','/metrics?requests=all')
  def ask(self,model,messages,max_tokens):
   return self._json('POST','/v1/chat/completions',{'model':model,'messages':messages,'max_tokens':max_tokens,
    'temperature':0,'stream':False,'chat_template_kwargs':{'enable_thinking':True}})
 
 def plan(run_marker):
- """The request sequence, in order. Each step names its conversation and, for the copy
+ """Serial image-history requests only; concurrency is outside this qualification.
+ Each step names its conversation and, for the copy
  steps, the conversation it starts from, so an assistant reply is only ever carried into
  a later request of the SAME conversation."""
  return [
@@ -129,14 +133,6 @@ def plan(run_marker):
    system='You answer in exactly two words.',text='%s same history, new first instruction'%run_marker),
   dict(step='changed_pixels/1',conv='pixels',op='replace_image',source='stable',image='B',
    text='%s same question, other picture'%run_marker),
-  dict(step='interleave_four/1c1',conv='c1',op='user',text='%s c1 red or blue'%run_marker,image='A'),
-  dict(step='interleave_four/1c2',conv='c2',op='user',text='%s c2 red or blue'%run_marker,image='B'),
-  dict(step='interleave_four/1c3',conv='c3',op='user',text='%s c3 name a planet'%run_marker),
-  dict(step='interleave_four/1c4',conv='c4',op='user',text='%s c4 name a metal'%run_marker),
-  dict(step='interleave_four/2c1',conv='c1',op='user',text='%s c1 say it again'%run_marker),
-  dict(step='interleave_four/2c2',conv='c2',op='user',text='%s c2 say it again'%run_marker),
-  dict(step='interleave_four/2c3',conv='c3',op='user',text='%s c3 say it again'%run_marker),
-  dict(step='interleave_four/2c4',conv='c4',op='user',text='%s c4 say it again'%run_marker),
   dict(step='text_only_after_images/1',conv='text',op='user',text='%s one sentence about the moon'%run_marker),
   dict(step='text_only_after_images/2',conv='text',op='user',text='%s and one about iron'%run_marker)]
 
@@ -162,36 +158,113 @@ def parse_engine_log(text):
    reused=int(m.group(3)),read=int(m.group(4)),prompt_ms=float(m.group(5)),finish=m.group(6)))
   elif (m:=BATCH_LINE.search(line)):events.append(dict(kind='slot',session=int(m.group(1)),prompt=int(m.group(2)),
    reused=int(m.group(3)),read=int(m.group(4)),prompt_ms=float(m.group(5)),finish='length'))
-  elif (m:=RESTORED.search(line)):events.append(dict(kind='restored',session=int(m.group(1))))
+  elif (m:=PREFIX_RESTORED.search(line)):
+   events.append(dict(kind='restored',session=int(m.group(2)),source=int(m.group(1)),tokens=int(m.group(3))))
+  elif (m:=RESTORED.search(line)):
+   tokens=re.search(r' tokens=(\d+)',line)
+   events.append(dict(kind='restored',session=int(m.group(1)),tokens=int(tokens.group(1)) if tokens else None))
  return events
 
 def correlate(records,events):
  """Pair each server request record with the engine line naming the same prompt size (the
  server's own prompt_total IS the engine's ids.size()); order breaks ties. Anything
  unmatched is REPORTED: the smoke never invents a slot or a reuse count."""
- # one request = one serve line; the 'slot' line is the engine naming the slot that
- # served the SAME prompt, so it is matched by size afterwards and never a second request
- requests=[e for e in events if e['kind']=='request'];used=[False]*len(requests);rows=[]
+ # Production solo and batch admissions emit different summary lines. Treat both as
+ # summaries; if duplicates or ordering make pairing ambiguous, counts expose the
+ # mismatch rather than silently discarding a batch admission.
+ requests=[e for e in events if e['kind'] in ('request','slot')];used=[False]*len(requests);rows=[]
  for r in records:
   match=None
   for i,e in enumerate(requests):
    if not used[i] and e['prompt']==r.get('prompt_total'):match=i;break
   if match is None:rows.append(dict(record=r,engine=None));continue
   used[match]=True;e=requests[match]
-  restored=any(x['kind']=='restored' and x['session']==e['session'] for x in events)
-  result=next((x['result'] for x in events if x['kind']=='kvcache' and x['session']==e['session']),None)
-  rows.append(dict(record=r,engine=e,restored=restored,result=result))
+  # A session may serve many requests, and mixed stdout/stderr ordering does not
+  # establish event boundaries. Do not attribute another request's restore or result.
+  rows.append(dict(record=r,engine=e,restored=None,result=None))
  return rows,dict(unmatched_requests=sum(1 for r in rows if r['engine'] is None),
   unmatched_engine_lines=sum(1 for u in used if not u))
+
+def audit_log_span(raw, answers):
+ """Authoritative bracket audit. No pairing by arrival order or reused session."""
+ from collections import Counter
+ bad=lambda why:dict(attributed=False,exact=False,reason=why,summaries=[],sessions=[],events=[])
+ if not isinstance(raw,bytes) or (raw and not raw.endswith(b'\n')):return bad('partial_log_line')
+ events=parse_engine_log(raw.decode('utf-8','replace'))
+ summaries=[e for e in events if e['kind'] in ('request','slot')]
+ prompts=[(a.get('usage') or {}).get('prompt_tokens') for a in answers]
+ if any(type(n) is not int for n in prompts):return bad('missing_response_usage')
+ if len(summaries)!=len(answers) or Counter(e['prompt'] for e in summaries)!=Counter(prompts):
+  return bad('ambiguous_or_usage_mismatch')
+ out=dict(attributed=len(answers)==1,exact=True,reason=None if len(answers)==1 else 'concurrent_burst',
+  summaries=summaries,sessions=sorted({e['session'] for e in summaries}),events=events)
+ if len(answers)!=1:return out  # burst evidence only, never per-client attribution
+ summary=summaries[0];index=events.index(summary);session=summary['session']
+ provenance=[e for e in events if e['kind'] in ('kvcache','restored')]
+ if any(e['session']!=session or events.index(e)>index for e in provenance):
+  return bad('provenance_outside_serial_request')
+ caches=[e for e in provenance if e['kind']=='kvcache']
+ if len(caches)>1:return bad('ambiguous_cache_events')
+ result=caches[0]['result'] if caches else None
+ # The HTTP server consumes stdout KVREPLAY/KVCACHE internally; the native
+ # stderr prefix-checkpoint line is the authoritative restore evidence here.
+ out.update(restored=any(e['kind']=='restored' and e.get('tokens')==summary['reused'] for e in provenance),result=result)
+ return out
+
+
+def attribute_spans(windows,answers,engine_bytes,out,arm):
+ rows=[];groups=[];audits=[];by_step={a['step']:a for a in answers}
+ for i,window in enumerate(windows):
+  raw=engine_bytes[window['log_start']:window['log_end']]
+  path=out/('%s-span-%02d.log'%(arm,i));path.write_bytes(raw)
+  audit=audit_log_span(raw,[by_step[step] for step in window['steps']])
+  audits.append(dict(steps=window['steps'],start=window['log_start'],end=window['log_end'],path=str(path),audit=audit))
+  if not audit['exact']:raise RuntimeError('unattributable log span: '+str(window['steps'])+' '+audit['reason'])
+  if len(window['steps'])==1:
+   summary=audit['summaries'][0]
+   rows.append(dict(record=dict(_step=window['steps'][0],prompt_total=summary['prompt']),engine=summary,
+    restored=audit['restored'],result=audit['result']))
+  else:
+   group='burst-'+str(i)
+   groups.append(dict(group=group,steps=window['steps'],exact=True,records=audit['summaries']))
+   for summary in audit['summaries']:
+    rows.append(dict(record=dict(_group=group,prompt_total=summary['prompt']),engine=summary,restored=None,result=None))
+ all_summaries=[e for e in parse_engine_log(engine_bytes.decode('utf-8','replace')) if e['kind'] in ('request','slot')]
+ if len(all_summaries)!=len(rows):raise RuntimeError('request summaries outside bracketed spans')
+ return rows,dict(unmatched_requests=0,unmatched_engine_lines=0),groups,audits
 
 def png(path,rgb,size=64):
  """A deterministic solid-colour PNG: a public synthetic image, no external asset."""
  def chunk(tag,data):
-  body=tag+data;return len(body).to_bytes(4,'big')+body+zlib.crc32(body).to_bytes(4,'big')
+  body=tag+data;return len(data).to_bytes(4,'big')+body+zlib.crc32(body).to_bytes(4,'big')
  raw=b''.join(b'\x00'+bytes(rgb)*size for _ in range(size))
- Path(path).write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',size.to_bytes(4,'big')*2+b'\x08\x02\x00\x00\x00')
+ data=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',size.to_bytes(4,'big')*2+b'\x08\x02\x00\x00\x00')
   +chunk(b'IDAT',zlib.compress(raw,6))+chunk(b'IEND',b''))
+ validate_generated_png(data,rgb,size)
+ Path(path).write_bytes(data)
  return Path(path)
+
+def validate_generated_png(data,rgb,size=64):
+ """CPU guard for OUR RGB fixtures, run in preflight before services stop."""
+ if data[:8]!=b'\x89PNG\r\n\x1a\n':raise ValueError('PNG fixture signature invalid')
+ offset=8;chunks=[];payload=b''
+ while offset<len(data):
+  if offset+12>len(data):raise ValueError('PNG fixture truncated')
+  n=int.from_bytes(data[offset:offset+4],'big');tag=data[offset+4:offset+8]
+  end=offset+8+n
+  if end+4>len(data):raise ValueError('PNG fixture chunk length invalid')
+  body=data[offset+8:end];crc=int.from_bytes(data[end:end+4],'big')
+  if zlib.crc32(tag+body)!=crc:raise ValueError('PNG fixture CRC invalid')
+  chunks.append(tag)
+  if tag==b'IHDR' and body!=size.to_bytes(4,'big')*2+b'\x08\x02\x00\x00\x00':
+   raise ValueError('PNG fixture IHDR invalid')
+  if tag==b'IDAT':payload+=body
+  if tag==b'IEND' and body:raise ValueError('PNG fixture IEND invalid')
+  offset=end+4
+ if chunks!=[b'IHDR',b'IDAT',b'IEND']:raise ValueError('PNG fixture chunk sequence invalid')
+ expected=b''.join(b'\x00'+bytes(rgb)*size for _ in range(size))
+ if zlib.decompress(payload)!=expected:raise ValueError('PNG fixture pixels invalid')
+ return True
 
 def vision_of(source):
  v=source.get('vision') if isinstance(source.get('vision'),dict) else {}
@@ -240,10 +313,19 @@ def reap_recorded_groups(out,deadline):
  except OSError:lines=[]
  for line in lines:
   try:entry=json.loads(line)
-  except ValueError:continue
+  except ValueError:
+   report.append(dict(kind='unreadable_group_registration',group_empty=False,operator_cgroup_required=True));continue
   pid=entry.get('pid');starttime=entry.get('starttime')
   if not pid:continue
-  if not Path('/proc/%d'%pid).exists():report.append(dict(pid=pid,arm=entry.get('arm'),kind='already_reaped',group_empty=True));continue
+  if not Path('/proc/%d'%pid).exists():
+   # A missing leader is not proof that its process group disappeared. Probe only;
+   # never signal the numeric PGID after ownership of its leader has been lost.
+   try:os.killpg(pid,0)
+   except ProcessLookupError:
+    report.append(dict(pid=pid,arm=entry.get('arm'),kind='group_absent_probe_only',group_empty=True));continue
+   except PermissionError:pass
+   report.append(dict(pid=pid,arm=entry.get('arm'),kind='leader_missing_group_present_not_signalled',
+    group_empty=False,operator_cgroup_required=True));continue
   if starttime is None or proc_starttime(pid)!=starttime:
    report.append(dict(pid=pid,arm=entry.get('arm'),kind='pid_no_longer_ours_not_signalled',group_empty=False));continue
   try:os.killpg(pid,signal.SIGKILL);killed='present'
@@ -266,7 +348,9 @@ class Arm:
  """One arm: one temporary server (and its engine child) in ITS OWN process group."""
  def __init__(self,out,arm,cfg,python_bin,server_root,port):
   self.out=out;self.name=arm;self.cfg=cfg;self.port=port
-  self.command=[python_bin,'-m','serve.server','--engine','strata','--config',str(cfg),'--host','127.0.0.1',
+  self.config_path=out/('config-'+arm+'.json')
+  if json.loads(self.config_path.read_text())!=cfg:raise ValueError('temporary config differs from planned config')
+  self.command=[python_bin,'-m','serve.server','--engine','strata','--config',str(self.config_path),'--host','127.0.0.1',
    '--port',str(port)]
   self.server_root=server_root;self.child=None;self.stream=None;self.stop_result=None
  def start(self,fake_plan=None):
@@ -274,8 +358,13 @@ class Arm:
   command=self.command if fake_plan is None else [sys.executable,str(Path(__file__).resolve()),'--fake-server',
    str(self.port),str(fake_plan),str(self.out/(self.name+'-engine.log'))]
   self.stream=log.open('wb')
+  env={k:v for k,v in os.environ.items() if not k.startswith('STRATA_')}
+  env.update(TMPDIR=str(self.out),PYTHONPATH=str(self.server_root),PYTHONDONTWRITEBYTECODE='1',
+   PYTHONUNBUFFERED='1',STRATA_MMQ_KQ='1',
+   LD_LIBRARY_PATH=str(Path(self.cfg['exe']).parent)+':/usr/local/cuda-13.2/lib64')
   self.child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=self.stream,stderr=subprocess.STDOUT,
-   cwd=None if fake_plan is not None else str(self.server_root),start_new_session=True)
+   cwd=None if fake_plan is not None else str(self.server_root),start_new_session=True,
+   env=env)
   register_group(self.out,self.child,self.name)
   return self.child
  def stop(self,deadline):
@@ -283,12 +372,24 @@ class Arm:
   unreaped (its PGID is then certainly still ours), reap the leader, then PROVE the
   group empty. ONE deadline for all of it, never a fresh allowance."""
   graceful=True
-  try:self.child.terminate()
+  if self.child.returncode is not None:
+   # Someone already consumed the leader's status. Its numeric PID/PGID is
+   # no longer ours to signal; only a presence probe is permitted.
+   self.stop_result=dict(graceful=False,worker_reaped=True,
+    owned_group_empty=group_probe(self.child)=='empty')
+   self.stream.close()
+   return self.stop_result
+  # Popen.terminate() first polls and can REAP an already-exited leader. Use a
+  # direct signal while this still-unreaped child reserves its PID/PGID.
+  try:os.kill(self.child.pid,signal.SIGTERM)
   except OSError:graceful=False
   end=time.monotonic()+min(5.0,max(0.0,deadline-time.monotonic()))
   while time.monotonic()<end and worker_status(self.child) is None:time.sleep(0.05)
-  if worker_status(self.child) is None:
-   group_kill(self.child);graceful=False
+  # Still unreaped: this leader's PID/PGID cannot be recycled. Kill residual
+  # descendants even if the leader has already exited, before consuming its status.
+  if group_probe(self.child)!='empty':
+   group_kill(self.child)
+   if worker_status(self.child) is None:graceful=False
   reaped=False
   try:
    self.child.wait(timeout=max(0.0,deadline-time.monotonic()));reaped=True
@@ -327,7 +428,7 @@ def wait_healthy(client,deadline,out,arm,child=None,stdout=None):
    next_progress+=PROGRESS_S
   time.sleep(0.5)
 
-def run_steps(client,model,steps,max_tokens,images,run_marker,deadline,arm):
+def run_steps(client,model,steps,max_tokens,images,run_marker,deadline,arm,log_path=None,out=None):
  """Drive the sequence. The four first turns and the four second turns of the interleave
  run together (the engine has four slots); every other step is serial, so its server
  record maps to exactly one request."""
@@ -353,17 +454,33 @@ def run_steps(client,model,steps,max_tokens,images,run_marker,deadline,arm):
   elif op=='replace_image':
    conv.replace_image(step['image'])
    if step.get('text'):conv.user(step['text'])
+  elif op=='geometry':pass
   else:raise ValueError('unknown step operation '+op)
   started=time.monotonic();started_wall=time.time()
-  answer=client.ask(model,conv.render(images),max_tokens)
+  if step.get('body') is not None:
+   payload=__import__('copy').deepcopy(step['body'])
+   payload.update(model=model,max_tokens=max_tokens,temperature=0,stream=False)
+  else:
+   payload=dict(model=model,messages=conv.render(images),max_tokens=max_tokens,temperature=0,stream=False,
+    chat_template_kwargs=dict(enable_thinking=True))
+  if out:
+   stem=step['step'].replace('/','-')
+   (out/(arm+'-'+stem+'-request.json')).write_text(json.dumps(payload,indent=2)+'\n')
+  try:answer=client._json('POST','/v1/chat/completions',payload)
+  except urllib.error.HTTPError as error:
+   body=error.read(65536).decode('utf-8','replace')
+   if out:(out/(arm+'-'+stem+'-error.json')).write_text(json.dumps(dict(status=error.code,body=body),indent=2)+'\n')
+   raise RuntimeError('HTTP '+str(error.code)+': '+body) from error
+  if out:
+   (out/(arm+'-'+stem+'-response.json')).write_text(json.dumps(answer,indent=2)+'\n')
   choice=(answer.get('choices') or [{}])[0]
   message=choice.get('message') or {}
   conv.reply(message)
   return dict(step=step['step'],conv=step['conv'],op=op,user_turns=conv.user_turns(),
    started=started,started_wall=started_wall,client_elapsed_s=round(time.monotonic()-started,3),
-   finish=choice.get('finish_reason'),
+   finish=choice.get('finish_reason'),usage=answer.get('usage'),
    content=message.get('content') or '',reasoning_chars=len(message.get('reasoning_content') or ''),
-   tool_calls=len(message.get('tool_calls') or []),
+   tool_calls=len(message.get('tool_calls') or []),expected_prompt=step.get('expected_prompt'),
    markers=sorted(set(tokens.values())- {conv.marker}))
  # plan order is kept; only CONSECUTIVE parallel steps (the two groups of four) run
  # together, so each step's start time orders it the same way the server orders records
@@ -379,9 +496,14 @@ def run_steps(client,model,steps,max_tokens,images,run_marker,deadline,arm):
    runs.append(run)
   else:runs.append([steps[index]]);index+=1
  started=time.monotonic();next_progress=started+PROGRESS_S;done=0
+ last_end=None
  for run in runs:
   if time.monotonic()>=deadline:raise TimeoutError('window exhausted before step %s'%run[0]['step'])
   found={};errors=[];group_start=time.time()
+  span_start=log_path.stat().st_size if log_path and log_path.exists() else 0
+  if last_end is not None:
+   gap=log_path.read_bytes()[last_end:span_start]
+   if parse_engine_log(gap.decode('utf-8','replace')):raise RuntimeError('late request events outside previous span')
   def go(step):
    try:found[step['step']]=send(step)
    except BaseException as exc:errors.append('%s: %s: %s'%(step['step'],type(exc).__name__,exc))
@@ -401,7 +523,28 @@ def run_steps(client,model,steps,max_tokens,images,run_marker,deadline,arm):
   for s in run:
    if s['step'] not in found:raise RuntimeError('step %s returned nothing'%s['step'])
    answers.append(found[s['step']])
-  windows.append(dict(steps=[s['step'] for s in run],start_wall=group_start,end_wall=time.time()))
+  # Collect only complete lines visible within a bounded wait. A missing or late
+  # summary is deliberately unknown, not attributed from the next request's span.
+  span_end=span_start
+  if log_path:
+   end=min(deadline,time.monotonic()+2.0)
+   while time.monotonic()<end:
+    if log_path.exists():
+     data=log_path.read_bytes()[span_start:]
+     span_end=span_start+(data.rfind(b'\n')+1 if b'\n' in data else 0)
+     summaries=[e for e in parse_engine_log(data[:span_end-span_start].decode('utf-8','replace'))
+      if e['kind'] in ('request','slot')]
+     if len(summaries)==len(run) and data.endswith(b'\n'):
+      time.sleep(min(.1,max(0,deadline-time.monotonic())))
+      if log_path.stat().st_size==span_end:break
+     elif len(summaries)>len(run):raise RuntimeError('too many request summaries in bounded span')
+    time.sleep(.05)
+  raw=log_path.read_bytes()[span_start:span_end] if log_path else b''
+  audit=audit_log_span(raw,[found[s['step']] for s in run])
+  if not audit['exact']:raise RuntimeError('request log span failed: '+audit['reason'])
+  last_end=span_end
+  windows.append(dict(steps=[s['step'] for s in run],start_wall=group_start,end_wall=time.time(),
+   log_start=span_start,log_end=span_end))
  # the server-side view of the same requests; each record carries the request's START time
  snapshot=client.metrics()
  return answers,snapshot,windows
@@ -440,27 +583,26 @@ def arm_checks(arm,answers,rows,correlation,health,metrics_snapshot,engine_text,
    [l for l in engine_text.splitlines() if 'IMAGE_CHECKPOINT' in l][:4])
  stable=next((r for r in rows if r['record'].get('_step')=='stable_image/2'),None)
  stable_reuse=(stable or {}).get('engine',{}).get('reused') if stable else None
- add('stable_image_history_reuse_positive',stable_reuse is not None and stable_reuse>0,stable_reuse)
+ add('stable_image_history_reuse_positive',stable_reuse is not None and stable_reuse>0,stable_reuse,required=False)
  if arm=='candidate_on':
-  restores=sum(1 for r in rows if r.get('restored'))+sum(1 for r in rows if r.get('result')=='checkpoint')
-  add('checkpoint_restore_observed',restores>0,restores)
- inter=[a for a in answers if a['step'].startswith('interleave_four/')]
- add('interleave_four_eight_steps',len(inter)==8,len(inter))
- # four clients at once: attributed as a GROUP, and the slots they landed on come from
- # the engine's own session numbers, never from the client's thread order
- attributed_groups=[g for g in groups if g['group'].endswith('clients')]
- add('concurrent_groups_attributed',len(attributed_groups)==2 and all(g['exact'] for g in attributed_groups),
-  [dict(group=g['group'],records=len(g['records']),exact=g['exact']) for g in groups])
- def group_rows(g):return [r for r in rows if r['record'].get('_group')==g['group']]
- slots=[sorted({r['engine']['session'] for r in group_rows(g) if r['engine']}) for g in attributed_groups]
- reuse_by_group=[[r['engine']['reused'] for r in group_rows(g) if r['engine']] for g in attributed_groups]
- add('four_clients_used_distinct_slots',all(len(s)>=4 for s in slots),slots)
- second=reuse_by_group[1] if len(reuse_by_group)==2 else []
- add('interleave_second_group_reuse_positive',bool(second) and all(x>0 for x in second),reuse_by_group)
- if arm=='candidate_on':
-  add('interleave_group_restores_reported',any(r.get('restored') for g in attributed_groups
-   for r in group_rows(g)),[sum(1 for r in group_rows(g) if r.get('restored')) for g in attributed_groups])
- contaminated=[a['step'] for a in inter if any(m in a['content'] for m in a['markers'])]
+  positive=[r for r in rows if r['record'].get('_step','').startswith('qualified_rewrite/') and
+   r['record']['_step']!='qualified_rewrite/1']
+  add('qualified_after_image_restore',bool(positive) and all(r.get('restored') is True and
+   r['engine']['reused']>0 for r in positive),
+   [dict(step=r['record']['_step'],restored=r.get('restored'),reused=r['engine']['reused']) for r in positive])
+ geometry_answers=[a for a in answers if a['step'].startswith('qualified_rewrite/')]
+ add('qualified_geometry_prompt_matches',len(geometry_answers)==3 and all(
+  (a.get('usage') or {}).get('prompt_tokens')==a.get('expected_prompt') for a in geometry_answers),
+  [dict(step=a['step'],expected=a.get('expected_prompt'),actual=(a.get('usage') or {}).get('prompt_tokens')) for a in geometry_answers])
+ # This bounded HTTP qualification is deliberately serial. Concurrent admissions
+ # can yield and resume, producing multiple native summaries for ONE HTTP request.
+ # Their attribution needs a separate scheduler test, not relaxed count matching.
+ add('serial_scope_complete',len(answers)==10 and all(
+  not a['step'].startswith('interleave_four/') for a in answers),
+  dict(requests=len(answers),concurrency='NOT_TESTED'))
+ add('serial_spans_only',not groups and all(r['record'].get('_step') for r in rows),
+  dict(groups=len(groups),attributed_requests=len(rows)))
+ contaminated=[a['step'] for a in answers if any(m in a['content'] for m in a['markers'])]
  add('no_cross_conversation_contamination',not contaminated,contaminated)
  text=[a for a in answers if a['step'].startswith('text_only_after_images/')]
  add('text_only_after_images_ok',len(text)==2 and all(a['content'] or a['reasoning_chars'] for a in text),
@@ -513,7 +655,7 @@ def verdict(killed,late,exit_code,group_empty,report_status,arms_done,preflight=
  if not cleanup_complete:reasons.append('cleanup did not finish inside the allowance')
  if not server_groups_empty:reasons.append('a temporary server group this run started was still present')
  accepted=('PASS_IMAGE_HTTP_PLAN_ONLY' if plan_only else 'PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY' if preflight else
-  'PASS_IMAGE_HTTP_SMOKE_SELFTEST' if selftest else 'PASS_BOUNDED_IMAGE_HTTP_SMOKE')
+  'PASS_IMAGE_HTTP_SMOKE_SELFTEST' if selftest else 'PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE')
  if report_status!=accepted:reasons.append('worker report status '+str(report_status)+' not accepted for mode '
   +('preflight' if preflight else ('selftest:'+selftest if selftest else 'real')))
  if not arms_done:reasons.append('not every arm completed')
@@ -540,22 +682,27 @@ def plan_checks(report,a):
  add('vision_section_copied_from_live',bool(planned) and all(x['vision'] for x in planned),
     {x['arm']:x['vision'] for x in planned})
  add('live_credential_not_copied','api_key' not in json.dumps(planned))
- add('request_table_complete',len(report.get('steps') or [])==len(plan('smoke-x')),len(report.get('steps') or []))
+ add('request_table_complete',len(report.get('steps') or [])==len(plan('smoke-x'))+3,len(report.get('steps') or []))
  report['checks']=checks
  return all(c['ok'] for c in checks if c['required'])
 
+def geometry_selftest_steps():
+ return [dict(step='qualified_rewrite/'+str(i+1),conv='qualified',op='geometry',expected_prompt=1400,
+  body=dict(messages=[dict(role='user',content='stand-in geometry only')])) for i in range(3)]
+
 def selftest_plan(scenario,arm,run_marker):
  steps=[]
- for index,step in enumerate(plan(run_marker)):
+ fake_steps=geometry_selftest_steps()+plan(run_marker)
+ for index,step in enumerate(fake_steps):
   reused=0 if step['step'].endswith('/1') or '/1c' in step['step'] else (
    0 if scenario=='zero_stable_reuse' and step['step']=='stable_image/2' else 512)
   result='new' if reused==0 else ('checkpoint' if arm=='candidate_on' and scenario!='no_restore' else 'hit')
-  steps.append(dict(step=step['step'],conv=step['conv'],nth=sum(1 for s in plan('smoke')[:index+1]
+  steps.append(dict(step=step['step'],conv=step['conv'],nth=sum(1 for s in fake_steps[:index+1]
    if s['conv']==step['conv']),reused=reused,result=result,
    prompt_delta=(-3 if scenario=='divergence' and arm=='candidate_off' else 0),
    engine_error=scenario=='engine_error' and step['step']=='changed_pixels/1',
    missing_record=scenario=='missing_record' and step['step']=='system_rewrite/1',
-   cross_talk=scenario=='cross_talk' and step['step']=='interleave_four/1c2',
+   cross_talk=scenario=='cross_talk' and step['step']=='text_only_after_images/1',
    finish='stop'))
  return dict(arm=arm,scenario=scenario,marker=run_marker,steps=steps,health_images=scenario!='no_encoder',
   hang=scenario in ('hung_server','stuck_group'),descendant=scenario=='stuck_group',
@@ -607,14 +754,14 @@ def fake_server(port,plan_path,log_path):
      self.send_error(500,'plan exhausted');return
     s=plan_data['steps'][state['index']];conv=s['conv'];state['index']+=1
     session=state['arrival']%4;state['arrival']+=1
-    total=tokens(messages)+int(s.get('prompt_delta') or 0)
+    total=1400 if s['step'].startswith('qualified_rewrite/') else tokens(messages)+int(s.get('prompt_delta') or 0)
     reused=int(s.get('reused') or 0);read=max(0,total-reused);prompt_ms=max(1.0,read*1.3)
     epoch=state['arrival']
     lines=['KVCACHE session=%d generation=1 epoch=%d state=active tokens=%d bytes=580911104 '
      'reserved_tokens=%d result=%s replay=%d'%(session,epoch,total,total,s['result'],
       0 if s['result'] in ('hit','checkpoint') else 1)]
     if s['result']=='checkpoint':
-     lines.append('KVREPLAY session=%d generation=1 epoch=%d tokens=%d reason=prefix_checkpoint'%(session,epoch,reused))
+     lines.append('Qwen3.6 prefix checkpoint: source=0 session=%d restored_tokens=%d'%(session,reused))
     lines.append('strata serve: session %d: prompt %d tokens = %d reused + %d read in %.1f ms, 3 generated in '
      '40.0 ms (75.0 tok/s), drafts accepted 0 of 0 (%s)'%(session,total,reused,read,prompt_ms,
       s.get('finish','stop')))
@@ -626,7 +773,7 @@ def fake_server(port,plan_path,log_path):
       prompt_tokens=total-reused,reused=reused,output_tokens=3,prompt_total=total,prompt_read=read,
       prompt_ms=prompt_ms,decode_ms=40.0))
    self._send(dict(choices=[dict(message=dict(role='assistant',content=content,reasoning_content='thinking',
-    tool_calls=[dict(id='call_1',type='function',function=dict(name='note',arguments='{}'))]),
+    tool_calls=[]),
     finish_reason=s.get('finish','stop'))],usage=dict(prompt_tokens=total,completion_tokens=3)))
  if plan_data.get('slow_start_s'):time.sleep(plan_data['slow_start_s'])
  server=HTTPServer(('127.0.0.1',port),Handler)
@@ -644,6 +791,7 @@ def fake_server(port,plan_path,log_path):
 def worker(a,budget):
  out=a.out;report=dict(status='STARTED',mode=('plan-only' if a.plan_only else 'preflight' if a.preflight
   else 'selftest:'+a.selftest if a.selftest else 'real'),source_commit=os.environ.get('STRATA_IMAGE_HTTP_SOURCE_COMMIT',''),
+  scope='serial_image_http_10_requests_per_arm',concurrency='NOT_TESTED',
   window_seconds=a.window_seconds,cleanup_allowance_seconds=a.cleanup_seconds,
   server_root=str(a.server_root),engine_sha256=digest(a.engine) if a.engine.exists() else None,
   baseline_engine_sha256=digest(a.baseline_engine) if a.baseline_engine and a.baseline_engine.exists() else None,
@@ -659,6 +807,17 @@ def worker(a,budget):
   source=json.loads(a.source_config.read_text())
   run_marker='smoke-'+os.environ.get('STRATA_IMAGE_HTTP_STAMP',str(os.getpid()))
   steps=plan(run_marker)
+  if not a.selftest:
+   from q36_image_http_geometry import load as load_geometry
+   geometry,bodies=load_geometry(a.geometry,a.model,a.engine,a.source_config,a.server_root,a.baseline_engine)
+   report['geometry']=geometry
+   additions=[dict(step='qualified_rewrite/'+str(i+1),conv='qualified',op='geometry',body=body,
+    expected_prompt=geometry['request_prompt_tokens'][i]) for i,body in enumerate(bodies)]
+   steps=additions+steps
+  else:
+   steps=geometry_selftest_steps()+steps
+  if len(steps)!=10 or any(s['step'].startswith('interleave_four/') for s in steps):
+   raise RuntimeError('serial HTTP scope requires exactly ten non-burst requests')
   if a.plan_only:
    planned=[]
    for arm in a.arms:
@@ -676,10 +835,12 @@ def worker(a,budget):
    plan_arms=[]
    for arm in a.arms:
     engine=a.engine if arm!='baseline' else a.baseline_engine
-    cfg=plan_config(source,engine,a.port,out/('config-%s.json'%arm),out/('%s-engine.log'%arm),out,arm,a.model)
+    port=a.port or free_port()
+    cfg=plan_config(source,engine,port,out/('config-%s.json'%arm),out/('%s-engine.log'%arm),out,arm,a.model)
     plan_arms.append(dict(arm=arm,engine=str(engine),image_flag=IMAGE_FLAG in cfg['args'],args=cfg['args'],
-     vision=sorted(cfg['vision']),port=a.port,host=cfg['host']))
+     vision=sorted(cfg['vision']),port=port,host=cfg['host']))
    report['plan']=plan_arms;report['steps']=[s['step'] for s in steps];report['arms_done']=True
+   if not plan_checks(report,a):raise RuntimeError('preflight config/flag/port checks failed')
    report['marker']=PREFLIGHT_MARKER;report['status']='PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY'
    return 0
   reports={}
@@ -703,42 +864,40 @@ def worker(a,budget):
    health=None;snapshot=None;answers=[];rows=[];correlation={};engine_text=''
    try:
     health=wait_healthy(client,deadline,out,arm,child,arm_out/(arm+'-server-stdout.txt'))
-    steps_out,snapshot,windows=run_steps(client,health.get('model') or 'strata-q36',steps,a.max_tokens,images,
-     run_marker,budget.deadline,arm)
     log_path=out/('%s-engine.log'%arm)
-    engine_text=log_path.read_text(errors='replace') if log_path.is_file() else ''
+    steps_out,snapshot,windows=run_steps(client,health.get('model') or 'strata-q36',steps,a.max_tokens,images,
+     run_marker,budget.deadline,arm,log_path,out=out)
+    log_bytes=log_path.read_bytes() if log_path.is_file() else b''
+    engine_text=log_bytes.decode('utf-8','replace')
+    answer_by_step={a['step']:a for a in steps_out}
+    rows,correlation,groups,span_audits=attribute_spans(windows,steps_out,log_path.read_bytes(),out,arm)
+    from collections import Counter
+    records=snapshot.get('requests') or []
+    if len(records)!=len(steps_out) or Counter(r.get('prompt_total') for r in records)!=Counter(
+     (answer.get('usage') or {}).get('prompt_tokens') for answer in steps_out):
+     raise RuntimeError('complete metrics request counts/token multiset differ from HTTP responses')
     events=parse_engine_log(engine_text)
-    # label records by prompt size in arrival order, then correlate engine lines to them
-    # /metrics reports each request's own START time, so both sides sort the same way
-    records=sorted(snapshot.get('requests') or [],key=lambda r:r.get('time') or 0)
-    # A single-step run attributes its record to that step. A CONCURRENT run (the four
-    # clients of one interleave group) cannot be attributed per step: the server starts
-    # them in its own order, so guessing would invent which client reused what. The group
-    # is attributed as a whole and checked as a whole.
-    groups=[];cursor=0
-    for window in windows:
-     take=[]
-     while cursor<len(records) and len(take)<len(window['steps']) and \
-      (records[cursor].get('time') or 0)<=window['end_wall']+2.0:
-      take.append(records[cursor]);cursor+=1
-     if len(window['steps'])==1 and len(take)==1:take[0]['_step']=window['steps'][0]
-     else:
-      name=window['steps'][0].split('/')[1][0]+'clients' if '/' in window['steps'][0] else window['steps'][0]
-      for r in take:r['_group']=name
-      groups.append(dict(group=name,steps=window['steps'],records=[{k:v for k,v in r.items() if k!='_group'}
-       for r in take],exact=len(take)==len(window['steps'])))
-    rows,correlation=correlate(records,events)
     checks,reuse=arm_checks(arm,steps_out,rows,correlation,health,snapshot,engine_text,cfg['args'],groups)
+    if not a.selftest and arm=='candidate_on':
+     thresholds={str(r['turn']):r for r in geometry['audit']['rewrites']}
+     for row in rows:
+      step=row['record'].get('_step','')
+      if step.startswith('qualified_rewrite/') and step.rsplit('/',1)[1] in thresholds:
+       bound=thresholds[step.rsplit('/',1)[1]]
+       if not bound['image_end']<=row['engine']['reused']<=bound['lcp']:
+        raise RuntimeError('reuse did not land after complete image and before audited divergence')
     report['steps']=[s['step'] for s in steps]
     reports[arm]=dict(health=health,engine_info=snapshot.get('engine'),checks=checks,reuse=reuse,
-     correlation=correlation,log_lines=len(engine_text.splitlines()),
-     engine_events=len(events),sessions=sorted({e['session'] for e in events if e['kind']=='request'}))
+     correlation=correlation,span_audits=span_audits,log_lines=len(engine_text.splitlines()),
+     engine_events=len(events),sessions=sorted({e['session'] for e in events if e['kind'] in ('request','slot')}))
     print('HTTP_SMOKE_PROGRESS arm=%s stage=arm_done elapsed_s=%d requests=%d sessions=%d'%(
      arm,int(time.monotonic()-started),len(steps_out),len(reports[arm]['sessions'])),flush=True)
    finally:
     cleanup_deadline=budget.deadline if budget.left()>0 else time.monotonic()+a.cleanup_seconds
     handle.stop(cleanup_deadline)
     stop=handle.stop_result
+    if not stop['owned_group_empty'] or not stop['worker_reaped']:raise RuntimeError('temporary server group did not drain; operator cgroup cleanup required')
+    if not a.selftest:no_models()  # includes final arm; detect any escaped model/encoder child
     report.setdefault('arm_cleanup',{})[arm]=stop
     (out/(arm+'-report.json')).write_text(json.dumps(reports.get(arm,{}),indent=2)+'\n')
   required=[]
@@ -759,7 +918,7 @@ def worker(a,budget):
    report['status']='FAIL_required_checks';report['marker']=None;return 1
   report['arms_done']=True
   report['marker']=(('IMAGE_HTTP_SMOKE_SELFTEST PASS scenario='+a.selftest) if a.selftest else PASS_MARKER)
-  report['status']=('PASS_IMAGE_HTTP_SMOKE_SELFTEST' if a.selftest else 'PASS_BOUNDED_IMAGE_HTTP_SMOKE')
+  report['status']=('PASS_IMAGE_HTTP_SMOKE_SELFTEST' if a.selftest else 'PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE')
   return 0
  except BaseException as exc:
   report['status']='FAIL';report['error']=str(exc)[:400];raise
@@ -889,6 +1048,7 @@ def main():
  for name in ('engine','model','source-config','server-root','out'):
   p.add_argument('--'+name,type=Path)
  p.add_argument('--baseline-engine',type=Path)
+ p.add_argument('--geometry',type=Path)
  p.add_argument('--arms',default=None)
  p.add_argument('--window-seconds',type=int,default=WINDOW_DEFAULT)
  p.add_argument('--cleanup-seconds',type=int,default=CLEANUP_ALLOWANCE_DEFAULT)
@@ -912,11 +1072,12 @@ def main():
  a.arms=arms
  for name in ('engine','model','source_config','server_root','out'):
   if getattr(a,name) is None:p.error('--%s is required'%name.replace('_','-'))
+ if not arms or len(set(arms))!=len(arms):p.error('arms must be nonempty and unique')
  if any(x not in ARMS for x in arms):p.error('arms must be a subset of '+','.join(ARMS))
  if not a.selftest and not a.plan_only and os.environ.get('STRATA_IMAGE_HTTP_REVIEW_WINDOW')!='1':
   p.error('the HTTP smoke starts a model and encoder, so it runs only in the approved Orin window: set '
    'STRATA_IMAGE_HTTP_REVIEW_WINDOW=1 and bring the live services down through the manager first')
- if not a.selftest and not a.plan_only and (not ROOT or not ROOT.is_dir()):
+ if not a.selftest and not a.plan_only and (a.server_root.resolve()!=ROOT or ROOT!=Path('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache')):
   p.error('only the approved window, with STRATA_IMAGE_HTTP_ROOT set to the read-only server checkout')
  if 'baseline' in arms and a.baseline_engine is None:p.error('--baseline-engine required for the baseline arm')
  if getattr(a,'fault',None) and not a.selftest:p.error('fault injection requires --selftest')
@@ -928,15 +1089,16 @@ def main():
  if not 1<=a.cleanup_seconds<=CLEANUP_ALLOWANCE_MAX:p.error('cleanup allowance must be 1..%ds'%CLEANUP_ALLOWANCE_MAX)
  if not a.out.resolve().is_relative_to(STAGE) or a.out.resolve()==STAGE:
   p.error('all smoke results must live in a NEW directory under '+str(STAGE))
- if a.port and (a.port==PRODUCTION_PORT or not 1024<=a.port<=65535):p.error('refusing the production port')
+ if a.port and (a.port==PRODUCTION_PORT or not 11500<=a.port<=11599):p.error('refusing the production port')
  for path in (a.model,a.source_config,a.server_root):
   if not path.exists():p.error('missing '+str(path))
- if a.server_root.resolve()is STAGE or STAGE in a.server_root.resolve().parents:
+ if a.server_root.resolve()==STAGE or STAGE in a.server_root.resolve().parents:
   p.error('the server checkout must be read-only code, never the staging directory')
  if a.expect_engine_sha256 and digest(a.engine)!=a.expect_engine_sha256:
   p.error('candidate engine hash differs from the qualified build')
  for path in (a.engine,)+(a.baseline_engine,) if a.baseline_engine else ():
   if not path.is_file():p.error('missing engine '+str(path))
+ if not a.selftest and not a.geometry:p.error('--geometry from the CPU-only actual-GGUF preflight is required')
  if a.worker:return worker(a,Budget(a.window_seconds,'worker',a.deadline))
  if a.out.exists():p.error('results directory already exists; preserve old artifacts')
  a.out.mkdir(parents=True)

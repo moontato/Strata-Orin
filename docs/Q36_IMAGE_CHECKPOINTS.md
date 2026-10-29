@@ -1,4 +1,4 @@
-# Image-aware Qwen3.6 prefix checkpoints — opt-in; Orin numerical gate passed, HTTP layer pending
+# Image-aware Qwen3.6 prefix checkpoints — opt-in; Orin numerical and serial HTTP gates passed
 
 **2026-10-28 review blockers RESOLVED, and the bounded numerical Orin gate PASSED.**
 Origin publication and coding-server CPU validation are complete. Review found (a) a
@@ -13,11 +13,12 @@ with `IMAGE_CHECKPOINT_MEASURE … independent=1 exact=1` on all 17 measurement 
 constant-allocation proof `KV_PREALLOCATION_MODEL PASS physical_allocations=3924`, and the
 corrupted-conviction arm refused at `IMAGE_CHECKPOINT_FAILURE comparison=restored exact
 state required` (see **What the Orin numerical window measured** below). That qualifies the
-**engine and oracle only**. The HTTP integration layer — encoder through the OpenAI endpoint,
-carried replies, slot choice from correlated engine logs — has a prepared harness but has
-**not** been run on Orin: [Q36_IMAGE_HTTP_SMOKE.md](Q36_IMAGE_HTTP_SMOKE.md). The flag stays
-off by default, and the model-window commands below still need a separately approved
-operator isolation window.
+**engine and oracle only**. A separate bounded serial HTTP smoke subsequently passed
+on Orin with a resident encoder and three ten-request arms; it did not qualify
+HTTP concurrency or measure actual OWUI savings. See
+[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md) for evidence
+and limits. The flag stays off by default. Any new model window still needs a
+separately approved operator isolation window.
 
 Local parent: **765068db267f8cd8f846f8ef45c9cc94f90075d5**, on4130bdfd.
 This is a continuation of the multimodal-cache diagnostics, not the older

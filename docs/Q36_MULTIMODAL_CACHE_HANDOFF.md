@@ -1,4 +1,21 @@
+# Current serial HTTP qualification status
+
+The real Orin serial HTTP smoke PASSED: three arms, ten requests each; positive
+controlled after-image checkpoint restoration; cleanup and original vision service
+restoration verified. Production image checkpoints remain disabled. Concurrency
+and actual OWUI savings are NOT qualified by this smoke. The current continuation
+instructions and exact evidence hashes are in
+[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md).
+Earlier status text and execution recipes below are historical and superseded;
+do not run an old preparer or repeat a model window from them.
+
 # Qwen3.6 multimodal checkpoint handoff / fresh coding container
+
+**HTTP harness correction:** The old e57c7a37 export is superseded by the
+reviewer's completed standalone CPU-preflight package. Request spans are now the
+authoritative attribution path; actual-GGUF geometry still needs to run on Orin.
+See `Q36_IMAGE_HTTP_SMOKE.md`. Do not use historical GPU-window commands below.
+Production and the qualified native binary remain unchanged.
 
 ## Delivery status — origin publication and coding-server validation VERIFIED
 

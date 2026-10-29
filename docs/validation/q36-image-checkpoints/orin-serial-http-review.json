@@ -1,0 +1,274 @@
+{
+  "archive": "q36-image-http-passed-evidence.tar.gz",
+  "sha256": "9d6e0bfdfe17b3f848ecd52ea08536e9b798e006cca50f3c3747b8158c73b7ea",
+  "review": "PASS_FOR_BOUNDED_SERIAL_HTTP_CASE_ONLY",
+  "requests_independently_reaudited": 30,
+  "request_response_files_present": 60,
+  "span_usage_and_restore_audit": "PASS",
+  "config_flag_isolation": "PASS",
+  "baseline_candidate_off_reuse_equal": true,
+  "production_image_checkpoints_enabled": false,
+  "service_restoration_marker": true,
+  "cleanup": {
+    "window_seconds": 900,
+    "cleanup_allowance_seconds": 30,
+    "killed": false,
+    "deadline_crossed": false,
+    "worker_exit": 0,
+    "worker_reaped": true,
+    "owned_group_empty": true,
+    "cleanup_complete": true,
+    "worker_report_status": "PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE",
+    "interrupted_signals": "",
+    "required_failures": [],
+    "owned_server_groups": [
+      {
+        "pid": 3513952,
+        "arm": "baseline",
+        "kind": "group_absent_probe_only",
+        "group_empty": true
+      },
+      {
+        "pid": 3514533,
+        "arm": "candidate_off",
+        "kind": "group_absent_probe_only",
+        "group_empty": true
+      },
+      {
+        "pid": 3515090,
+        "arm": "candidate_on",
+        "kind": "group_absent_probe_only",
+        "group_empty": true
+      }
+    ],
+    "server_groups_empty": true,
+    "passed": true,
+    "reasons": [],
+    "operator_cgroup_required": true
+  },
+  "results": {
+    "baseline": [
+      {
+        "step": "qualified_rewrite/1",
+        "session": 0,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "qualified_rewrite/2",
+        "session": 1,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "qualified_rewrite/3",
+        "session": 2,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "stable_image/1",
+        "session": 3,
+        "reused": 0,
+        "read": 60,
+        "restored": false
+      },
+      {
+        "step": "stable_image/2",
+        "session": 0,
+        "reused": 0,
+        "read": 91,
+        "restored": false
+      },
+      {
+        "step": "earlier_user_rewrite/1",
+        "session": 1,
+        "reused": 0,
+        "read": 59,
+        "restored": false
+      },
+      {
+        "step": "system_rewrite/1",
+        "session": 2,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "changed_pixels/1",
+        "session": 3,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/1",
+        "session": 0,
+        "reused": 0,
+        "read": 48,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/2",
+        "session": 1,
+        "reused": 0,
+        "read": 77,
+        "restored": false
+      }
+    ],
+    "candidate_off": [
+      {
+        "step": "qualified_rewrite/1",
+        "session": 0,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "qualified_rewrite/2",
+        "session": 1,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "qualified_rewrite/3",
+        "session": 2,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "stable_image/1",
+        "session": 3,
+        "reused": 0,
+        "read": 60,
+        "restored": false
+      },
+      {
+        "step": "stable_image/2",
+        "session": 0,
+        "reused": 0,
+        "read": 91,
+        "restored": false
+      },
+      {
+        "step": "earlier_user_rewrite/1",
+        "session": 1,
+        "reused": 0,
+        "read": 59,
+        "restored": false
+      },
+      {
+        "step": "system_rewrite/1",
+        "session": 2,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "changed_pixels/1",
+        "session": 3,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/1",
+        "session": 0,
+        "reused": 0,
+        "read": 48,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/2",
+        "session": 1,
+        "reused": 0,
+        "read": 77,
+        "restored": false
+      }
+    ],
+    "candidate_on": [
+      {
+        "step": "qualified_rewrite/1",
+        "session": 0,
+        "reused": 0,
+        "read": 3708,
+        "restored": false
+      },
+      {
+        "step": "qualified_rewrite/2",
+        "session": 0,
+        "reused": 3584,
+        "read": 124,
+        "restored": true
+      },
+      {
+        "step": "qualified_rewrite/3",
+        "session": 0,
+        "reused": 3584,
+        "read": 124,
+        "restored": true
+      },
+      {
+        "step": "stable_image/1",
+        "session": 1,
+        "reused": 0,
+        "read": 60,
+        "restored": false
+      },
+      {
+        "step": "stable_image/2",
+        "session": 2,
+        "reused": 0,
+        "read": 91,
+        "restored": false
+      },
+      {
+        "step": "earlier_user_rewrite/1",
+        "session": 3,
+        "reused": 0,
+        "read": 59,
+        "restored": false
+      },
+      {
+        "step": "system_rewrite/1",
+        "session": 0,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "changed_pixels/1",
+        "session": 1,
+        "reused": 0,
+        "read": 122,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/1",
+        "session": 2,
+        "reused": 0,
+        "read": 48,
+        "restored": false
+      },
+      {
+        "step": "text_only_after_images/2",
+        "session": 3,
+        "reused": 0,
+        "read": 77,
+        "restored": false
+      }
+    ]
+  },
+  "limits": [
+    "concurrency NOT TESTED by this HTTP run",
+    "HTTP does not repeat independent native tensor oracle",
+    "tiny natural conversations show zero reuse",
+    "actual OWUI savings UNMEASURED",
+    "all three arm cleanups recorded graceful=false but owned groups empty/reaped=true"
+  ]
+}

@@ -1,4 +1,21 @@
-# Qwen3.6 image-checkpoint review — resolved; Orin numerical gate PASSED, HTTP layer pending
+# Current serial HTTP qualification status
+
+The real Orin serial HTTP smoke PASSED: three arms, ten requests each; positive
+controlled after-image checkpoint restoration; cleanup and original vision service
+restoration verified. Production image checkpoints remain disabled. Concurrency
+and actual OWUI savings are NOT qualified by this smoke. The current continuation
+instructions and exact evidence hashes are in
+[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md).
+Earlier status text and execution recipes below are historical and superseded;
+do not run an old preparer or repeat a model window from them.
+
+# HTTP follow-up correction status
+
+The native gate and subsequent serial HTTP smoke passed on Orin. The old HTTP
+export is superseded. The HTTP smoke does not repeat the native tensor oracle or
+qualify concurrency. Historical review findings follow.
+
+# Qwen3.6 image-checkpoint review — resolved; Orin numerical and serial HTTP gates passed
 
 Reviewed published support tip **72457256fa0367660a8e0849bb19e234c6fc1711** and
 implementation **37911119e64aa97b837b2f6a920dbdc8cc3930bd** (parent diagnostics
@@ -17,9 +34,9 @@ f19e2294 (`bind the gate verdict to the run mode under the supervisor`), R3/R4
 **off by default**. The numerical engine/oracle has since passed its bounded Orin window
 (`PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE`, all 17 `IMAGE_CHECKPOINT_MEASURE` lines
 `independent=1 exact=1`; numbers in
-[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md)). The **HTTP integration** layer on
-Orin is still pending, with its harness prepared and host-tested here —
-[Q36_IMAGE_HTTP_SMOKE.md](Q36_IMAGE_HTTP_SMOKE.md).
+[Q36_IMAGE_CHECKPOINTS.md](Q36_IMAGE_CHECKPOINTS.md)). The separate serial HTTP
+smoke also passed; its limited scope is recorded in
+[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md).
 
 ## R1 — restored-state observation could read another slot's device rotary delta (resolved)
 

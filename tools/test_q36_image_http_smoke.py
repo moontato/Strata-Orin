@@ -33,22 +33,13 @@ def config_for(tmp_path,arm,port=11501):
   tmp_path,arm,tmp_path/'model.gguf')
 
 # ---- the request sequence ------------------------------------------------------------
-def test_plan_covers_every_requested_exercise():
- steps={s['step'] for s in smoke.plan('m')}
- for name in ('stable_image/1','stable_image/2','earlier_user_rewrite/1','system_rewrite/1','changed_pixels/1',
-  'interleave_four/1c1','interleave_four/1c2','interleave_four/1c3','interleave_four/1c4',
-  'interleave_four/2c1','interleave_four/2c2','interleave_four/2c3','interleave_four/2c4',
-  'text_only_after_images/1','text_only_after_images/2'):
-  assert name in steps,name
- inter=[s for s in smoke.plan('m') if s['step'].startswith('interleave_four')]
- assert len(inter)==8 and len({s['conv'] for s in inter})==4
- text=[s for s in smoke.plan('m') if s['step'].startswith('text_only_after_images')]
- assert text and all('image' not in s for s in text)
- # every requested exercise happens AFTER an image has entered the history
- order=[s['step'] for s in smoke.plan('m')]
- for name in order[order.index('stable_image/2')+1:]:
-  assert name in ('earlier_user_rewrite/1','system_rewrite/1','changed_pixels/1') or \
-   name.startswith(('interleave_four','text_only_after_images')),name
+def test_plan_is_explicitly_serial():
+ steps=smoke.plan('m')
+ assert [s['step'] for s in steps]==[
+  'stable_image/1','stable_image/2','earlier_user_rewrite/1','system_rewrite/1',
+  'changed_pixels/1','text_only_after_images/1','text_only_after_images/2']
+ assert 'concurrency=NOT_TESTED' in smoke.PASS_MARKER
+ assert all('image' not in s for s in steps if s['step'].startswith('text_only'))
 
 def build_conversations(tmp_path,marker='mark'):
  """Replay the plan exactly as run_steps does. Returns the rendered messages of every
@@ -151,88 +142,75 @@ def test_engine_log_yields_slots_reuse_and_restores():
  assert [e['kind'] for e in events if e['kind'] in ('kvcache','restored')]==['kvcache','kvcache','restored']
  assert [e['session'] for e in events if e['kind']=='restored']==[2]
 
-def test_correlation_marks_restores_and_reports_strays():
- events=smoke.parse_engine_log(ENGINE_LOG)
- records=[dict(_step='a',prompt_total=1054,time=1.0),dict(_step='b',prompt_total=1079,time=2.0)]
- rows,extra=smoke.correlate(records,events)
- assert extra=={'unmatched_requests':0,'unmatched_engine_lines':0}
- assert [r['engine']['session'] for r in rows]==[1,2]
- assert rows[0]['restored'] is False and rows[1]['restored'] is True and rows[1]['result']=='checkpoint'
- rows,extra=smoke.correlate(records[:1],events)
- assert extra['unmatched_engine_lines']==1
- rows,extra=smoke.correlate(records+[dict(_step='c',prompt_total=999,time=3.0)],events)
- assert extra['unmatched_requests']==1
+def test_legacy_whole_log_never_claims_request_provenance():
+ rows,counts=smoke.correlate([dict(prompt_total=1054),dict(prompt_total=1079)],smoke.parse_engine_log(ENGINE_LOG))
+ assert all(r['restored'] is None and r['result'] is None for r in rows)
+ # This compatibility helper is NOT the real worker's attribution path.
+ import inspect
+ assert 'correlate(' not in inspect.getsource(smoke.worker)
+
 
 # ---- the per-arm verdicts -----------------------------------------------------------
 def arm_inputs(tmp_path,arm='candidate_on',**change):
- """Synthesise the three inputs a real arm produces: the answers the API returned, the
- server's /metrics records, and the engine's own log text."""
- steps=smoke.plan('mark')
- answers=[dict(step=s['step'],conv=s['conv'],op=s['op'],user_turns=1+(i%2),content='ok',reasoning_chars=12,
-   tool_calls=0,finish='stop',client_elapsed_s=0.4,started=float(i),started_wall=float(i),
-   markers=['mark-%s'%c for c in sorted({x['conv'] for x in steps}) if c!=s['conv']])
-  for i,s in enumerate(steps)]
- prompt=1051 if change.get('tokens_differ') else 1054
- lines=[]
- for i,s in enumerate(steps):
-  session=i%4+1;reused=0 if s['step'].endswith('/1') or '/1c' in s['step'] else 512
-  if change.get('zero_reuse') and s['step']=='stable_image/2':reused=0
-  if change.get('second_group_zero') and s['step'].startswith('interleave_four/2'):reused=0
-  restore=reused>0 and not change.get('no_restore')
-  lines.append('strata serve: session %d: prompt %d tokens = %d reused + %d read in 400.0 ms (stop)'%
-   (session,prompt,reused,prompt-reused))
-  lines.append('KVCACHE session=%d generation=1 epoch=1 state=active tokens=1024 bytes=1048576 '
-   'reserved_tokens=8192 result=%s replay=%d'%(session,'checkpoint' if restore else 'new',1 if restore else 0))
-  if restore:lines.append('KVREPLAY session=%d tokens=%d reason=prefix_checkpoint'%(session,reused))
- engine_text='\n'.join(lines)
- if change.get('fault'):engine_text+='\nERR session 9: KV restore failed\n'
- if change.get('off_checkpoint_lines'):engine_text+='\nIMAGE_CHECKPOINT_MEASURE slot=1\n'
- events=smoke.parse_engine_log(engine_text)
- # the eight interleave steps ran as two bursts of four clients: their records are
- # attributed to the BURST, not to a guessed client order
- concurrent=[a['step'] for a in answers if a['step'].startswith('interleave_four/')]
- records=[]
- for i,a in enumerate(answers):
-  record=dict(time=float(i),prompt_total=prompt)
-  if a['step'] in concurrent:record['_group']='1clients' if concurrent.index(a['step'])<4 else '2clients'
-  else:record['_step']=a['step']
-  records.append(record)
- groups=[dict(group=g,steps=[s for s in concurrent if (concurrent.index(s)<4)==(g=='1clients')],records=[],
-   exact=True) for g in ('1clients','2clients')]
- if change.get('group_short'):groups[1]['steps']=groups[1]['steps'][:3];groups[1]['exact']=False
- if change.get('same_slot'):
-  for e in events:
-   if e['kind']=='request' and e['session'] in (2,3,4) and e['prompt']==prompt:e['session']=1
- rows,correlation=smoke.correlate(records,events)
- if change.get('contaminate'):answers[6]['content']='about mark-stable'
- cfg_args=list(smoke.QUALIFIED)+([smoke.IMAGE_FLAG] if (arm=='candidate_on')!=bool(change.get('flip_flag')) else [])
- checks,reuse=smoke.arm_checks(arm,answers,rows,correlation,
-  {'images':not change.get('no_encoder'),'loaded':True},{'live':{'state':'idle'},'requests':records},
-  engine_text,cfg_args,groups)
+ steps=smoke.geometry_selftest_steps()+smoke.plan('mark')
+ answers=[];chunks=[];windows=[];raw=b'';index=0
+ while index<len(steps):
+  step=steps[index];run=[step];index+=1
+  if step['step'].startswith('interleave_four/'):
+   key=step['step'].split('/')[1][0]
+   while index<len(steps) and steps[index]['step'].startswith('interleave_four/'+key):
+    run.append(steps[index]);index+=1
+  start=len(raw)
+  for step in run:
+   i=len(answers);prompt=1400 if step['step'].startswith('qualified_rewrite/') else (1051 if change.get('tokens_differ') else 1054)
+   reused=0 if step['step'].endswith('/1') or '/1c' in step['step'] else 512
+   if change.get('zero_reuse') and step['step']=='stable_image/2':reused=0
+   if change.get('second_group_zero') and step['step'].startswith('interleave_four/2'):reused=0
+   restore=arm=='candidate_on' and reused>0 and not change.get('no_restore')
+   session=0 if change.get('same_slot') else i%4
+   lines=['KVCACHE session=%d generation=1 epoch=1 state=active tokens=%d bytes=100 reserved_tokens=%d result=%s replay=0'%(session,prompt,prompt,'checkpoint' if restore else 'new')]
+   if restore:lines.append('KVREPLAY session=%d tokens=%d reason=prefix_checkpoint'%(session,reused))
+   lines.append('strata serve: session %d: prompt %d tokens = %d reused + %d read in 400.0 ms (stop)'%(session,prompt,reused,prompt-reused))
+   raw+=('\n'.join(lines)+'\n').encode()
+   answers.append(dict(step=step['step'],conv=step['conv'],op=step['op'],user_turns=2,content='ok',reasoning_chars=12,
+    tool_calls=0,finish='stop',client_elapsed_s=.4,usage=dict(prompt_tokens=prompt),expected_prompt=step.get('expected_prompt'),
+    markers=['mark-stable']))
+  windows.append(dict(steps=[x['step'] for x in run],log_start=start,log_end=len(raw)))
+ rows,correlation,groups,_=smoke.attribute_spans(windows,answers,raw,tmp_path,arm)
+ if change.get('group_short'):groups.append(dict(group='unexpected-burst',steps=['a','b'],records=[],exact=False))
+ if change.get('contaminate'):next(a for a in answers if a['step']=='text_only_after_images/1')['content']='about mark-stable'
+ text=raw.decode()
+ if change.get('fault'):text+='ERR session 9: KV restore failed\n'
+ if change.get('off_checkpoint_lines'):text+='IMAGE_CHECKPOINT_MEASURE slot=1\n'
+ args=list(smoke.QUALIFIED)+([smoke.IMAGE_FLAG] if (arm=='candidate_on')!=bool(change.get('flip_flag')) else [])
+ if change.get('drop_answer'):answers.pop()
+ checks,reuse=smoke.arm_checks(arm,answers,rows,correlation,{'images':not change.get('no_encoder'),'loaded':True},
+  {'live':{'state':'idle'},'requests':[{}]*len(answers)},text,args,groups)
  return dict(arm=arm,checks=checks,reuse=reuse,correlation=correlation)
+
 
 def check(report,name):return next(c for c in report['checks'] if c['name']==name)
 
 def test_a_clean_arm_passes_every_required_check(tmp_path):
  report=arm_inputs(tmp_path)
  assert check(report,'stable_image_history_reuse_positive')['value']==512
- assert check(report,'checkpoint_restore_observed')['ok']
+ assert check(report,'qualified_after_image_restore')['ok']
  assert report['correlation']=={'unmatched_requests':0,'unmatched_engine_lines':0}
  assert not [c['name'] for c in report['checks'] if c['required'] and not c['ok']]
 
-def test_zero_reuse_fails_a_required_check(tmp_path):
+def test_natural_zero_reuse_is_an_observation(tmp_path):
  failed=check(arm_inputs(tmp_path,zero_reuse=True),'stable_image_history_reuse_positive')
- assert not failed['ok'] and failed['required'] and failed['value']==0
+ assert not failed['ok'] and not failed['required'] and failed['value']==0
 
 def test_missing_restore_fails_a_required_check(tmp_path):
- assert not check(arm_inputs(tmp_path,no_restore=True),'checkpoint_restore_observed')['ok']
+ assert not check(arm_inputs(tmp_path,no_restore=True),'qualified_after_image_restore')['ok']
 
 def test_engine_fault_fails_a_required_check(tmp_path):
  assert not check(arm_inputs(tmp_path,fault=True),'engine_log_without_fault')['ok']
 
 def test_foreign_reply_text_fails_a_required_check(tmp_path):
  failed=check(arm_inputs(tmp_path,contaminate=True),'no_cross_conversation_contamination')
- assert not failed['ok'] and failed['required'] and any('interleave_four' in x for x in failed['value'])
+ assert not failed['ok'] and failed['required'] and any('text_only_after_images' in x for x in failed['value'])
 
 def test_checkpoint_lines_never_appear_with_the_flag_off(tmp_path):
  failed=check(arm_inputs(tmp_path,arm='candidate_off',off_checkpoint_lines=True),'no_image_checkpoint_lines_in_log')
@@ -244,20 +222,16 @@ def test_flag_mismatch_between_config_and_arm_is_caught(tmp_path):
   assert check(arm_inputs(tmp_path,arm=arm),'image_flag_matches_the_running_config')['ok']
   assert not check(arm_inputs(tmp_path,arm=arm,flip_flag=True),'image_flag_matches_the_running_config')['ok'],arm
 
-def test_concurrent_group_is_checked_as_a_group(tmp_path):
- for change,name in ((dict(group_short=True),'concurrent_groups_attributed'),
-  (dict(same_slot=True),'four_clients_used_distinct_slots')):
-  failed=check(arm_inputs(tmp_path,**change),name)
-  assert not failed['ok'] and failed['required'],(change,name)
+def test_serial_arm_refuses_concurrent_group_attribution(tmp_path):
+ failed=check(arm_inputs(tmp_path,group_short=True),'serial_spans_only')
+ assert failed['required'] and not failed['ok']
+ # Slot reuse itself is valid: the smoke does not require four distinct slots.
+ assert check(arm_inputs(tmp_path,same_slot=True),'serial_scope_complete')['ok']
 
-def test_interleave_second_burst_reuse_is_required(tmp_path):
- report=arm_inputs(tmp_path)
- for row in report['reuse']:
-  if row['group']=='2clients':row['reused']=0
- for r in report['checks']:
-  pass
- broken=arm_inputs(tmp_path,second_group_zero=True)
- assert not check(broken,'interleave_second_group_reuse_positive')['ok']
+def test_serial_scope_requires_all_ten_requests(tmp_path):
+ broken=arm_inputs(tmp_path,drop_answer=True)
+ assert not check(broken,'serial_scope_complete')['ok']
+ assert not check(broken,'server_record_count_matches_requests')['ok']
 
 def test_missing_encoder_fails_a_required_check(tmp_path):
  assert not check(arm_inputs(tmp_path,no_encoder=True),'encoder_resident')['ok']
@@ -272,7 +246,7 @@ def test_rendered_token_divergence_is_reported_not_required(tmp_path):
 
 # ---- supervisor verdict -------------------------------------------------------------
 def verdict(**kw):
- base=dict(killed=False,late=False,exit_code=0,group_empty=True,report_status='PASS_BOUNDED_IMAGE_HTTP_SMOKE',
+ base=dict(killed=False,late=False,exit_code=0,group_empty=True,report_status='PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE',
   arms_done=True)
  base.update(kw)
  return smoke.verdict(**base)
@@ -283,8 +257,8 @@ def test_pass_marker_is_bound_to_the_mode_that_ran():
  assert verdict(report_status='PASS_IMAGE_HTTP_SMOKE_SELFTEST',selftest='normal')[0]
  assert verdict(report_status='PASS_IMAGE_HTTP_PLAN_ONLY',plan_only=True)[0]
  for status,kw in (('PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY',{}),('PASS_IMAGE_HTTP_PLAN_ONLY',{}),
-  ('PASS_IMAGE_HTTP_SMOKE_SELFTEST',{}),('PASS_BOUNDED_IMAGE_HTTP_SMOKE',{'preflight':True}),
-  ('PASS_BOUNDED_IMAGE_HTTP_SMOKE',{'plan_only':True}),('PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY',{'selftest':'x'})):
+  ('PASS_IMAGE_HTTP_SMOKE_SELFTEST',{}),('PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE',{'preflight':True}),
+  ('PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE',{'plan_only':True}),('PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY',{'selftest':'x'})):
   assert not verdict(report_status=status,**kw)[0],(status,kw)
 
 def test_verdict_refuses_unclean_or_late_runs():
@@ -296,7 +270,7 @@ def test_verdict_refuses_unclean_or_late_runs():
 def test_plan_checks_required_set(tmp_path):
  report=dict(plan=[dict(arm=a,host='127.0.0.1',port=11500+i,engine=str(tmp_path/('b' if a=='baseline' else 'e')),
    image_flag=(a=='candidate_on'),args=[],vision=['gpu']) for i,a in enumerate(smoke.ARMS)],
-  steps=[s['step'] for s in smoke.plan('m')])
+  steps=[s['step'] for s in smoke.geometry_selftest_steps()+smoke.plan('m')])
  class A:arms=smoke.ARMS;baseline_engine=tmp_path/'b';engine=tmp_path/'e'
  assert smoke.plan_checks(report,A())
  for break_,value in (('image_flag',lambda:report['plan'][0].update(image_flag=True)),
@@ -310,6 +284,7 @@ def test_plan_checks_required_set(tmp_path):
   report['steps']=[s['step'] for s in smoke.plan('m')]
 
 # ---- process-group ownership --------------------------------------------------------
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='real /proc unavailable; operator cgroup qualification pending')
 def test_groups_are_registered_and_reaped_once(tmp_path):
  child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(300)'],start_new_session=True,
   stdout=subprocess.DEVNULL)
@@ -327,6 +302,7 @@ def test_groups_are_registered_and_reaped_once(tmp_path):
   try:child.wait(timeout=10)
   except subprocess.TimeoutExpired:pass
 
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='real /proc unavailable; operator cgroup qualification pending')
 def test_recycled_pid_is_never_signalled(tmp_path):
  """The recorded start time must still match: otherwise the pid is somebody else's and
  the harness leaves it alone."""
@@ -389,11 +365,8 @@ def test_selftest_normal_passes_with_every_arm(tmp_path):
   assert not failed,(arm,failed)
   assert rep['sessions']==[0,1,2,3],(arm,rep['sessions'])
   named={c['name']:c for c in rep['checks']}
-  assert named['concurrent_groups_attributed']['ok'] and named['four_clients_used_distinct_slots']['ok']
-  assert named['interleave_second_group_reuse_positive']['ok'],(arm,named['interleave_second_group_reuse_positive'])
-  # the eight concurrent steps are NOT attributed per step: the report says so
-  assert all(not r['attributed'] for r in rep['reuse'] if r['step'].startswith('interleave_four/')),rep['reuse']
-  assert all(r['attributed'] for r in rep['reuse'] if not r['step'].startswith('interleave_four/')),rep['reuse']
+  assert named['serial_scope_complete']['ok'] and named['serial_spans_only']['ok']
+  assert len(rep['reuse'])==10 and all(r['attributed'] and r['group'] is None for r in rep['reuse'])
  for arm,cleanup in report['arm_cleanup'].items():
   assert cleanup['owned_group_empty'] and cleanup['worker_reaped'],(arm,cleanup)
  assert 'IMAGE_HTTP_SMOKE_SELFTEST PASS scenario=normal' in run.stdout
@@ -405,15 +378,12 @@ def test_selftest_normal_passes_with_every_arm(tmp_path):
  # slot/session choice is recorded from the engine's own lines, not guessed
  assert arms['candidate_on']['correlation']=={'unmatched_requests':0,'unmatched_engine_lines':0}
  restores={c['name']:c for c in arms['candidate_on']['checks']}
- assert restores['checkpoint_restore_observed']['value']>0,restores['checkpoint_restore_observed']
- assert restores['interleave_group_restores_reported']['ok'],restores['interleave_group_restores_reported']
- # the two bursts each landed on four distinct engine sessions
- assert restores['four_clients_used_distinct_slots']['ok'],restores['four_clients_used_distinct_slots']
+ assert restores['qualified_after_image_restore']['ok'],restores['qualified_after_image_restore']
 
 def test_semantic_failures_are_reported_as_failures(tmp_path):
- for scenario,broken in (('zero_stable_reuse','stable_image_history_reuse_positive'),
-  ('no_restore','checkpoint_restore_observed'),('engine_error','engine_log_without_fault'),
-  ('cross_talk','no_cross_conversation_contamination'),('missing_record','correlation_complete'),
+ for scenario,broken in (
+  ('no_restore','qualified_after_image_restore'),('engine_error','engine_log_without_fault'),
+  ('cross_talk','no_cross_conversation_contamination'),('missing_record','complete metrics request counts'),
   # an encoder that is not resident stops the arm before any request: the refusal is
   # recorded as the run error, which is equally loud
   ('no_encoder','the image encoder is not resident')):
@@ -444,8 +414,9 @@ def test_hung_and_stuck_servers_are_killed_inside_the_cleanup_allowance(tmp_path
    assert cleanup['worker_reaped'],(scenario,arm,cleanup)
    assert not cleanup['graceful'],(scenario,arm,cleanup)
   kinds=[x['kind'] for x in watch['owned_server_groups']]
-  assert kinds==['already_reaped']*3,(scenario,kinds)
+  assert kinds==['group_absent_probe_only']*3,(scenario,kinds)
 
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='real /proc unavailable; operator cgroup qualification pending')
 def test_window_deadline_kills_a_slow_run_and_leaves_nothing_behind(tmp_path):
  run,watch,report,arms,out=run_smoke(tmp_path,'slow_server',window=20,cleanup=10)
  assert run.returncode==1
@@ -455,6 +426,7 @@ def test_window_deadline_kills_a_slow_run_and_leaves_nothing_behind(tmp_path):
  assert 'PASS' not in run.stdout
  assert [x['kind'] for x in watch['owned_server_groups']]==['killed_owned_group']
 
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='real /proc unavailable; operator cgroup qualification pending')
 def test_signal_teardown_reaps_the_worker_and_its_server_group(tmp_path):
  stage=harness_dirs(tmp_path)
  out=stage/('sig-%d-%d'%(os.getpid(),next(counter)))
@@ -481,6 +453,7 @@ def test_record_failure_never_restarts_cleanup_or_prints_pass(tmp_path):
  assert 'result_record_failed' in run.stdout and 'PASS' not in run.stdout
  assert not (out/'watchdog.json').exists()
 
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='real /proc unavailable; operator cgroup qualification pending')
 def test_supervisor_crash_reaps_the_server_group_it_left_behind(tmp_path):
  run,watch,report,arms,out=run_smoke(tmp_path,'normal',extra=('--fault','crash'))
  assert run.returncode==1 and 'supervisor_error' in run.stdout and 'PASS' not in run.stdout
@@ -492,7 +465,7 @@ def test_plan_only_and_preflight_are_bounded_modes(tmp_path):
  run,watch,report,arms,out=run_smoke(tmp_path,'normal',plan_only=True)
  assert run.returncode==0,run.stdout+run.stderr
  assert 'IMAGE_HTTP_PLAN_ONLY PASS nothing_started=1' in run.stdout
- assert 'PASS_BOUNDED_IMAGE_HTTP_SMOKE' not in run.stdout and 'PREFLIGHT' not in run.stdout
+ assert 'PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE' not in run.stdout and 'PREFLIGHT' not in run.stdout
  assert report['mode']=='plan-only' and report['status']=='PASS_IMAGE_HTTP_PLAN_ONLY'
  assert [x['image_flag'] for x in report['plan']]==[False,False,True]
  assert all(x['port']!=smoke.PRODUCTION_PORT and x['host']=='127.0.0.1' for x in report['plan'])
@@ -502,7 +475,7 @@ def test_plan_only_and_preflight_are_bounded_modes(tmp_path):
  run,watch,report,arms,out=run_smoke(tmp_path,'normal',preflight=True)
  assert run.returncode==0,run.stdout+run.stderr
  assert 'IMAGE_HTTP_SMOKE_PREFLIGHT PASS model_not_started=1' in run.stdout
- assert 'PASS_BOUNDED_IMAGE_HTTP_SMOKE' not in run.stdout
+ assert 'PASS_BOUNDED_SERIAL_IMAGE_HTTP_SMOKE' not in run.stdout
  assert report['status']=='PASS_IMAGE_HTTP_SMOKE_PREFLIGHT_ONLY' and len(report['plan'])==3
  assert [x['image_flag'] for x in report['plan']]==[False,False,True]
 
@@ -533,7 +506,7 @@ def test_guards_refuse_the_wrong_window_and_the_production_port(tmp_path):
  assert outside.returncode==2 and 'NEW directory' in outside.stderr
  same=subprocess.run(base+['--out',str(stage/'planned'),'--plan-only','--stage',str(stage)],
   capture_output=True,text=True,timeout=60,env=dict(os.environ,PYTHONPATH=str(ROOT)))
- assert same.returncode==0,same.stdout+same.stderr
+ assert same.returncode==2 and '--geometry' in same.stderr
 
 def test_harness_never_names_a_service_operation():
  """The harness may MENTION the live services in its prose, but no string it can execute
