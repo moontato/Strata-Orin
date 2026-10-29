@@ -43,7 +43,8 @@ def generate(encode):
     temporary = [history(), history(inserted=True, tail=1), history(tail=2), history(inserted=True, tail=3), history(tail=4)]
     system = [history(), history(context='Context version B.', tail=1), history(tail=2),
               history(context='Context version B.', tail=3), history(tail=4)]
-    ordinary = [history(tail=t) for t in range(4)]
+    # User-ending requests preserve ordinary continuation prefixes.
+    ordinary = [history(tail=t)[:-1] for t in range(1, 5)]
     interleaved = [(0, history(tail=0)), (1, history(peer=True)),
                    (0, history(inserted=True, tail=1)), (1, history(tail=1, peer=True)),
                    (0, history(tail=2)), (1, history(tail=2, peer=True))]
