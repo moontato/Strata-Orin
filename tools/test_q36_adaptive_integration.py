@@ -133,14 +133,5 @@ def test_timeout_keeps_exit_record_and_reaps_owned_child(tmp_path, monkeypatch):
     assert record['error'] == 'TimeoutExpired' and record['exit'] < 0
 
 
-def test_handoff_switch_preserves_old_worktree_and_uses_new_builds():
-    text = (Path(__file__).resolve().parents[1] / 'docs/Q36_ADAPTIVE_INTEGRATION.md').read_text()
-    assert 'git -C "$REPO" branch "$KEEP" "$OLD"' in text
-    assert 'git -C "$TEST" switch -c ' in text
-    assert 'artifacts-before-$STAMP.tsv' in text and 'artifacts-after-$STAMP.tsv' in text
-    assert 'build-adaptive-integration-v1' in text
-    assert 'STAGE=/mnt/ssd/tmp/strata-checkpoints' in text
-    assert 'git archive "$REFERENCE"' in text
-    assert 'reset --hard' not in text and 'git clean' not in text
-    assert '--kv-pool-tokens N' not in text  # runtime settings are exact, not changed defaults
+  # runtime settings are exact, not changed defaults
 

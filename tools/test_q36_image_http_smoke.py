@@ -21,7 +21,7 @@ def source_config(tmp_path):
  production port, none of which may reach a temporary config."""
  path=tmp_path/'config.json'
  path.write_text(json.dumps({'model_name':'q36','tokenizer':'/models/q36.gguf','api_key':'secret-value',
-  'host':'100.100.10.3','port':11436,'replicas':2,'vision':{'model':'/models/vit.fp16.gguf',
+  'host':'192.0.2.10','port':11436,'replicas':2,'vision':{'model':'/models/vit.fp16.gguf',
   'mmproj':'/models/mmproj.bin','gpu':True,'elastic':True,'exe':'/opt/vision'}}))
  return path
 
@@ -110,7 +110,7 @@ def test_temporary_config_keeps_the_live_service_out(tmp_path,arm):
  cfg=config_for(tmp_path,arm)
  assert cfg['host']=='127.0.0.1' and cfg['port']==11501 and cfg['port']!=smoke.PRODUCTION_PORT
  text=json.dumps(cfg)
- assert 'secret-value' not in text and '100.100.10.3' not in text and '"replicas"' not in text
+ assert 'secret-value' not in text and '192.0.2.10' not in text and '"replicas"' not in text
  assert '--kv-preallocate' in cfg['args'] and '--kv-checkpoint-interval' in cfg['args']
  assert '--chunk' in cfg['args'] and '--kv-vision-max-tokens' in cfg['args']
 
@@ -275,7 +275,7 @@ def test_plan_checks_required_set(tmp_path):
  assert smoke.plan_checks(report,A())
  for break_,value in (('image_flag',lambda:report['plan'][0].update(image_flag=True)),
   ('production_port',lambda:report['plan'][1].update(port=11436)),
-  ('non_loopback',lambda:report['plan'][2].update(host='100.100.10.3')),
+  ('non_loopback',lambda:report['plan'][2].update(host='192.0.2.10')),
   ('wrong_engine',lambda:report['plan'][0].update(engine=str(tmp_path/'e'))),
   ('short_plan',lambda:report.update(steps=report['steps'][:3]))):
   value();assert not smoke.plan_checks(report,A()),break_

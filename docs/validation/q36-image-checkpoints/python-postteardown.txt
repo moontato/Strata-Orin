@@ -1,4 +1,0 @@
-$ /workspace/.venv-q36-dev/bin/python -m pytest -q tools/test_q36_image_checkpoints.py tools/test_q36_multimodal_cache.py
-exit=0
-...............................                                          [100%]
-31 passed in 82.15s (0:01:22)

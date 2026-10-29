@@ -5,19 +5,13 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
-## Current Qwen3.6 multimodal checkpoint development
+## Qwen3.6 development
 
-The serial HTTP smoke has now passed on Orin. Read
-[docs/Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](docs/Q36_IMAGE_HTTP_SERIAL_HANDOFF.md)
-for the current result, scope and next coding-only integration work. Production
-image checkpoints remain off; HTTP concurrency remains unqualified.
-
-Read [docs/Q36_MULTIMODAL_CACHE_HANDOFF.md](docs/Q36_MULTIMODAL_CACHE_HANDOFF.md)
-first for the active feature branch, portable CPU setup, evidence and Orin safety
-boundaries. Do not run the installer/production Docker entrypoint for coding tests.
-Image-aware checkpoints remain opt-in; the native numerical gate and the bounded serial
-HTTP smoke passed on Orin. See [docs/Q36_IMAGE_HTTP_SMOKE.md](docs/Q36_IMAGE_HTTP_SMOKE.md)
-for scope and limits.
+Feature contracts are documented in docs/Q36_INT8_KV.md,
+docs/Q36_KV_PREALLOCATION.md, docs/Q36_PREFIX_CHECKPOINTS.md and
+docs/Q36_IMAGE_CHECKPOINTS.md. Use docs/Q36_DEVELOPMENT.md for reproducible
+CPU tests. Generated builds, logs, validation dumps and local deployment records
+stay outside tracked source. Preserve opt-in defaults and report untested scopes.
 
 ## Installing Strata for a user
 

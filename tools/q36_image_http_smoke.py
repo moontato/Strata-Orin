@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded HTTP integration smoke for the OPT-IN image-aware Qwen3.6 checkpoints.
 Runs ONLY inside the separately approved operator isolation window, with EVERY file
-under /mnt/ssd/tmp/strata-checkpoints: a TEMPORARY loopback server (own config, own
+under the configured test staging directory: a TEMPORARY loopback server (own config, own
 port, own engine log) against ONE already-built engine at a time. It never touches the
 production config, port, OWUI, service units or any worktree.
 
@@ -11,7 +11,7 @@ reasoning_content and tool_calls, unchanged) are carried into the following requ
 slot/session choice and reuse are read from the ENGINE'S OWN log lines (strata serve,
 KVCACHE, KVREPLAY) correlated with the server's per-request records; the sequence
 covers a stable image history, an earlier-user rewrite after the image, an early
-system rewrite, changed image pixels, a four-client interleave and text-only
+system rewrite, changed image pixels, serial image follow-ups and text-only
 generation after images.
 
 What this test does NOT claim: it does NOT re-check restored-state or logit exactness
@@ -38,14 +38,14 @@ from tools.q36_multimodal_cache_gate import no_models,digest
 try: from q36_image_checkpoint_gate import Budget,CleanupState,teardown,group_kill,group_probe,worker_status
 except ImportError: from tools.q36_image_checkpoint_gate import Budget,CleanupState,teardown,group_kill,group_probe,worker_status
 
-STAGE=Path('/mnt/ssd/tmp/strata-checkpoints')
+STAGE=Path(os.environ.get('STRATA_Q36_STAGE',ROOT/'logs/q36-tests')).resolve()
 QUALIFIED=['--serve','--vision','--max-context','262144','--batch','4','--kv-pool-tokens','524288','--kv','int8',
  '--mtp','2','--batch-mtp','--mtp-sampled','--kv-checkpoint-mib','1024','--kv-checkpoint-interval','1024',
  '--kv-checkpoint-policy','adaptive','--kv-preallocate','--kv-vision-max-tokens','1024','--chunk','512']
 IMAGE_FLAG='--kv-image-checkpoints'
 ARMS=('baseline','candidate_off','candidate_on')
 WINDOW_DEFAULT=1800;WINDOW_MAX=3600;CLEANUP_ALLOWANCE_DEFAULT=20;CLEANUP_ALLOWANCE_MAX=60
-PRODUCTION_PORT=11436;PRODUCTION_HEALTH='http://100.100.10.3:11436/health';PRODUCTION_HOST='100.100.10.3'
+PRODUCTION_PORT=11436;PRODUCTION_HEALTH=os.environ.get('STRATA_Q36_PRODUCTION_HEALTH','http://127.0.0.1:11436/health');PRODUCTION_HOST='127.0.0.1'
 PROGRESS_S=20
 SELFTESTS=('normal','no_encoder','zero_stable_reuse','no_restore','engine_error','divergence','hung_server',
  'cross_talk','missing_record','slow_server','stuck_group')
@@ -1077,7 +1077,7 @@ def main():
  if not a.selftest and not a.plan_only and os.environ.get('STRATA_IMAGE_HTTP_REVIEW_WINDOW')!='1':
   p.error('the HTTP smoke starts a model and encoder, so it runs only in the approved Orin window: set '
    'STRATA_IMAGE_HTTP_REVIEW_WINDOW=1 and bring the live services down through the manager first')
- if not a.selftest and not a.plan_only and (a.server_root.resolve()!=ROOT or ROOT!=Path('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache')):
+ if not a.selftest and not a.plan_only and (a.server_root.resolve()!=ROOT or ROOT!=Path(__file__).resolve().parents[1]):
   p.error('only the approved window, with STRATA_IMAGE_HTTP_ROOT set to the read-only server checkout')
  if 'baseline' in arms and a.baseline_engine is None:p.error('--baseline-engine required for the baseline arm')
  if getattr(a,'fault',None) and not a.selftest:p.error('fault injection requires --selftest')

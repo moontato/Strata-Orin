@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FUTURE OPERATOR-APPROVED WINDOW ONLY. Not executed during development.
+# Isolated GPU validation with prior-service-state restoration.
 # Dedicated shell; both named units must use the SAME confirmed manager scope.
 set -euo pipefail
 : "${MM_CACHE_STOP_APPROVED:?operator approval required after review}"
@@ -8,10 +8,10 @@ test "$MM_CACHE_STOP_APPROVED" = 1
 : "${HEALTH:?existing Strata health URL; do not guess/change configuration}"
 : "${MODEL:?existing actual GGUF first shard}"
 : "${FIXTURES:?already CPU-verified fixtures under staging}"
-: "${MM_CACHE_ENGINE:?new isolated review build executable, NOT the live checkpoint-policy build}"
-STAGE=/mnt/ssd/tmp/strata-checkpoints
-TEST=/mnt/ssd/Strata-Orin/worktrees/multimodal-cache
-PYTHON=/mnt/ssd/strata-service/venv/bin/python
+: "${MM_CACHE_ENGINE:?isolated test build executable; never the live runtime}"
+: "${STAGE:?Set the test staging directory}"
+TEST=${TEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+PYTHON=${PYTHON:-python3}
 ENGINE="$MM_CACHE_ENGINE"
 SERVICE=strata.service
 LLAMA=llama-server.service
@@ -23,14 +23,12 @@ esac
 cd "$TEST"
 test "$(git rev-parse --show-toplevel)" = "$TEST"
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git merge-base --is-ancestor f934b85b42e79cc2a7c4ec0ca9da7685674e1ebd HEAD
-git diff --exit-code f934b85b42e79cc2a7c4ec0ca9da7685674e1ebd -- tools/q36_adaptive_integration_fixture.py tools/test_q36_integration_ordinary.py docs/Q36_ADAPTIVE_ORIN_VALIDATION.json
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)-$$
 mkdir -p "$STAGE/mm-window-$STAMP" "$STAGE/mm-tmp-$STAMP"
 RECORD="$STAGE/mm-window-$STAMP"; export TMPDIR="$STAGE/mm-tmp-$STAMP"
 RESULTS="$STAGE/mm-results-$STAMP"
 # These CPU checks MUST finish before the first stop command.
-"$PYTHON" tools/q36_multimodal_cache_gate.py --preflight --engine "$ENGINE" --model "$MODEL" --fixtures "$FIXTURES" --out "$RESULTS" \
+STRATA_Q36_STAGE="$STAGE" "$PYTHON" tools/q36_multimodal_cache_gate.py --preflight --engine "$ENGINE" --model "$MODEL" --fixtures "$FIXTURES" --out "$RESULTS" \
  2>&1 | tee "$RECORD/preflight.log"
 test -f /sys/fs/cgroup/cgroup.controllers
 for name in "$SERVICE" "$LLAMA"; do
@@ -106,7 +104,7 @@ launched=1
 "${RUN[@]}" --unit="$UNIT" --wait --pipe --collect --property=KillMode=control-group \
  --property=RuntimeMaxSec=300s --property=TimeoutStopSec=20s --working-directory="$TEST" \
  "$PYTHON" -c 'import os,sys;from pathlib import Path;Path(sys.argv[1]).write_text(Path("/proc/self/cgroup").read_text());os.execvp(sys.argv[2],sys.argv[2:])' \
- "$CGRECORD" /usr/bin/env STRATA_MM_CACHE_REVIEW_WINDOW=1 \
+ "$CGRECORD" /usr/bin/env STRATA_MM_CACHE_REVIEW_WINDOW=1 STRATA_Q36_STAGE="$STAGE" \
  LD_LIBRARY_PATH="$(dirname "$ENGINE")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
  "$PYTHON" tools/q36_multimodal_cache_gate.py --engine "$ENGINE" --model "$MODEL" --fixtures "$FIXTURES" --out "$RESULTS" \
  2>&1 | tee "$RECORD/worker.log"

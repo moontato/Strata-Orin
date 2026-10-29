@@ -78,4 +78,4 @@ def test_no_service_or_live_worktree_operations_in_worker():
     assert 'systemctl' not in source and 'pkill' not in source
     assert 'os.WNOWAIT' in source and 'next_progress = started + 20' in source
     assert 'deadline = time.monotonic() + 300' in source
-    assert 'worktrees/multimodal-cache' in source and 'strata-checkpoints' in source
+    assert "os.environ.get('STRATA_Q36_STAGE'" in source and 'REVIEW = ROOT' in source

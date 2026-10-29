@@ -32,8 +32,10 @@ __global__ void exchange(volatile Doorbell* p, unsigned long long timeout) {
 }
 
 int main() {
-    cudaDeviceProp prop{};
-    if (!ck(cudaGetDeviceProperties(&prop, 0), "device properties")) return 1;
+    int clock_rate_khz = 0;
+    if (!ck(cudaDeviceGetAttribute(
+        &clock_rate_khz, cudaDevAttrClockRate, 0),
+        "device clock rate")) return 1;
     // Managed allocations are tested with synchronization at every ownership
     // transition. concurrentManagedAccess=0 forbids the doorbell use case.
     int* managed = nullptr;
@@ -71,7 +73,7 @@ int main() {
     *host = {};
     if (!ck(cudaHostGetDevicePointer(&device, host, 0), "mapped alias")) { cudaFreeHost(host); return 1; }
     strata::platform::mapped_memory_release();
-    exchange<<<1, 1>>>(device, (unsigned long long) prop.clockRate * 10000); // 10 seconds
+    exchange<<<1, 1>>>(device, (unsigned long long) clock_rate_khz * 10000ULL); // 10 seconds
     ok = ck(cudaGetLastError(), "doorbell launch");
     volatile Doorbell* poll = host;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);

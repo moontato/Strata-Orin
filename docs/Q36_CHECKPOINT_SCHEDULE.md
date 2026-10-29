@@ -1,10 +1,7 @@
-# Independent schedule-matched checkpoint oracle (developer gate)
+# Independent schedule-matched checkpoint oracle
 
-Built on vision-qualified `3f3bc4e85e1d44b3501f0dcb8cd73471632753cf`.
-This changes no numerical kernel, sampler, production setting or default policy.
-CUDA/Orin compilation and model execution are **pending**, not established by the
-local CPU tests. The isolated projection investigation is closed absent new,
-contradictory evidence; this is a restoration gate, not another matrix study.
+Developer validation uses real Engine processing under the recorded producer/suffix
+schedule. It is separate from serving and adds no default numerical behavior.
 
 ## Native implementation
 
@@ -65,32 +62,8 @@ failure, crash, or a PASS marker is not successful negative-control coverage.
 Never enable this developer flag in serve. Unknown controls/test combinations
 are rejected. It adds no new serving API.
 
-`tools/q36_checkpoint_schedule.py --fixture FILE --out audit.json` audits actual
-saved rendered token prefixes per case/slot without loading a model. In the old
-fixture turn 2 was a rewrite; only turn 3 extended all prior rendered IDs. Neither
-case names nor an appended message proves token-prefix continuation.
 
-## Measurements and scope
-
-`SCHEDULE_MEASURE` reports replayed/reused tokens, bank checkpoint-copy bytes/us,
-Serve prefill ms and BGEN-to-first-token admission latency ms, split by declared
-warmup/steady phase. The reference and host snapshots are outside these timers.
-Checkpoint snapshots inside the tested request ARE timed: diagnostic latency is
-not production serving performance. Physical allocation/attempt counters and bank
-bytes must remain unchanged after readiness; reset must leave zero mappings.
-Startup engine warmup stays enabled and its own log must be preserved. No speedup
-is claimed. An adaptive-vs-fixed difference needs the later staged Orin gate.
-
-## Local versus pending
-
-CPU metadata tests cover partial producer calls, original declared length/head,
-chunk boundaries, original IDs, same-slot/cross-slot recipe inheritance,
-ordinary-singleton/suffix MTP coverage and the original 16384/29/22 call recipe.
-A second CPU test executes the actual native oracle include against a small
-shape-sensitive Engine/Serve and CUDA-IO stand-in, exercising positive matching
-and visible different schedules plus three payload-corruption controls. This
-compiles and runs the **gate**, NOT the real Engine/Serve CUDA translation unit.
-The ordinary allocator/preallocation, vision staging/leases and sampled-MTP CPU
-tests are separate. The export logs identify exactly which were run. No CUDA,
-HIP, SYCL or Orin model validation is claimed, and this is not ready for upstream
-review/deployment until applicable backend builds and hardware gates pass.
+`tools/q36_checkpoint_schedule.py --fixture FILE --out audit.json` classifies saved
+rendered-token prefixes per case and slot without starting a model. Case names
+alone never establish append-only behavior. Native gates, CPU scaffolds and serial
+HTTP checks have different scopes; report them separately.

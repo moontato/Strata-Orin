@@ -1,5 +1,0 @@
-RESTORE_OBSERVATION BASELINE PASS placement=1 harness=0 exit=0
-RESTORE_OBSERVATION_NEGATIVE PASS observe_at_copy_time placement_exit=1 harness_exit=-6
-RESTORE_OBSERVATION_NEGATIVE PASS fire_before_select placement_exit=1
-RESTORE_OBSERVATION_NEGATIVE PASS guard_removed exit=1
-RESTORE_OBSERVATION_NEGATIVE PASS host-only boundary controls; NOT GPU qualification

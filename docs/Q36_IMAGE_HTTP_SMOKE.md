@@ -1,106 +1,48 @@
-# Current serial HTTP qualification status
+# Serial image-checkpoint HTTP validation
 
-The real Orin serial HTTP smoke PASSED: three arms, ten requests each; positive
-controlled after-image checkpoint restoration; cleanup and original vision service
-restoration verified. Production image checkpoints remain disabled. Concurrency
-and actual OWUI savings are NOT qualified by this smoke. The current continuation
-instructions and exact evidence hashes are in
-[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md).
-Earlier status text and execution recipes below are historical and superseded;
-do not run an old preparer or repeat a model window from them.
+`tools/q36_image_http_smoke.py` runs three sequential temporary loopback-server
+arms: baseline, candidate with image checkpoints off, and candidate with the flag
+on. Each arm uses its own config, port and logs. Production config credentials,
+bind address and replica settings are not copied into temporary configs.
 
-# Historical preparation notes (superseded by the completed serial run)
+There are ten serial requests per arm: three audited eligible rewrite requests,
+then stable image history, an earlier-user rewrite, a system rewrite, changed
+pixels and text after images. Assistant content, reasoning content and tool calls
+returned by the API are carried unchanged into later requests. Short natural
+histories may reuse zero; positive restore is required only for the eligible,
+actual-tokenizer-audited rewrite controls.
 
-The original preparation notes below describe an earlier proposed run, not the
-completed serial run. Use the current handoff above for the actual ten-request
-scope, results and limits. No production default or native code changed.
+Response usage and complete metrics are checked against bounded engine-log byte
+spans. Serial attribution requires one unambiguous summary with matching token
+counts; restore provenance must belong to that request. A logical request that
+yields and resumes during concurrent admission can emit multiple native summaries.
+That requires a scheduler-aware test; this serial harness does not deduplicate
+those events or claim concurrent HTTP coverage.
 
-The old e57c7a37 transfer and its placeholder-filled commands are superseded.
+The whole-worker supervisor enforces one monotonic execution deadline and one
+cleanup allowance. Owned groups are identified conservatively and reaped; missing
+ownership is not permission to signal a recycled process. A manager-owned enclosing
+cgroup is still required where the tool's cleanup contract calls for one.
+Plan/preflight/selftest markers cannot qualify an actual model run.
 
-## Corrections
+## Inputs and modes
 
-- Fetch `/metrics?requests=all` through a proxy-free loopback client. Check all
-  request counts and the multiset of prompt sizes against response usage. Metrics
-  arrival order and prompt size do not establish individual request identity.
-- Serial requests have bounded engine-log byte spans. A serial span must have
-  exactly one solo/batch summary matching response usage. Duplicate, partial, late,
-  wrong-slot or mismatched evidence fails closed. The actual run excludes concurrent
-  bursts; those require a separate scheduler-aware contract.
-- A restored checkpoint belongs to a serial request only when its event precedes
-  that request's sole summary, names that session and matches its reused tokens.
-  Read the real stderr `Qwen3.6 prefix checkpoint:` line: stdout KVCACHE/KVREPLAY
-  is normally consumed internally by the Python server. Missing cache metadata
-  stays unknown. No session-wide association is used by the real worker.
-- The real server command receives a config **filename**, not a Python dictionary.
-  Each arm has its own loopback listener, config/log files and TMPDIR in staging.
-- Preserve returned assistant content/reasoning/tool fields, including null and
-  empty values. Save the public request/response JSONs for inspection. No tool
-  execution is claimed; semantic image correctness is not graded by this smoke.
-- Short natural image-history reuse, second-burst reuse and four occupied slots
-  are observations. Four simultaneous clients do not guarantee four occupied slots.
-- Positive reuse is checked separately using the already GPU-tested public
-  canned-history rewrite, transported as actual HTTP bodies with data-URI PNGs.
-  This does not label the canned history as generated model history.
+`--engine`, `--baseline-engine`, `--model`, `--source-config`, `--server-root`,
+`--geometry` and a fresh `--out` are explicit inputs. The server root must be the
+checkout, and output must stay within `STRATA_Q36_STAGE` (default logs/q36-tests).
+`--plan-only` writes only a plan; `--preflight` validates bindings without starting
+an encoder/model/listener. Real execution additionally requires
+`STRATA_IMAGE_HTTP_REVIEW_WINDOW=1` and an independently arranged isolated window.
+That flag does not stop services or prove the host is idle.
 
-## CPU-only actual-GGUF preparation
+`tools/q36_image_http_preflight.py` consumes an explicit fixture-state file and
+config, verifies their source/input hashes, prepares actual-GGUF HTTP geometry,
+and runs the CPU plan/preflight modes. Fixture state binds source checkout/commit,
+model, candidate build/hash, qualified native fixtures and diagnostic encoder
+fixtures. It is generated per test, not tied to an installed service's paths or a
+specific binary hash in source. `q36_image_http_geometry.py` checks tokenization,
+image identity and legal after-image checkpoint opportunities against those inputs.
 
-Run `tools/q36_image_http_preflight.py` with the service Python after placing this
-package under `/mnt/ssd/tmp/strata-checkpoints`. The script starts no listener,
-encoder or native engine and does not operate services. It uses the existing
-`image-checkpoint-fixture-state.json`, qualified PNG/SVE inputs, native fixture
-manifest and actual GGUF/template. It verifies the candidate hash, Orin source
-commit and all three protected-file hashes.
-
-The public requests are converted to their exact data-URI HTTP form, then the real
-OpenAI conversion and `Service.prepare` execute with frozen, previously encoded
-SVE inputs. Actual resulting token IDs and image keys must equal the GPU-tested
-fixture. No synthetic tokenizer or image-row count fallback is allowed.
-
-The audit mirrors `Q36ImagePlan` for the first fresh four-payload request with
-empty learning, chunk512 and interval1024. It considers only actual legal
-callbacks, respects complete image boundaries, and requires a saved checkpoint
-AFTER the image and before each genuine rewrite divergence. Known qualified
-geometry is image_end2112, LCP3671 and best retained point3584. These numbers are
-recomputed, not treated as permission to fabricate a pass.
-
-Prepared bodies, IDs, source configuration, actual encoder binary, candidate and
-baseline binaries, source files and prior input evidence are hash-bound. GGUF and
-projector identities retain path/size/mtime; the 23 GB GGUF is not copied or fully
-hashed. Inputs are rechecked by both the plan/preflight worker and real worker.
-HTTP response prompt sizes and actual restored reuse must match the audit.
-
-A minimal source-config snapshot contains only the vision fields, tokenizer path
-and model name. It carries no API key, live listener, replicas or production args.
-The live configuration is read but never written.
-
-Actual Orin CPU preparation and the serial window were subsequently completed.
-Do not repeat a model window solely to reproduce this result.
-
-## Bounded real-window design (not an instruction to execute)
-
-The completed run used the deployed native engine, candidate flag off, and
-candidate flag on, all with the same reviewed Python server. Each arm required a
-resident encoder and `images=true`. It executed ten serial requests per arm:
-controlled rewrites and natural-history observations. Concurrent bursts were not
-included; generated histories retained responses from their own conversation.
-
-Each arm has an owned process group. A still-unreaped leader reserves its PID/PGID
-until residual group cleanup is signalled. If the leader is already lost, only a
-presence probe is allowed; a live or unprovable group is a FAILURE, never empty.
-Malformed registry entries fail closed. SIGINT/SIGTERM/SIGHUP use the existing
-single-budget watchdog and persistent cleanup state. An outer operator-owned
-cgroup and proof of emptiness before restoring production remain mandatory.
-The harness itself performs no service-manager operations.
-
-The real stdout marker is `IMAGE_HTTP_SMOKE PASS` with explicit tensor/OWUI limits;
-only the supervisor may print it after the correct mode and complete cleanup.
-`IMAGE_HTTP_SMOKE_PREFLIGHT PASS` starts no model and is not a GPU result.
-
-## Local evidence and limits
-
-See the serial handoff and the focused tests. Loopback stand-ins are not models
-or encoders. The reviewer host skipped six /proc-dependent lifecycle tests; the
-coding host subsequently ran all 82 focused tests without skips. The completed
-native GPU oracle was not repeated or weakened. No C++/CUDA, include, native
-tests or CMake file was changed. Concurrency, broader encoder co-residency and
-actual OWUI savings remain unqualified. Production was not switched.
+This HTTP test does not read GPU tensors or repeat the independent native oracle.
+Its results describe that bounded serial case, not broad semantic vision quality,
+all frontends or throughput under concurrent HTTP load.

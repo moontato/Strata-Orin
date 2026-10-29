@@ -1,4 +1,4 @@
-"""Execute ONLY the documented shell against FAKE service/cgroup/health commands.
+"""Execute ONLY the managed test-window script against FAKE service/cgroup/health commands.
 No real services, CUDA, encoder or model operation. Fixtures remain temporary.
 """
 import os
@@ -47,7 +47,7 @@ elif cmd=='start':
  event('start-'+key);(r/key).write_text('active')
 else:raise AssertionError(args)
 '''
-class Handoff(unittest.TestCase):
+class Window(unittest.TestCase):
     def run_window(self,mode='ok',llama=True):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'bin').mkdir();(root/'stage').mkdir()
@@ -58,12 +58,11 @@ class Handoff(unittest.TestCase):
             (root/'strata').write_text('active');(root/'llama').write_text('active' if llama else 'inactive')
             for name in ('systemctl','systemd-run','curl','pgrep'):
                 path=root/'bin'/name;path.write_text(MOCK);path.chmod(0o700)
-            source=re.findall(r'```bash\n(.*?)```',(ROOT/'docs/Q36_VISION_PREALLOCATION.md').read_text(),re.S)[-1]
-            source=source.replace('SCOPE=system # confirmed actual scope: system OR user, not a guess','SCOPE=user # MOCK ONLY')
+            source=(ROOT/'tools/q36_vision_preallocation_window.sh').read_text()
             source=source.replace('test -f /sys/fs/cgroup/cgroup.controllers',': # MOCK host preflight')
             source=source.replace('seq 1 90','seq 1 1').replace('sleep 2','sleep 0')
             script=root/'window.sh';script.write_text(source)
-            env=dict(os.environ,MOCK_ROOT=str(root),MOCK_MODE=mode,TEST=str(root),STAGE=str(root/'stage'),MODEL=str(root/'model'),MMPROJ=str(root/'mmproj'),
+            env=dict(os.environ,SCOPE='user',HEALTH='CPU_MOCK_NO_HTTP',MOCK_ROOT=str(root),MOCK_MODE=mode,TEST=str(root),STAGE=str(root/'stage'),MODEL=str(root/'model'),MMPROJ=str(root/'mmproj'),
                      PYTHON=sys.executable,VISION_STOP_APPROVED='1',PATH=str(root/'bin')+':'+os.environ['PATH'])
             run=subprocess.run(['bash',str(script)],env=env,capture_output=True,timeout=30)
             events=(root/'events').read_text().splitlines() if (root/'events').exists() else []

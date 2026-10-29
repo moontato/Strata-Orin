@@ -1,405 +1,57 @@
-# Image-aware Qwen3.6 prefix checkpoints — opt-in; Orin numerical and serial HTTP gates passed
+# Qwen3.6 image-aware prefix checkpoints
 
-**2026-10-28 review blockers RESOLVED, and the bounded numerical Orin gate PASSED.**
-Origin publication and coding-server CPU validation are complete. Review found (a) a
-restored-state device-delta observation that could read another slot's scalar and (b) a
-gate whose advertised absolute budget was not enforced. Both are fixed and
-regression-tested on this host; see [Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md)
-for the harness, the six bounded-supervisor scenarios and the mutation controls that fail
-when either fix is reverted.
+`--kv-image-checkpoints` is opt-in. It extends prefix restoration to eligible
+image histories with strict preallocation, a checkpoint budget, `--vision`,
+`--chunk 512` and an explicit combined image cap no larger than 1024 rows.
+The flag remains off by default.
 
-The numerical window has since been run on Orin: `PASS_BOUNDED_INDEPENDENT_IMAGE_CHECKPOINT_GATE`
-with `IMAGE_CHECKPOINT_MEASURE … independent=1 exact=1` on all 17 measurement lines, the
-constant-allocation proof `KV_PREALLOCATION_MODEL PASS physical_allocations=3924`, and the
-corrupted-conviction arm refused at `IMAGE_CHECKPOINT_FAILURE comparison=restored exact
-state required` (see **What the Orin numerical window measured** below). That qualifies the
-**engine and oracle only**. A separate bounded serial HTTP smoke subsequently passed
-on Orin with a resident encoder and three ten-request arms; it did not qualify
-HTTP concurrency or measure actual OWUI savings. See
-[Q36_IMAGE_HTTP_SERIAL_HANDOFF.md](Q36_IMAGE_HTTP_SERIAL_HANDOFF.md) for evidence
-and limits. The flag stays off by default. Any new model window still needs a
-separately approved operator isolation window.
-
-Local parent: **765068db267f8cd8f846f8ef45c9cc94f90075d5**, on4130bdfd.
-This is a continuation of the multimodal-cache diagnostics, not the older
-projection/adaptive fork. No kernel/sampler/tolerance, OWUI/frontend matching,
-prompt rewriting, deployment, configuration or service operation is part of this
-change. **`--kv-image-checkpoints` defaults OFF**, including after building it.
-
-## Evidence, without an unsupported routing diagnosis
-
-Operator reports: diagnostics CUDA build and15 CPU CTests passed; native
-OFF/ON diagnostic state/logit/output/schedule neutrality passed. Constructed
-image prefixes reused1060 and1072 cells, including cross-slot. Real rendered
-follow-ups changed their previous token prefix and reused zero. Actual OWUI
-follow-ups changed message0 content too, but precise token divergence and possible
-checkpoint savings for those requests are **UNMEASURED**. None establishes an
-exact-prefix routing defect or implicates fetch_url specifically. The tests here
-separate public rendered histories, constructed controls and actual OWUI evidence.
-The completed projection investigation is neither rerun nor used as a tolerance.
-
-## State, eligibility and reference design
-
-1. Exact complete-state prefix matches remain FIRST, including pinned cross-slot
-   donors. With the new flag, actual image bytes/geometry authorize that path too;
-   a changed advisory key alone does not invalidate identical actual inputs.
-2. Only if no exact donor serves the request may GENI/BGENI discover an image-aware
-   checkpoint. Actual token LCP is mandatory. Image semantics can only REDUCE it.
-   Complete images before the boundary must have identical FP32 embedding BYTES,
-   width, row count, grid, token-cell placement and rotary start. No hash/key alone
-   grants permission. Images after the boundary are not part of its permission;
-   changed/added later images cannot authorize a longer prefix. An incomplete
-   image is never an eligible endpoint.
-3. Each payload has a bounded host proof: immutable original image bytes/layout,
-   consumed end, retained rotary delta and explicit readiness. GPU payload remains
-   the existing packed GDN recurrence, convolution histories and last hidden seed;
-   main+MTP KV codes/scales use the original charged session planes. Cross-slot
-   restore copies EVERY prefix plane and eligible inherited payload. Same-slot
-   rewind keeps unchanged earlier KV, restores recurrence/seed, and retires later
-   records. Metadata is published only after transfer+stream synchronization.
-4. Capture readiness is not inferred from `!geni` removal. A fresh empty prefix,
-   a qualified restored prefix, or an exact prefix whose contiguous seeded end
-   still equals reuse may extend readiness. The suffix must take the existing
-   prompt/MTP path (`fresh>1` or restored singleton). Ordinary decode cannot extend
-   this provenance. Unseeded exact continuations conservatively do not capture.
-5. Image restore is NOT the old text restore's clear-and-forget behavior: it
-   reconstructs complete-prefix image metadata and CPU/device rotary delta before
-   publishing the restored state. Incoming image rows/table are uploaded from the
-   independently validated full NEW request before suffix processing. Shared
-   staging views are never copied from a donor or captured as persistent state.
-6. Owner availability retains generation, epoch, backing, residency, decoding,
-   exact donor-pin and destination-lease checks. Donors are pinned BEFORE admission
-   can reclaim idle owners. Image full-state donors now retain that pin THROUGH
-   admission/copy too. Discovery does not borrow arbitrary active owners. Reset,
-   replay/rewind and eviction invalidate/retag the corresponding image proofs with
-   their original checkpoint metadata. No new checkpoint authorization by learning.
-
-### Legal boundaries without changing numerical schedules
-
-Only existing process callbacks may capture. No chunks are split or calls
-shortened. An interval/learned target inside a picture maps to the last legal
-callback at/before it; if none exists, defer to the first legal complete callback.
-This deliberately permits an early safety point BELOW interval, rather than
-losing all pre-image reuse. At most two middle banks use learned/fallback legal
-anchors; the final bank rolls. One-payload budgets retain the single safety bank.
-At512-token chunks, image cells700..1723 and interval1024, safety512 and middle2048
-are both useful;1024/1536 are forbidden. If the first image spans50..1073, the
-first possible legal callback is1536. A divergence earlier than that may
-legitimately yield zero reuse: a missing past state cannot be invented.
-
-### Cancellation and transitions
-
-Before-image/outside-image cancellation keeps only the actual read prefix and its
-own positional offset; legal earlier checkpoints may survive. Cancellation inside
-an image invalidates/reset that owner AFTER ending the admission, discarding its
-proofs and partial image state. Error paths retain existing quiesce/reset rules.
-Prefill views retire without clearing another slot's offset; new uploads drain
-queued work before reuse. Exact prefix, image->text, four-slot interleaving and
-sampled-image MTP exclusion remain supported as before. The sampled-image guard is
-source-identical; this feature does not implement sampled-image speculation.
-
-## Memory and defaults
-
-Activation requires strict preallocation/vision/serve, a checkpoint budget,
-chunk512 and an explicit combined image-row cap **<=1024**. The qualification gate
-requires the deployed cap1024. Fixed staging remains the SAME allocation; rows,
-M-RoPE and mapping buffers never grow after readiness. No new GPU scratch,
-fifth payload, layout, capacity function or physical handle allocation is added.
-The four-payload ceiling,1GiB configured budget and shared524288/context262144
-bank calculation are unchanged (3924 pages /8,229,224,448 bank bytes if granularity
-is2MiB). That is a calculation, not a new measurement.
-
-Actual bytes live in shared immutable HOST objects. Per slot, at most four
-checkpoint identities plus one live identity; an in-flight request can add one
-more globally. Thus <=21 distinct1024-row byte arrays, each `1024*n_embd*4`, plus
-<=21*1024 fixed-size image descriptors and small per-slot plans/proofs. At width2048
-this bounds additional retained/in-flight proof bytes by168MiB plus about1.2MiB
-of descriptors/control storage (calculated payloads, not measured allocator RSS).
-Request parsing/upload vectors and host comparison snapshots are separate. The
-planner's transient callback list is <=512 entries at this geometry. Proofs share
-arrays, not one copy per capture; reset/eviction retires their references. Fresh
-existing UMA/cgroup headroom checks still see actual host/encoder residency. The
-encoder is external; this gate does not requalify its workspace/co-residency.
-
-Flag OFF retains old image checkpoint bypass. Text checkpoint policy/defaults,
-fixed image staging, numerical methods/kernels and sampler restrictions stay
-unchanged. New CPU descriptors simply expose already-calculated grid/position
-values; no parser position arithmetic changed. Host default routing is compared
-to the pre-feature selector over1000 cases. This is NOT CUDA default-output/SASS
-parity; actual old/new CUDA qualification remains pending.
-
-## Independent correctness oracle
-
-Restored-state observation has an explicit boundary contract
-(`src/qwen35/q36_restore_observation.inc`): copy state -> request observation ->
-`select(dst)` -> fire observation -> upload the incoming rows/table -> process the
-suffix. `checkpoint_restore` observes in place after selecting its destination;
-`copy_session` defers to the caller's selection. The device rotary offset is a single
-scalar bound to the current slot, so observing a non-current destination throws and is
-counted. The gate asserts at every observation that the observed slot IS current, that
-the engine sits exactly at the restored boundary, that no observation was refused, and
-that observations match the producers one-for-one; each observation, not only the
-last, is compared against the independently replayed schedule. Host evidence and the
-mutation controls that re-create the defect live in
-[Q36_IMAGE_CHECKPOINT_REVIEW.md](Q36_IMAGE_CHECKPOINT_REVIEW.md).
-
-`--kv-image-checkpoint-test FILE` records original FULL declared token calls,
-original SVE file names/keys, consumed callback ends and checkpoint-suffix/MTP/head
-semantics. Original unconsumed tails remain in the recipe. A captured prefix in
-the middle of a call must be replayed with that original declared length and stop
-callback, not as a shorter call. No process/forward/GEMM algorithm is changed.
-
-For every request, an isolated existing reference slot starts EMPTY. It rereads
-original SVE files, rebuilds positions with the unchanged LEGACY image builder
-(independent of candidate's bounded builder/proof/delta helper), uploads ORIGINAL
-inputs, and executes real process calls under the recorded schedule. Strict
-image hashes are independently derived from actual rows then original keys.
-Retained delta is separately reconstructed from the legacy M-RoPE table. The
-reference NEVER restores/copies a checkpoint or uploads candidate snapshots.
-Other idle slots are pinned while its admission runs; no fifth GPU state is used.
-
-Checks are EXACT: restored boundary AND final GDN/conv/hidden seed, main KV,
-every initialized MTP KV code/scale, CPU position/token history/complete-image
-metadata, CPU+device rotary delta, and full final logits (finite). Transient logits
-at a headless checkpoint, token staging and dead scratch are not persistent
-state. A corrupted convolution payload MUST fail the restored-state comparison,
-not merely exit nonzero for another reason. Different OFF/ON chunk histories may
-produce different outputs; each arm must pass its OWN independently reconstructed
-matching schedule. Diagnostic neutrality alone is not an oracle.
-
-Native cancellation checks also compare the valid pre-image cancelled prefix to
-an empty-state replay, invalidate inside-image state, exercise operation-owned pin
-eligibility and verify reset invalidation. Physical allocation/attempt/release
-counters and the image staging pointer must remain constant; final mappings zero.
-
-## Bounded gate and interpretation
-
-The public fixture includes an actual-tokenizer/template/Service.prepare history
-with an earlier USER message changed AFTER a complete historical image. First two
-requests are warmup; the steady rewrite (including cross-slot) MUST restore a
-positive after-image boundary. Preparation fails if actual rendered IDs cannot
-support that claim. Native controls isolate before-image boundaries, exact
-continuation/full-state donor preference, changed pixels with stable keys,
-changed grid and placement. Grid manipulation is explicitly synthetic, not an
-encoder result. Prior real rendered header/reasoning follow-ups are preserved as
-observed controls; zero reuse is reported honestly.
-
-The gate runs as a **supervisor + worker** pair. The supervisor starts the worker in
-its own process group with a shared absolute CLOCK_MONOTONIC deadline and, on expiry,
-SIGKILLs that whole group: the execution budget (default300s, explicit maximum420s,
-`--budget-seconds`) covers synchronous preflight hashing, native execution, log
-reading, comparisons and final report writing, not just the native children. Native
-arms stay inside that group so their descendants are reachable too. Bounded cleanup
-uses ONE absolute **cleanup allowance** (`--cleanup-seconds`, default20s, maximum60s)
-that covers waiting for the worker, killing the owned group, reaping it and proving it
-empty; it is never re-armed, so a run cannot spend twice the allowance in teardown.
-`watchdog.json` records `owned_group_empty`, `worker_reaped` and `cleanup_complete`.
-The worker also
-keeps cooperative budget checks around every phase. Only the supervisor prints a
-verdict, and its pure `verdict()` refuses a killed worker, a completion at/after the
-deadline, a nonzero exit, a non-empty owned group, a worker that was never reaped, an
-interrupted supervisor or a non-PASS report — a late success is never accepted.
-SIGINT, SIGTERM and SIGHUP delivered to the supervisor are recorded and routed through
-that SAME teardown: the owned worker and group are killed, reaped and verified, the run
-is written up as a failure (`interrupted_signals`, `passed=false`) and the exit is
-nonzero; a signal can never skip the record or turn into a pass. The group is only ever
-signalled while its leader is still unreaped (the leader's exit status is read with
-`WNOWAIT`), and the leader is reaped before the final emptiness proof, so a recycled
-PGID can never be signalled by accident. Cleanup progress is persistent per run: the
-deadline is created once and shared by the normal, signal and fault paths, teardown is
-idempotent, and once the leader is reaped the former group is only probed, never
-signalled again. If the result itself cannot be written (disk full, I/O error), the run
-reports `stage=record action=failed` on stderr, prints
-`FAIL result_record_failed_<type>`, exits nonzero and never restarts cleanup or reports a
-pass. The accepted report status also depends on the mode:
-`--preflight` can only report `PASS_PREFLIGHT_ONLY` and prints
-`IMAGE_CHECKPOINT_PREFLIGHT PASS model_not_started=1`, never the numerical-gate
-marker. `--selftest normal|slow_preflight|hung_child|
-slow_postprocess|late_success` exercises exactly these paths with fake children and a
-throwaway staging directory; `--fault record|crash`, accepted only together with
-`--selftest`, injects the two recording faults (a watchdog write that fails after
-cleanup, and a supervisor failure after the worker was reaped). Never run the worker
-alone: without the supervisor the run has only cooperative bounds. Progress is emitted for
-preflight rows, startup/every20s and each native turn. First unexpected failure stops
-the sequence. It signals/reaps only the groups it created (the worker's own session and
-the arms inside it), so the operator must still own and reap the enclosing cgroup;
-`watchdog.json` restates this as `operator_cgroup_required=true`. No service control,
-encoder, HTTP listener, projection matrix or
-sampling suite is launched. Fixtures <=24 turns, each <=6144 expanded cells.
-
-`IMAGE_CHECKPOINT_MEASURE` reports reused/replayed cells, checkpoint boundary,
-prefill_ms, request_ms, checkpoint copy_us/bytes and metadata_us. Prefill includes
-capture copies; request includes input parsing, staging, identity work and first
-token. copy_us measures synchronized payload/KV transfers; metadata_us measures
-proof construction and selected identity searches (NOT all host overhead).
-Reference work/comparison is OUTSIDE those request timings. Compare steady public
-fixture measurements only as **synthetic performance**, never actual OWUI gains
-or a general speedup. Actual OWUI token divergence/savings remain UNMEASURED.
-
-## What the Orin numerical window measured (2026-10-28, operator window)
-
-Run in the existing multimodal-cache worktree with all build staging under
-`/mnt/ssd/tmp/strata-checkpoints`: imported source tip `96d1a00b11c8393179c49e24696efee29a3eaa66`
-applied onto the actual Orin HEAD `549df89938fe0b2c23c70f2c4ce76ea33d6bedd4` (the f934
-follow-ups preserved, their hashes recorded as `33be6fe8…`, `17f1afa2…`, `7aed1065…`),
-CUDA 13.2 / SM87 build, candidate binary `eb5ef5de8f7f36de9bd25206d59ec2161a4fb5548e3f74246483a344f8544c3f`,
-17 CTests, then the bounded gate under a 420 s execution budget and a 20 s cleanup
-allowance: `worker_reaped=1 owned_group_empty=1 cleanup_complete=1 passed=1`.
-
-* 17 `IMAGE_CHECKPOINT_MEASURE` lines, every one `independent=1 exact=1`, in both the
-  disabled and enabled arms (17 requests each).
-* Real earlier-user rewrite: first turn `reused=0 replayed=3708 prefill_ms=4918`, then
-  `reused=3584 replayed=124 prefill_ms=345` warm and `prefill_ms=341` steady.
-* Constant allocation across the whole run: `physical_allocations=3924`,
-  `driver_allocations=3924`, `mapped_bytes=0`, `KV_PREALLOCATION_MODEL PASS`, with
-  `checkpoint_operations=47 checkpoint_copy_bytes=3622502400`.
-* The corrupted-conviction arm is refused, not tolerated:
-  `IMAGE_CHECKPOINT_FAILURE comparison=restored exact state required`.
-* Acknowledged limit, measured not assumed: the short `rendered_header_reasoning` rewrites
-  reuse zero (`reused=0 replayed=1060`), while the real rendered rewrite reuses 3584.
-
-This is engine/oracle qualification. GPU tensor exactness inside the **HTTP** path, reuse
-through `serve/`, and any front-end savings remain separate: the pass marker records
-`actual_OWUI token divergence and savings UNMEASURED`.
-
-## Orin handoff — commands only, NOT executed here
-
-Both review blockers are fixed, but this recipe is still NOT authorized: it needs the
-reviewed isolation window and the operator-owned cgroup procedure below. Run the gate
-through its supervisor (never the worker alone) and pass the cleanup allowance
-explicitly, e.g. `--budget-seconds 300 --cleanup-seconds 20`.
-
-Use ONLY existing `/mnt/ssd/Strata-Orin/worktrees/multimodal-cache`.
-Never modify/build live `worktrees/checkpoint-policy`. All build staging, copied
-scripts, fixtures and results below live under `/mnt/ssd/tmp/strata-checkpoints`.
-No push/deploy/config edits or service operations are authorized by this handoff.
-
-The actual diagnostic checkout includes f934b85b plus a cherry-picked diagnostic
-commit; its HEAD need NOT equal765068db. The incremental bundle requires4130bdfd
-and carries the original765068db object plus implementation37911119 and subsequent
-portable-support/handoff commits, so verification
-does not assume the original diagnostic object was previously fetched. Importing
-that object does NOT mean replaying its commit onto the Orin branch. Preserve its source/ignored artifacts.
-Apply ONLY this archive's reviewed post765068db feature/support commits onto that actual clean HEAD,
-not a reset/merge/switch to the archive tip which would lose the Orin follow-ups.
-
-```bash
-set -euo pipefail
-STAGE=/mnt/ssd/tmp/strata-checkpoints
-REPO=/mnt/ssd/Strata-Orin
-TEST="$REPO/worktrees/multimodal-cache"
-STAMP=$(date -u +%Y%m%dT%H%M%SZ)-$$
-mkdir -p "$STAGE"; cd "$STAGE"
-# Transfer archive + its .sha256 here first.
-sha256sum -c q36-image-checkpoints-review.tar.gz.sha256
-tar -xzf q36-image-checkpoints-review.tar.gz
-ART="$STAGE/q36-image-checkpoints-review"
-(cd "$ART" && sha256sum -c SHA256SUMS)
-test "$(git -C "$TEST" rev-parse --show-toplevel)" = "$TEST"
-test "$(git -C "$TEST" rev-parse --path-format=absolute --git-common-dir)" = "$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
-test -z "$(git -C "$TEST" status --porcelain=v1 --untracked-files=all)"
-OLD=$(git -C "$TEST" rev-parse HEAD)
-git -C "$TEST" merge-base --is-ancestor f934b85b "$OLD"
-git -C "$TEST" log -5 --oneline > "$STAGE/image-source-before-$STAMP.txt"
-PROTECTED=(tools/q36_adaptive_integration_fixture.py tools/test_q36_integration_ordinary.py docs/Q36_ADAPTIVE_ORIN_VALIDATION.json)
-(cd "$TEST" && sha256sum "${PROTECTED[@]}") > "$STAGE/image-protected-before-$STAMP.sha256"
-KEEP="preserve/multimodal-diagnostic-$STAMP"
-git -C "$REPO" branch "$KEEP" "$OLD"
-git -C "$REPO" bundle create "$STAGE/multimodal-before-image-$STAMP.bundle" "$KEEP" ^4130bdfd
-# Inventory old ignored artifacts without touching or hashing multi-GB dumps.
-(cd "$TEST" && find . -maxdepth 1 -type d \( -name 'build*' -o -name logs \) \
- -exec find {} -type f -printf '%p\t%s\t%T@\n' \; | LC_ALL=C sort) > "$STAGE/image-artifacts-before-$STAMP.tsv"
-BUNDLE="$ART/q36-image-checkpoints-incremental.bundle"
-git -C "$REPO" bundle verify "$BUNDLE"
-git -C "$REPO" fetch "$BUNDLE" refs/heads/feature/q36-image-checkpoints
-FEATURE=$(git -C "$REPO" rev-parse FETCH_HEAD)
-git -C "$REPO" merge-base --is-ancestor 765068db267f8cd8f846f8ef45c9cc94f90075d5 "$FEATURE"
-git -C "$REPO" merge-base --is-ancestor 37911119e64aa97b837b2f6a920dbdc8cc3930bd "$FEATURE"
-# Inspect this exact delta: implementation + portable support, NEVER diagnostics.
-git -C "$REPO" log --oneline "765068db..$FEATURE"
-RANGE=$(git -C "$REPO" rev-list --reverse "765068db..$FEATURE")
-for p in "${PROTECTED[@]}"; do
- test -z "$(git -C "$REPO" diff --name-only 765068db "$FEATURE" -- "$p")"
-done
-git -C "$TEST" switch -c "review/image-checkpoints-$STAMP" "$OLD"
-git -C "$TEST" cherry-pick $RANGE # reviewed feature/support commits ONLY, not diagnostics
-# Any conflict: STOP, preserve logs/ref/working tree for review. No force/reset/clean.
-(cd "$TEST" && sha256sum -c "$STAGE/image-protected-before-$STAMP.sha256")
-(cd "$TEST" && sha256sum "${PROTECTED[@]}") > "$STAGE/image-protected-after-$STAMP.sha256"
-cmp "$STAGE/image-protected-before-$STAMP.sha256" "$STAGE/image-protected-after-$STAMP.sha256"
-test "$(git -C "$REPO" rev-parse "$KEEP")" = "$OLD"
-git -C "$TEST" diff --name-only "$OLD" HEAD > "$STAGE/image-changed-paths-$STAMP.txt"
-for p in "${PROTECTED[@]}"; do ! grep -Fx "$p" "$STAGE/image-changed-paths-$STAMP.txt"; done
-git -C "$TEST" rev-parse HEAD > "$STAGE/image-actual-tip-$STAMP.txt"
-(cd "$TEST" && find . -maxdepth 1 -type d \( -name 'build*' -o -name logs \) \
- -exec find {} -type f -printf '%p\t%s\t%T@\n' \; | LC_ALL=C sort) > "$STAGE/image-artifacts-after-$STAMP.tsv"
-cmp "$STAGE/image-artifacts-before-$STAMP.tsv" "$STAGE/image-artifacts-after-$STAMP.tsv"
+```text
+--serve --max-context 262144 --batch 4 --kv-pool-tokens 524288
+--kv int8 --mtp 2 --batch-mtp --mtp-sampled --chunk 512 --kv-preallocate
+--vision --kv-vision-max-tokens 1024
+--kv-checkpoint-mib 1024 --kv-checkpoint-interval 1024
+--kv-checkpoint-policy adaptive --kv-image-checkpoints
 ```
 
-Local765068db lacks two Orin-only files; their local absence was preserved, NOT
-filled with fabricated contents. The hash checks above MUST succeed on the actual
-Orin files. The exported complete patch is an alternative for exact local parent;
-do NOT apply it after bundle/cherry-pick, or overwrite Orin files from `source/`.
+## Identity and authorization
 
-### Build and CPU preflight (no service operations)
+Exact complete-state matches remain first. A checkpoint is considered only when
+no exact donor can serve the request. Actual rendered-token LCP is mandatory;
+image identity can shorten that prefix but never extend it. Complete images
+before a restore boundary must match actual embedding bytes, width, row count,
+grid, token-cell placement and rotary start. An advisory key or hash alone grants
+no permission, and a boundary inside an image is invalid.
 
-```bash
-: "${CUDA_ROOT:?existing CUDA13.2 toolkit, no replacement/install}"
-: "${LLAMA_SRC:?existing validated llama.cpp checkout}"
-test "$(git -C "$LLAMA_SRC" rev-parse HEAD)" = 3cf03257f219afbe7334045ff7c6a06ac68c627d
-PYTHON=/mnt/ssd/strata-service/venv/bin/python
-MODEL=/mnt/ssd/llamacpp_models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-BUILD="$STAGE/build-image-checkpoints-$STAMP"
-SCRIPTS="$STAGE/image-scripts-$STAMP"
-test ! -e "$BUILD"; mkdir "$SCRIPTS"
-cp "$TEST/tools/q36_image_checkpoint_fixture.py" "$TEST/tools/q36_image_checkpoint_gate.py" "$SCRIPTS/"
-export STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT="$TEST"
-"$CUDA_ROOT/bin/nvcc" --version | tee "$STAGE/image-nvcc-$STAMP.txt"
-grep -q 'release 13.2' "$STAGE/image-nvcc-$STAMP.txt"
-cmake -S "$TEST" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_CUDA_COMPILER="$CUDA_ROOT/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_ROOT" \
- -DCMAKE_CUDA_ARCHITECTURES=87 -DSTRATA_GGML_DIR="$LLAMA_SRC" \
- -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF -DSTRATA_ENABLE_SYCL=OFF \
- -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PREFILL_MMQ=OFF -DSTRATA_MMQ_KQUANTS=ON \
- -DSTRATA_BUILD_TESTS=ON 2>&1 | tee "$STAGE/image-configure-$STAMP.txt"
-cmake --build "$BUILD" --target strata-q36 strata_kq -j4 2>&1 | tee "$STAGE/image-build-$STAMP.txt"
-# Explicit paths to the already saved actual diagnostic inputs; no encoder launch.
-: "${DIAGNOSTIC_FIXTURES:?existing q36-image-cache-v1 fixture directory under STAGE}"
-: "${IMAGE_A:?saved public red-square PNG under STAGE}"
-: "${IMAGE_B:?saved public blue-square PNG under STAGE}"
-: "${SVE_A:?saved real1024-row red embeddings under STAGE}"
-: "${SVE_B:?saved real1024-row blue embeddings under STAGE}"
-FIXTURES="$STAGE/image-checkpoint-fixtures-$STAMP"
-"$PYTHON" "$SCRIPTS/q36_image_checkpoint_fixture.py" --model "$MODEL" \
- --image-a "$IMAGE_A" --image-b "$IMAGE_B" --sve-a "$SVE_A" --sve-b "$SVE_B" \
- --diagnostic "$DIAGNOSTIC_FIXTURES" --out "$FIXTURES" > "$STAGE/image-prepare-$STAMP.json"
-"$PYTHON" "$SCRIPTS/q36_image_checkpoint_gate.py" --preflight --engine "$BUILD/strata-q36" \
- --model "$MODEL" --fixtures "$FIXTURES" --out "$STAGE/image-results-$STAMP"
-```
+A payload retains bounded CPU proof of image bytes/layout, consumed end, rotary
+delta and readiness alongside the existing packed recurrence/conv/hidden snapshot.
+Main and MTP KV codes/scales remain in the session planes. Donor generation,
+epoch, backing and idle eligibility must match; a donor pin is held through
+admission and copying. Shared incoming staging views are not captured or cloned.
 
-Only after a SEPARATELY approved existing operator isolation window: pause clients,
-record both prior Strata/llama states, stop/reap them using the already reviewed
-manager scope, and own a transient test cgroup. None of those operations was
-performed or automated here. In that isolated cgroup run the same command without
-`--preflight`, explicitly passing BOTH environment variables:
+Restore reconstructs complete-prefix image metadata and CPU/device rotary state
+before publication. Incoming rows and tables for the new request are uploaded
+before suffix processing. Unseeded or partially consumed image state does not
+become an eligible checkpoint. Cancellation inside an image invalidates the owner;
+valid earlier states may survive cancellation outside the image.
 
-```bash
-STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT="$TEST" STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW=1 \
- "$PYTHON" "$SCRIPTS/q36_image_checkpoint_gate.py" --engine "$BUILD/strata-q36" \
- --model "$MODEL" --fixtures "$FIXTURES" --out "$STAGE/image-results-$STAMP" \
- 2>&1 | tee "$STAGE/image-window-$STAMP.log"
-```
+## Retention boundaries
 
-No old/live process is killed by the worker; surviving models cause refusal.
-The operator MUST reap the entire test cgroup, restore both exact prior active/
-inactive states, and verify `service=strata,status=ok,loaded=true` at the existing
-`http://100.100.10.3:11436/health` before resuming clients. Failed inspection/reaping
-blocks restart; SIGKILL/power loss requires operator recovery. Do not use an old
-window script that hard-codes the previous diagnostic worker. No production
-executable, API binding, OWUI settings or configuration is changed.
+Only existing completed prompt callbacks can capture. No chunk is split and no
+numerical call shape is changed for checkpoint placement. A target inside an image
+maps to a legal completed boundary or is deferred. The four-payload ceiling and
+configured physical bank charge remain unchanged. Early divergence before the
+first legal retained state can legitimately require replay from zero.
 
-Required numerical marker: `IMAGE_CHECKPOINT_ORIN_GATE PASS independent=1 exact=1`.
-Keep commands, actual source/protected-file hashes, raw logs/exit records and every
-per-turn measurement. Positive steady rendered rewrite reuse is REQUIRED; legit
-zero cases stay zero. Broader sampling, actual OWUI, encoder peaks/co-residency,
-other backends and performance distributions are separate pending qualifications.
+## Validation
+
+The native image-checkpoint gate independently recomputes restored and final
+persistent state under the same schedule, compares full logits exactly, checks
+finite values and bank invariants, and requires a corrupted-state control to fail.
+It exercises rewritten histories, identity/placement changes, cancellation and
+cross-slot transfer. It is not just enabled/disabled output equality.
+
+The separate [serial HTTP smoke](Q36_IMAGE_HTTP_SMOKE.md) exercises actual image
+parts and server history handling. Native mixed-slot coverage does not establish
+concurrent HTTP qualification, and a bounded synthetic case is not a general
+frontend speedup benchmark. Other models, backend/device combinations and long
+aggregate-pool-pressure workloads require their own validation.

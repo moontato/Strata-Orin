@@ -12,7 +12,8 @@ mkdir -p "$RESULTS"
 for name in strata strata-q36; do
   if pgrep -x "$name" >/dev/null; then echo "Another $name process exists: abort, never run two models" >&2; exit 1; fi
 done
-[[ $(git -C /mnt/ssd/llama-strata-pin rev-parse HEAD) == 3cf03257f219afbe7334045ff7c6a06ac68c627d ]]
+: "${STRATA_GGML_DIR:?Set the pinned llama.cpp source directory}"
+[[ $(git -C "$STRATA_GGML_DIR" rev-parse HEAD) == 3cf03257f219afbe7334045ff7c6a06ac68c627d ]]
 "$PYTHON" tools/q36_sampled_mtp_fixture.py --model "$MODEL" --out "$RESULTS/sampled.csv"
 "$PYTHON" tools/q36_prefix_checkpoint_fixture.py --model "$MODEL" --out "$RESULTS/checkpoints.csv"
 # Every native test must exit 0. Only explicit, rollback-checked unsupported

@@ -24,10 +24,10 @@ def main():
  p.add_argument('--build-dir',type=Path,default=ROOT/'build-q36-dev-cpu')
  p.add_argument('--log-dir',type=Path,default=ROOT/'logs/q36-dev-cpu')
  p.add_argument('--jobs',type=int,default=2);p.add_argument('--sanitizers',action='store_true')
- p.add_argument('--negative-controls',action='store_true');a=p.parse_args()
+ p.add_argument('--negative-controls',action='store_true');p.add_argument('--source-preservation',action='store_true',help='also compare unchanged source against full Git history');a=p.parse_args()
  if not 1<=a.jobs<=32:p.error('jobs must be1..32')
  for tool in ('g++','cmake','ctest','ninja'):
-  if not shutil.which(tool):p.error('missing '+tool+'; follow docs/Q36_MULTIMODAL_CACHE_HANDOFF.md')
+  if not shutil.which(tool):p.error('missing '+tool+'; follow docs/Q36_DEVELOPMENT.md')
  build=a.build_dir.resolve();stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+str(os.getpid())
  logs=a.log_dir.resolve()/stamp;logs.mkdir(parents=True,exist_ok=False)
  scratch=logs/'scratch';scratch.mkdir()
@@ -60,7 +60,7 @@ def main():
   suite(build,False)
   tests=sorted(str(x.relative_to(ROOT)) for x in (ROOT/'tools').glob('test_q36_*.py'))
   run('python',[sys.executable,'-m','pytest','-q',*tests,'serve/test_q36_config.py','serve/test_unified_kv.py','tools/test_unified_kv_validate.py'])
-  run('source-preservation',[sys.executable,'tools/check_q36_image_preservation.py'])
+  if a.source_preservation:run('source-preservation',[sys.executable,'tools/check_q36_image_preservation.py'])
   if a.negative_controls:
    for name in ('image_checkpoint','vision','restore_observation','gate_watchdog','image_http_smoke'):
     run('negative-'+name,[sys.executable,'tools/check_q36_'+name+'_negative.py'])

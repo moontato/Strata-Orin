@@ -2,7 +2,7 @@
 """Operator-approved isolated vision review worker. NO service/config operations.
 Owns one encoder and at most one LLM process. Must run inside an operator-managed
 transient cgroup AFTER production Strata/llama were stopped/reaped. All staging
-and results stay under /mnt/ssd/tmp/strata-vision. No downloads or HTTP listener.
+and results stay under the configured test staging directory. No downloads or HTTP listener.
 """
 import argparse
 import json
@@ -67,9 +67,9 @@ def protocol(path):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--engine',required=True);p.add_argument('--baseline',required=True);p.add_argument('--encoder',required=True)
     p.add_argument('--model',required=True);p.add_argument('--mmproj',required=True);p.add_argument('--out',required=True);p.add_argument('--timeout',type=int,default=1800);a=p.parse_args()
-    if os.environ.get('STRATA_VISION_REVIEW_WINDOW')!='1' or str(ROOT)!='/mnt/ssd/Strata-Orin/worktrees/vision-preallocation':p.error('only the reviewed Orin nested test worktree/approved window')
-    out=Path(a.out).resolve();stage=Path('/mnt/ssd/tmp/strata-vision')
-    if not out.is_relative_to(stage) or out==stage or out.exists():p.error('use a NEW results directory under /mnt/ssd/tmp/strata-vision')
+    if os.environ.get('STRATA_VISION_REVIEW_WINDOW')!='1':p.error('an explicit isolated model-test window is required')
+    out=Path(a.out).resolve();stage=Path(os.environ.get('STRATA_Q36_STAGE',ROOT/'logs/q36-tests')).resolve()
+    if not out.is_relative_to(stage) or out==stage or out.exists():p.error('use a NEW results directory under the configured test stage')
     for binary in (a.engine,a.baseline):
         if b'--kv-vision-test' not in Path(binary).read_bytes():p.error('build diagnostic native binary first')
     no_models();out.mkdir(parents=True);make_images(out/'images')

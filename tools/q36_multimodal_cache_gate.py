@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Future APPROVED isolated Orin window only. No service/config operations.
+"""Explicitly approved isolated model-validation window only. No service/config operations.
 Two sequential LLM arms, one binary, identical input/schedule; <=300s total model
 budget, progress every20s. No encoder/HTTP server, projection study or image oracle.
 """
@@ -16,8 +16,8 @@ import sys
 import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-STAGE = Path('/mnt/ssd/tmp/strata-checkpoints')
-REVIEW = Path('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache')
+STAGE = Path(os.environ.get('STRATA_Q36_STAGE', ROOT / 'logs/q36-tests')).resolve()
+REVIEW = ROOT
 
 
 def digest(path):
@@ -145,10 +145,10 @@ def main():
     p.add_argument('--preflight', action='store_true', help='CPU checks only, allowed before approved service window')
     a = p.parse_args()
     if ROOT != REVIEW or (not a.preflight and os.environ.get('STRATA_MM_CACHE_REVIEW_WINDOW') != '1'):
-        p.error('only an explicitly approved nested multimodal-cache review checkout/window')
+        p.error('an explicitly isolated source checkout and model-test window are required')
     if not a.engine.resolve().is_relative_to(REVIEW) or not a.out.resolve().is_relative_to(STAGE) or a.out.resolve()==STAGE:
-        p.error('isolated review binary and NEW staging/results path required; live checkpoint-policy build forbidden')
-    if not a.fixtures.resolve().is_relative_to(STAGE): p.error('fixtures must be staged under strata-checkpoints')
+        p.error('test binary must belong to this checkout; results must use a fresh staging path')
+    if not a.fixtures.resolve().is_relative_to(STAGE): p.error('fixtures must belong to the configured test staging root')
     binary = a.engine.read_bytes()
     if b'--kv-image-cache-test' not in binary or b'--kv-cache-diagnostics' not in binary:
         p.error('build the new diagnostic executable')

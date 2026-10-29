@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Future APPROVED Orin cgroup worker, run under a hard whole-run supervisor.
+"""Isolated model-validation cgroup worker, run under a hard whole-run supervisor.
 NO service/config/encoder operations. The supervisor bounds EVERY phase of the worker
 (synchronous preflight/hashing, native execution, log reading, comparisons, final
 reporting) with one execution budget (default300s, explicit maximum420s) and may
@@ -12,13 +12,13 @@ session), so an enclosing OPERATOR-OWNED CGROUP is still required to catch anyth
 else. A timeout, a killed worker or a completion at/after the deadline is always
 nonzero: a late success, an uninterruptible-teardown run or an incomplete cleanup is
 never accepted. Independent correctness is native empty-state recomputation, not
-OFF/ON equality. All staging/results under strata-checkpoints.
+OFF/ON equality. Staging/results stay within the configured test root.
 """
 import argparse,json,os,re,signal,subprocess,sys,time
 from pathlib import Path
 ROOT=Path(os.environ.get('STRATA_IMAGE_CHECKPOINT_REVIEW_ROOT',Path(__file__).resolve().parents[1])).resolve();sys.path.insert(0,str(ROOT))
 from tools.q36_multimodal_cache_gate import no_models,digest
-STAGE=Path('/mnt/ssd/tmp/strata-checkpoints');REVIEW=Path('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache')
+STAGE=Path(os.environ.get('STRATA_Q36_STAGE',ROOT/'logs/q36-tests')).resolve();REVIEW=ROOT
 EXECUTION_BUDGET_DEFAULT=300;EXECUTION_BUDGET_MAX=420;CLEANUP_ALLOWANCE_DEFAULT=20;CLEANUP_ALLOWANCE_MAX=60
 SELFTESTS=('normal','slow_preflight','hung_child','slow_postprocess','late_success')
 OWNED_PROBE='#Q36OWNEDPROBE'   # marks the gate's OWN fake hung child/descendant for reaping checks
@@ -129,7 +129,7 @@ def worker(a,budget):
   report['binary_sha256']=digest(a.engine)
   budget.check('binary provenance')
   cache=a.engine.resolve().parent/'CMakeCache.txt'
-  if not cache.is_file() or ('CMAKE_HOME_DIRECTORY:INTERNAL='+str(REVIEW)) not in cache.read_text():raise RuntimeError('build provenance must name ONLY the existing multimodal-cache worktree')
+  if not cache.is_file() or ('CMAKE_HOME_DIRECTORY:INTERNAL='+str(REVIEW)) not in cache.read_text():raise RuntimeError('build provenance must name the selected source checkout')
   if b'--kv-image-checkpoint-test' not in a.engine.read_bytes():raise RuntimeError('new diagnostic binary required')
   manifest=json.loads((a.fixtures/'manifest.json').read_text())
   if not a.selftest:
@@ -433,10 +433,10 @@ def main():
   # encoder or service, so they may use a throwaway staging directory.
   REVIEW=ROOT;STAGE=a.out.resolve().parent
  if getattr(a,'fault',None) and not a.selftest:p.error('fault injection requires --selftest')
- if ROOT!=REVIEW or (not a.preflight and not a.selftest and os.environ.get('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW')!='1'):p.error('only approved existing multimodal-cache checkout/window')
+ if ROOT!=REVIEW or (not a.preflight and not a.selftest and os.environ.get('STRATA_IMAGE_CHECKPOINT_REVIEW_WINDOW')!='1'):p.error('an isolated source checkout and explicit model-test window are required')
  if not 1<=a.budget_seconds<=EXECUTION_BUDGET_MAX:p.error(f'execution budget must be 1..{EXECUTION_BUDGET_MAX}s')
  if not 1<=a.cleanup_seconds<=CLEANUP_ALLOWANCE_MAX:p.error(f'cleanup allowance must be 1..{CLEANUP_ALLOWANCE_MAX}s')
- if not a.engine.resolve().is_relative_to(STAGE) or not a.fixtures.resolve().is_relative_to(STAGE) or not a.out.resolve().is_relative_to(STAGE) or a.out.resolve()==STAGE:p.error('NEW staging results and isolated test binary required; never live checkpoint-policy')
+ if not a.engine.resolve().is_relative_to(STAGE) or not a.fixtures.resolve().is_relative_to(STAGE) or not a.out.resolve().is_relative_to(STAGE) or a.out.resolve()==STAGE:p.error('NEW staging results and isolated test binary required; never the live runtime')
  if a.worker:return worker(a,Budget(a.budget_seconds,'worker',a.deadline))
  # Supervisor: the only entity that may print a verdict marker.
  if a.out.exists():p.error('results directory already exists; preserve old artifacts')

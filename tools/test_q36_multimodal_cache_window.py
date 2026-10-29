@@ -53,11 +53,11 @@ def setup(tmp_path):
     for name in ('git','systemctl','systemd-run','curl','python-shim'):
         path=bin/name;path.write_text('#!'+sys.executable+'\n'+SHIM);path.chmod(0o755)
     source=(ROOT/'tools/q36_multimodal_cache_window.sh').read_text()
-    source=source.replace('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache',str(test)).replace('/mnt/ssd/tmp/strata-checkpoints',str(stage))
-    source=source.replace('/mnt/ssd/strata-service/venv/bin/python',str(bin/'python-shim'))
+    # Host cgroup availability is simulated; the production script keeps its check.
+    source=source.replace('test -f /sys/fs/cgroup/cgroup.controllers', ': CPU_MOCK_CGROUP_V2')
     script=tmp_path/'window-copy.sh';script.write_text(source)
     env=dict(os.environ,PATH=str(bin)+':'+os.environ['PATH'],REAL_PYTHON=sys.executable,MOCK_RECORD=str(record),MOCK_STATE=str(state),MOCK_TEST=str(test),
-             MM_CACHE_STOP_APPROVED='1',MM_CACHE_ENGINE=str(test/'build-mm-cache-mock/strata-q36'),SCOPE='user',HEALTH='CPU_MOCK_NO_HTTP',MODEL='CPU_MOCK_NOT_A_MODEL',FIXTURES=str(stage/'fixture'))
+             TEST=str(test),STAGE=str(stage),PYTHON=str(bin/'python-shim'),MM_CACHE_STOP_APPROVED='1',MM_CACHE_ENGINE=str(test/'build-mm-cache-mock/strata-q36'),SCOPE='user',HEALTH='CPU_MOCK_NO_HTTP',MODEL='CPU_MOCK_NOT_A_MODEL',FIXTURES=str(stage/'fixture'))
     return script,env,record,state
 
 

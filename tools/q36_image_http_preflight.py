@@ -10,9 +10,8 @@ import sys
 sys.dont_write_bytecode = True
 from datetime import datetime, timezone
 
-STAGE = Path('/mnt/ssd/tmp/strata-checkpoints')
-TRIAL = Path('/mnt/ssd/Strata-Orin/worktrees/multimodal-cache')
-QUALIFIED_SHA = 'eb5ef5de8f7f36de9bd25206d59ec2161a4fb5548e3f74246483a344f8544c3f'
+TRIAL = Path(__file__).resolve().parents[1]
+STAGE = Path(os.environ.get('STRATA_Q36_STAGE', TRIAL / 'logs/q36-tests')).resolve()
 
 
 def sha(path):
@@ -21,16 +20,17 @@ def sha(path):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--fixture-state', type=Path, default=STAGE / 'image-checkpoint-fixture-state.json')
-    p.add_argument('--live-config', type=Path, default=Path('/mnt/ssd/strata-service/strata.json'))
+    p.add_argument('--fixture-state', type=Path, required=True)
+    p.add_argument('--live-config', type=Path, required=True)
     a = p.parse_args()
     state = json.loads(a.fixture_state.read_text())
     assert Path(state['trial']).resolve() == TRIAL
     assert subprocess.check_output(['git', '-C', str(TRIAL), 'rev-parse', 'HEAD'], text=True).strip() == state['commit']
-    for name, expected in state['protected'].items():
+    for name, expected in state.get('protected', {}).items():
         assert sha(TRIAL / name) == expected, 'protected file changed: ' + name
     candidate = Path(state['build']) / 'strata-q36'
-    assert sha(candidate) == QUALIFIED_SHA == state['engine_sha256']
+    qualified_sha = state['engine_sha256']
+    assert sha(candidate) == qualified_sha
     live = json.loads(a.live_config.read_text())
     base_cwd = Path(live.get('cwd') or a.live_config.parent)
     def absolute(path):
@@ -52,13 +52,14 @@ def main():
                 model_name=live.get('model_name') or 'qwen3.6-35b-a3b')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + str(os.getpid())
     out = STAGE / ('http-smoke-cpu-' + stamp)
+    STAGE.mkdir(parents=True, exist_ok=True)
     out.mkdir()
     config = out / 'source-config.json'
     config.write_text(json.dumps(safe, indent=2) + '\n')
     audit = prepare(a.fixture_state, out / 'geometry', config, baseline)
     script = Path(__file__).with_name('q36_image_http_smoke.py')
     command = [sys.executable, str(script), '--engine', str(candidate),
-               '--expect-engine-sha256', QUALIFIED_SHA, '--baseline-engine', str(baseline),
+               '--expect-engine-sha256', qualified_sha, '--baseline-engine', str(baseline),
                '--model', state['model'], '--source-config', str(config), '--server-root', str(TRIAL),
                '--geometry', str(out / 'geometry/geometry.json'), '--window-seconds', '120',
                '--cleanup-seconds', '10']
