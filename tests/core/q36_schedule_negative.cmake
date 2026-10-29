@@ -1,0 +1,5 @@
+execute_process(COMMAND "${PROGRAM}" "${FIXTURE}" "${CONTROL}" RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 1 OR NOT out MATCHES "SCHEDULE_CORRUPT category=${CONTROL}" OR NOT out MATCHES "SCHEDULE_FIRST comparison=restored category=${CONTROL}" OR NOT err MATCHES "SCHEDULE_FAILURE comparison=restored" OR out MATCHES "CHECKPOINT_SCHEDULE_TEST PASS")
+  message(FATAL_ERROR "negative control did not detect corrupted restored ${CONTROL}: rc=${rc}\n${out}\n${err}")
+endif()
+message(STATUS "${CONTROL}: corrupted checkpoint rejected at restored boundary")

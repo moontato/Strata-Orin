@@ -1,0 +1,13 @@
+# CPU CODING image only. Unlike ../Dockerfile, no installer, GPU/model or server.
+# Run from repository root: docker build -f docker/Dockerfile.q36-dev -t strata-q36-dev .
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git build-essential python3 python3-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-q36-dev.txt /opt/q36-dev-requirements.txt
+RUN python3 -m venv /opt/q36-dev \
+    && /opt/q36-dev/bin/python -m pip install --no-cache-dir -r /opt/q36-dev-requirements.txt
+ENV PATH="/opt/q36-dev/bin:${PATH}" PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
+WORKDIR /workspace
+# Mount/clone SOURCE here. No ports, health check, credentials or runtime entrypoint.
+CMD ["/bin/bash"]

@@ -4,7 +4,7 @@
 > **Strata-Orin: Jetson AGX Orin 64 GB development port of Strata v0.1.45.**
 > ARM64 · CUDA SM87 · JetPack 6.2 / CUDA 12.6.
 > **[Jetson port guide](ports/jetson-orin-v0.1.45/README.md)** ·
-> [Native build at `/mnt/ssd/Strata-Orin`](ports/jetson-orin-v0.1.45/BUILD.md) ·
+> [Native Jetson build](ports/jetson-orin-v0.1.45/BUILD.md) ·
 > [Local validation and limits](ports/jetson-orin-v0.1.45/VALIDATION.md).
 > **Not yet tested on Orin.** Follow the native build guide, not the upstream installer or updater below.
 <!-- Strata-Orin v0.1.45:end -->

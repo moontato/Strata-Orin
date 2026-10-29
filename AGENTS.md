@@ -5,6 +5,14 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+## Qwen3.6 development
+
+Feature contracts are documented in docs/Q36_INT8_KV.md,
+docs/Q36_KV_PREALLOCATION.md, docs/Q36_PREFIX_CHECKPOINTS.md and
+docs/Q36_IMAGE_CHECKPOINTS.md. Use docs/Q36_DEVELOPMENT.md for reproducible
+CPU tests. Generated builds, logs, validation dumps and local deployment records
+stay outside tracked source. Preserve opt-in defaults and report untested scopes.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,
@@ -19,6 +27,9 @@ offers the same steps as tools.
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
+- The bounded HTTP image-checkpoint smoke runs against a loopback stand-in without a model:
+  `python -m pytest tools/test_q36_image_http_smoke.py`, and its guards are checked by
+  `python tools/check_q36_image_http_smoke_negative.py`.
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
   measurement.
 

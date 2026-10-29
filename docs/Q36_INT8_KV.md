@@ -17,45 +17,11 @@ For optional startup backing of this same layout, see
 head strides and the shared logical capacity unchanged, with a separate physical
 bank and a page-rounding/distribution bound rather than raw bytes/token.
 
-## Focused validation actually performed here
+## Validation scope
 
-* x86_64, CUDA 12.6.85, SM87: `strata`, `strata-q36`, `q36_kv_int8_test`, `unified_kv_test` built/linked.
-* CPU ownership/layout test passed, including the four token distributions and INT8 scale/granule accounting. Non-PIE ASan/UBSan also passed. The PIE sanitizer executable crashed without a diagnostic in this host environment; no production flags were changed to address it.
-* Invalid `--kv` selection is rejected explicitly.
-* All 63 original compute-kernel machine-code sections still match the Jetson baseline; three new INT8 kernels are added. In this toolchain the new attention uses 64 registers and 24 KiB shared memory, with no register spills. This is not a performance result.
-* The native INT8 test **compiled but skipped here (no GPU)**. It checks quantized K/V writes and RoPE, FP64 attention over the stored codes, FP16 prompt staging, row-selected caches, main/draft prefix copies, physical growth including scales, LRU/cache misses and graph replay after eviction. Its CUDA runtime correctness still needs the Orin run.
-* No Orin INT8 model inference, long-context residency, model-logit/quality comparison, MTP acceptance or performance result is claimed. No full suites or prolonged benchmarks were run for this change.
-
-The Flash-Next [registered-host-pointer finding](KV_HOST_MAPPING.md) is separate. Its capability-based narrow correction does not assert that devices lacking the guarantee can support flat incremental host mappings. No host-VMM or segmented backend was implemented.
-
-## Build and short smoke tests on Orin
-
-Reuse the **already working CUDA 13.2 / SM87 build directory**, preserving its native-expert/K-quant/MMQ options and ggml pin. Example directory: `build-orin`.
-
-```bash
-cmake -S . -B build-orin -DSTRATA_BUILD_TESTS=ON
-cmake --build build-orin --target strata strata-q36 strata_kq q36_kv_int8_test unified_kv_test -j4
-ctest --test-dir build-orin -R '^(unified_kv_test|q36_kv_int8_test)$' --output-on-failure
-```
-
-Keep `libstrata_kq.so` beside the engine. The CUDA INT8 gate must **pass, not skip** on Orin. Then a short actual-model serial MTP2 smoke (no benchmark):
-
-```bash
-MODEL=/path/to/Qwen3.6-35B-A3B-first-shard.gguf
-TOKENS=$(python3 -c 'print(",".join(["198"]*256))')
-build-orin/strata-q36 --model "$MODEL" \
-  --max-context 250000 --batch 4 --kv-pool-tokens 500000 \
-  --kv int8 --mtp 2 --batch-mtp --chunk 512 \
-  --tokens "$TOKENS" --n 8
-```
-
-A short four-slot protocol smoke with the required limits and batch-MTP:
-
-```bash
-python3 tools/unified_kv_validate.py --exe build-orin/strata-q36 \
-  --lengths 256 --gen 8 --pool-tokens 500000 --out results/q36-int8-smoke -- \
-  --model "$MODEL" --max-context 250000 --batch 4 \
-  --kv int8 --mtp 2 --batch-mtp --chunk 512
-```
-
-This sends 256-token prompts, not 250K prompts: the configured ceilings are not proof of full residency. Confirm `kv_format=int8`, scale group 64, graphs on, MMQ and full-GPU expert placement in the logs. INT8 is lossy, so FP32/INT8 generated tokens are not required to be identical. Do not relax existing FP32 numerical checks; establish model quality/logit checks on Orin separately before qualification.
+The CPU layout/ownership tests and CUDA q36_kv_int8_test cover different scopes.
+The device gate checks stored quantized values/scales, attention references,
+main/MTP prefix copies, growth and graph replay after eviction. Hardware-required
+checks must pass rather than skip. INT8 is lossy; exact FP32-versus-INT8 generated
+text is not a quality criterion. Model quality, long-context residency and timing
+require separately reported measurements. See [Q36_DEVELOPMENT.md](Q36_DEVELOPMENT.md).

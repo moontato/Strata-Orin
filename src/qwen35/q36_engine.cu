@@ -32,6 +32,10 @@
 #include "q36_kernels.cuh"
 #include "q36_kv_int8.cuh"
 #include "strata/core/q36_prefix_checkpoint.hpp"
+#include "strata/core/q36_image_checkpoint.hpp"
+#include "strata/core/q36_checkpoint_schedule.hpp"
+#include "strata/core/q36_cache_diagnostics.hpp"
+#include "strata/core/q36_vision_preallocation.hpp"
 #include "strata/core/q36_sampled_mtp.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1183,6 +1187,7 @@ struct Engine {
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     bool kv_int8 = false; // opt-in; the default FP32 kernels/storage stay unchanged
+    bool cache_diagnostics = false; // opt-in host-only observations; never a match/routing input
     std::vector<q36kv8::Cache> kv8;
     q36kv8::Cache* d_kv8_tab = nullptr;
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
@@ -1232,10 +1237,23 @@ struct Engine {
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
         strata::core::Q36PrefixCheckpoints checkpoints;
+        strata::core::Q36ImageSourcePtr image_source;
+        std::array<strata::core::Q36ImagePoint,4> image_points{};
+        strata::core::Q36ImagePlan image_plan;
+        uint64_t image_ready_end=0; // contiguous main/MTP prefill + hidden seed, not decode scratch
+        void clear_image_points() {image_source.reset();image_points={};image_plan={};image_ready_end=0;}
         std::vector<float*> checkpoint_data; // packed GDN/conv/hlast, owned by this slot's VMM adapter
     };
     uint64_t checkpoint_budget = 0, checkpoint_interval = 1024, checkpoint_payload = 0;
+    strata::core::Q36PrefixCheckpoints::Policy checkpoint_policy = strata::core::Q36PrefixCheckpoints::Policy::fixed;
+    bool image_checkpoints=false; // explicit opt-in; default path retains image exclusion
+    mutable uint64_t image_metadata_us=0; // proof construction / identity search CPU, not GPU copy time
     uint64_t checkpoint_last_reused = 0; // focused native regression, not a scheduling hint
+    // Optional developer instrumentation. Null in every normal engine invocation.
+    strata::core::Q36ScheduleBook* schedule_book=nullptr;
+    std::function<void(int)> schedule_restored;
+    std::function<void(int,int)> schedule_before_restore;
+#include "q36_restore_observation.inc"
     size_t checkpoint_count = 0;
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -1262,6 +1280,9 @@ struct Engine {
     bool map_on = false;                // this forward's embeddings take picture rows
     std::vector<int32_t> img_map;       // the request's cell -> picture row (-1: text)
     int64_t img_prompt_cells = 0;       // the request's prompt length: cells below it use the table
+    uint64_t vision_max_rows=0; // strict mode: 0 selects context; optional explicit cap
+    strata::core::Q36VisionBudget vision_budget;
+    strata::core::Q36VisionLease vision_lease;
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
@@ -1343,8 +1364,13 @@ struct Engine {
             }
             for(auto& item:row_graphs) destroy(item.second);
         }
+        if(ok && vision) {
+            release_vision_views();
+            for(void* pointer:{(void*)d_img,(void*)d_mtab,(void*)d_map,(void*)logits_mr,(void*)pick_mr}) if(pointer && cudaFree(pointer)!=cudaSuccess) ok=false;
+            if(h_map && cudaFreeHost(h_map)!=cudaSuccess) ok=false;
+        }
         if(!ok) {
-            std::fprintf(stderr,"--kv-preallocate: shutdown synchronization/graph destruction failed; quarantining KV until process teardown\n");
+            std::fprintf(stderr,"--kv-preallocate: shutdown synchronization/graph/vision cleanup failed; quarantining KV until process teardown\n");
             for(auto& adapter:kv_adapters) adapter->quarantine();
         }
         // Members now drain adapters before destroying the bank. No captured
@@ -1427,6 +1453,7 @@ struct Engine {
         }
         ss.hlast = state((size_t) g.n_embd);
         ss.checkpoints.interval = checkpoint_interval;
+        ss.checkpoints.policy = checkpoint_policy;
         ss.checkpoints.points.resize(checkpoint_count);
         for (size_t i=0;i<checkpoint_count;++i)
             ss.checkpoint_data.push_back((float*) adapter->reserve({checkpoint_payload, UINT64_MAX, 1, 1, 0}, false, strata::core::KvBufferKind::checkpoint));
@@ -1592,6 +1619,9 @@ struct Engine {
             tok_m = dalloc_t<int32_t>(T);
             pos0_m = dalloc_t<int32_t>(1);
             pick_m = dalloc_t<int32_t>(1);
+            if(kv_bank && vision) { // image/text interleaving must not lazily create this ancillary scratch
+                logits_mr=dalloc((size_t)kVerify*g.n_vocab);pick_mr=dalloc_t<int32_t>(kVerify);
+            }
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
@@ -1628,8 +1658,10 @@ struct Engine {
                 a->invalidate = [this, s](std::string&) {
                     Sess& ss = sess[(size_t) s];
                     ss.live.clear(); ss.imgs.clear(); ss.pos = 0; ss.rdelta = 0;
-                    ss.checkpoints.clear();
+                    ss.checkpoints.clear();ss.clear_image_points();
+                    if(schedule_book) schedule_book->reset(s);
                     if (cur == s) pos = 0;
+                    if(kv_bank && vision && vision_lease.owner==s) release_vision_views();
                     // Every dependent device buffer belongs to this adapter and is
                     // unmapped. Graphs and batch tables keep stable VA, not freed pointers.
                     return true;
@@ -1691,6 +1723,15 @@ struct Engine {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
             d_map = dalloc_t<int32_t>(T);
             CK(cudaHostAlloc((void**) &h_map, T * sizeof(int32_t), cudaHostAllocDefault));
+            if(kv_bank) {
+                vision_budget=strata::core::Q36VisionBudget::make((uint64_t)ctx,(uint64_t)N,(uint64_t)T,vision_max_rows);
+                vision_max_rows=vision_budget.image_rows;
+                img_cap=(size_t)(vision_budget.embedding_bytes/4);d_img=dalloc(img_cap);
+                std::fprintf(stderr,"KVVISION fixed=1 shared_prefill=1 max_image_rows=%llu image_bytes=%llu mrope_bytes=%llu map_bytes=%llu pinned_map_bytes=%llu batch_mtp_bytes=%llu encoder_workspace=external_not_in_bank\n",
+                    (unsigned long long)vision_max_rows,(unsigned long long)vision_budget.embedding_bytes,
+                    (unsigned long long)vision_budget.mrope_bytes,(unsigned long long)vision_budget.map_bytes,(unsigned long long)vision_budget.pinned_map_bytes,
+                    (unsigned long long)(m->has_mtp ? (uint64_t)kVerify*((uint64_t)g.n_vocab*4+4) : 0));
+            }
         }
         d_delta = dalloc_t<int32_t>(1);
         cur = 0;
@@ -1719,7 +1760,8 @@ struct Engine {
 
     /// The recurrent state and the cache to a fresh sequence.
     void reset() {
-        sess[(size_t) cur].checkpoints.clear();
+        if(schedule_book) schedule_book->reset(cur);
+        sess[(size_t) cur].checkpoints.clear();sess[(size_t)cur].clear_image_points();
         if (kv_pool && !kv_adapters[(size_t) cur]->covers(1)) {
             pos = 0; sess[(size_t) cur].pos = 0; set_delta(0);
             return; // recurrence is zero-initialized when the first physical pages are committed
@@ -2613,8 +2655,10 @@ struct Engine {
     // length take their rotary positions from the table, the text after it continues at cell + delta (what the pictures
     // did not use of their cells: llama.cpp's mtmd advances the text position by max(nx, ny) per picture).
     bool img_active = false;
+#include "q36_vision_staging.inc"
     void set_images(const std::vector<float>& rows, const std::vector<int32_t>& cell_row, const std::vector<int32_t>& mrope,
                     int64_t n_prompt, int32_t delta) {
+        if(kv_bank) {strict_set_images(rows,cell_row,mrope,n_prompt,delta);return;}
         const size_t need = rows.size();
         if (need > img_cap) {
             CK(cudaDeviceSynchronize());
@@ -2630,6 +2674,10 @@ struct Engine {
         set_delta(delta);
     }
     void clear_images() {
+        if(kv_bank && vision) {
+            if(vision_lease.busy()) vision_lease.check(cur);
+            release_vision_views();
+        }
         img_map.clear();
         img_active = false;
         img_prompt_cells = 0;
@@ -2642,6 +2690,11 @@ struct Engine {
         mtab_now = nullptr;
         map_on = false;
         if (!img_active) return;
+        if(kv_bank && vision) {
+            const auto owner=kv_pool->session((uint32_t)cur);
+            vision_lease.check(cur,owner.id.generation,owner.epoch);
+            if(owner.state!=strata::core::KvResidency::active) throw std::runtime_error("inactive vision prefill lease");
+        }
         if (c0 < img_prompt_cells) mtab_now = d_mtab;
         bool any = false;
         for (int j = 0; j < T; ++j) {
@@ -2910,46 +2963,95 @@ struct Engine {
         if(off*4!=checkpoint_payload) throw std::logic_error("checkpoint state layout mismatch");
     }
     bool checkpoint_available(int s,int index,const strata::core::KvIdlePin* donor_pin=nullptr,
-                              const strata::core::KvIdentity* destination_lease=nullptr) const {
+                              const strata::core::KvIdentity* destination_lease=nullptr,bool image_mode=false) const {
         const auto& ss=sess[(size_t)s];
         if(index<0 || (size_t)index>=ss.checkpoints.points.size()) return false;
         const auto p=ss.checkpoints.points[(size_t)index];
         const auto owner=kv_pool->session((uint32_t)s);
+        if(image_mode && (!image_checkpoints || !ss.image_points[(size_t)index].valid(p.pos))) return false;
         return strata::core::Q36PrefixCheckpoints::available(p,owner,ss.live.size(),(uint64_t)ss.pos,
-            !ss.imgs.empty(),ss.active,kv_adapters[(size_t)s]->covers(p.pos),kv_pool.get(),donor_pin,destination_lease);
+            !image_mode && !ss.imgs.empty(),ss.active,kv_adapters[(size_t)s]->covers(p.pos),kv_pool.get(),donor_pin,destination_lease);
     }
-    int checkpoint_match(int s,const std::vector<int32_t>& ids) const {
+    size_t checkpoint_common(int s,const std::vector<int32_t>& ids) const {
+        const auto& live=sess[(size_t)s].live;
+        size_t common=0;
+        while(common<live.size() && common<ids.size() && live[common]==ids[common]) ++common;
+        return common;
+    }
+    int checkpoint_match(int s,const std::vector<int32_t>& ids,size_t common=SIZE_MAX) const {
         if(!checkpoint_count) return -1;
         const auto& ss=sess[(size_t)s];
-        size_t common=0;
-        while(common<ss.live.size() && common<ids.size() && ss.live[common]==ids[common]) ++common;
+        if(common==SIZE_MAX) common=checkpoint_common(s,ids);
         const auto owner=kv_pool->session((uint32_t)s);
-        const int i=ss.checkpoints.best(common,ids.size(),owner.id.generation,owner.epoch);
-        return checkpoint_available(s,i) ? i : -1;
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::fixed) {
+            const int i=ss.checkpoints.best(common,ids.size(),owner.id.generation,owner.epoch);
+            return checkpoint_available(s,i) ? i : -1;
+        }
+        return ss.checkpoints.best_available(common,ids.size(),owner.id.generation,owner.epoch,
+            [&](int i){return checkpoint_available(s,i);});
     }
-    void checkpoint_capture() {
+#include "q36_image_checkpoint.inc"
+    // Request-local observation, NOT a mutation during candidate discovery. Prefer
+    // the closest idle text lineage even if it has no useful snapshot yet.
+    // Full-prefix continuation in ANY slot is not evidence of a rewrite.
+    strata::core::Q36PrefixCheckpoints::Learning checkpoint_learning(const size_t* common_tokens) {
+        strata::core::Q36PrefixCheckpoints::Learning result;
+        if(checkpoint_policy!=strata::core::Q36PrefixCheckpoints::Policy::adaptive || !checkpoint_count) return result;
+        size_t longest=0;int source=-1;
+        for(int i=0;i<n_sess;++i) {
+            const auto& ss=sess[(size_t)i];const auto owner=kv_pool->session((uint32_t)i);
+            if(ss.active || !ss.imgs.empty() || owner.state!=strata::core::KvResidency::idle ||
+               !kv_adapters[(size_t)i]->covers(ss.live.size())) continue;
+            const size_t common=common_tokens[i];
+            if(common && common==ss.live.size()) return ss.checkpoints.learning;
+            if(common>longest) {longest=common;source=i;}
+        }
+        if(source>=0) {
+            result=sess[(size_t)source].checkpoints.learning;
+            const auto previous=sess[(size_t)source].live.size();
+            if(result.observe(longest,previous,(uint64_t)tmax))
+                std::fprintf(stderr,"Q36CHECKPOINT event=learn source=%d common_tokens=%zu previous_tokens=%zu rewrites=%llu\n",
+                    source,longest,previous,(unsigned long long)result.rewrites);
+        }
+        return result;
+    }
+    void checkpoint_capture(int image_index=-2,const strata::core::Q36ImagePoint* image=nullptr) {
         if(!checkpoint_count) return;
         auto& ss=sess[(size_t)cur];
-        const int i=ss.checkpoints.placement((uint64_t)pos);
+        const int i=image_index==-2 ? ss.checkpoints.placement((uint64_t)pos) : image_index;
         if(i<0) return;
+        // Retire before writing: a failed transfer cannot publish partial state.
+        const auto previous=ss.checkpoints.retire((size_t)i).pos;
+        if(image_checkpoints) ss.image_points[(size_t)i]={};
         const auto started=Clock::now();
         checkpoint_transfer(ss,ss.checkpoint_data[(size_t)i],false);
         CK(cudaStreamSynchronize(st)); // publish metadata only after the entire state is copied
         if(kv_bank) kv_bank->checkpoint_copy(checkpoint_payload,(uint64_t)(ms_since(started)*1000));
         const auto owner=kv_pool->session((uint32_t)cur);
-        ss.checkpoints.points[(size_t)i]={(uint64_t)pos,owner.id.generation,owner.epoch};
+        if(image_checkpoints) ss.image_points[(size_t)i]=image ? *image : strata::core::Q36ImagePoint{{},(uint64_t)pos,0,true};
+        ss.checkpoints.publish((size_t)i,{(uint64_t)pos,owner.id.generation,owner.epoch});
+        if(schedule_book) schedule_book->capture(cur,(size_t)i);
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive)
+            std::fprintf(stderr,"Q36CHECKPOINT event=capture session=%d record=%d tokens=%lld replaced_tokens=%llu reason=%s copy_bytes=%llu copy_us=%llu\n",
+                cur,i,(long long)pos,(unsigned long long)previous,image ? "image_legal_boundary" : ss.checkpoints.capture_reason(i),
+                (unsigned long long)checkpoint_payload,(unsigned long long)(ms_since(started)*1000));
     }
-    bool checkpoint_restore(int src,int index,int dst,const strata::core::KvIdlePin* donor_pin) {
+    bool checkpoint_restore(int src,int index,int dst,const strata::core::KvIdlePin* donor_pin,bool image_mode=false) {
         const auto* destination_lease=src==dst ? &kv_ids[(size_t)dst] : nullptr;
-        if(!checkpoint_available(src,index,donor_pin,destination_lease)) return false;
+        if(!checkpoint_available(src,index,donor_pin,destination_lease,image_mode)) return false;
+        const auto destination=kv_pool->session((uint32_t)dst);
+        if(image_mode && (destination.state!=strata::core::KvResidency::active || destination.id.generation!=kv_ids[(size_t)dst].generation)) return false;
         const auto p=sess[(size_t)src].checkpoints.points[(size_t)index];
         auto& a=sess[(size_t)src];auto& b=sess[(size_t)dst];
+        auto image_inherited=a.image_points;const auto image_point=a.image_points[(size_t)index];
         auto inherited=a.checkpoints.points;
         for(auto& q:inherited) if(q.pos>p.pos || q.generation!=p.generation || q.epoch!=p.epoch) q={};
         kv_ensure(dst,p.pos); // snapshots and every KV code/scale plane are charged to the adapter
         select(dst);
         const auto started=Clock::now();
         uint64_t copied=checkpoint_payload;
+        if(schedule_before_restore) schedule_before_restore(src,index);
+        if(src!=dst) b.checkpoints.clear(); // no publication during destination replacement
         checkpoint_transfer(b,a.checkpoint_data[(size_t)index],true);
         if(src!=dst) {
             const auto& g=m->g;
@@ -2978,12 +3080,31 @@ struct Engine {
         b.checkpoints.points=std::move(inherited);
         b.checkpoints.rewind(p.pos,owner.id.generation,owner.epoch);
         pos=b.pos=(int64_t)p.pos;
-        b.imgs.clear();clear_images(); // checkpoints are text-only; image requests never select them
+        b.imgs.clear();clear_images(); // incoming table is uploaded later; never borrow a donor's views
+        b.clear_image_points();
+        if(image_checkpoints) {
+            b.image_points=std::move(image_inherited);
+            for(size_t i=0;i<b.image_points.size();++i) if(i>=b.checkpoints.points.size() || !b.checkpoints.points[i].pos) b.image_points[i]={};
+            b.image_ready_end=p.pos;
+            if(image_mode) {
+                b.image_source=image_point.source;
+                for(const auto& x:strata::core::q36_image_source(image_point.source).images) if(x.cell+x.n<=p.pos)
+                    b.imgs.push_back({(int64_t)x.cell,(int64_t)x.n,x.hash});
+                set_delta(image_point.delta);
+            }
+        }
         kv_progress(dst,p.pos);
         checkpoint_last_reused=p.pos;
+        if(schedule_book) schedule_book->restore(src,(size_t)index,dst);
+        // This path already selected dst (select(dst) above) and restored its CPU/
+        // device rotary state, so the observation boundary is correct here.
+        observe_restored_state(dst);
         if(kv_protocol) std::printf("KVREPLAY session=%d generation=%llu epoch=%llu tokens=%llu reason=prefix_checkpoint\n",dst,
             (unsigned long long)owner.id.generation,(unsigned long long)owner.epoch,(unsigned long long)p.pos);
         std::fprintf(stderr,"Qwen3.6 prefix checkpoint: source=%d session=%d restored_tokens=%llu\n",src,dst,(unsigned long long)p.pos);
+        if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive)
+            std::fprintf(stderr,"Q36CHECKPOINT event=restore source=%d session=%d tokens=%llu copy_bytes=%llu copy_us=%llu\n",
+                src,dst,(unsigned long long)p.pos,(unsigned long long)copied,(unsigned long long)(ms_since(started)*1000));
         return true;
     }
 
@@ -3028,11 +3149,16 @@ struct Engine {
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
         b.checkpoints.clear(); // its snapshots describe the previous slot contents, not the copied donor
+        b.clear_image_points();b.image_source=a.image_source;b.image_ready_end=a.image_ready_end;
         b.pos = a.pos;
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
+        if(schedule_book) schedule_book->copy(src,dst);
+        // Do NOT observe here: dst is not the current slot, so d_delta still belongs
+        // to another session. The caller fires after it has selected dst.
+        request_restore_snapshot(dst);
     }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
@@ -3453,6 +3579,7 @@ uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
 struct ImgReq {
     std::vector<float> rows;
     std::vector<ImgKey> imgs;
+    strata::core::Q36ImageSourcePtr image_source;
     std::vector<int32_t> cell_row;   // per prompt cell: its row in `rows`, or -1 (text)
     std::vector<int32_t> mrope;      // [cell][3] t, h, w of every prompt cell (llama.cpp's mtmd positions)
     int32_t delta = 0;               // the text after the prompt: rotary position = cell + delta
@@ -3525,6 +3652,24 @@ std::string build_images(const std::string& path, const std::vector<int32_t>& id
     return "";
 }
 
+// Strict mode uses bounded ancillary buffers; legacy image parsing stays unchanged.
+std::string build_images_bounded(const std::string& path,const std::vector<int32_t>& ids,Engine& e,
+                                const std::vector<uint64_t>& keys,ImgReq& r) {
+    try {
+        auto input=strata::core::q36_read_vision(path,ids,(uint64_t)e.m->g.n_embd,(uint64_t)e.ctx,e.vision_max_rows,keys);
+        if(e.image_checkpoints) {
+            strata::core::Q36ImageHostTimer timer(e.image_metadata_us);
+            if(e.vision_max_rows>strata::core::Q36ImageSource::max_rows) throw std::invalid_argument("image checkpoints require the combined 1024-row cap");
+            auto proof=std::make_shared<strata::core::Q36ImageSource>();proof->width=(uint64_t)e.m->g.n_embd;proof->rows=input.rows;
+            for(const auto& x:input.images) proof->images.push_back({(uint64_t)x.cell,(uint64_t)x.n,(uint64_t)x.nx,(uint64_t)x.ny,x.rotary,x.row,x.hash});
+            r.image_source=std::move(proof);
+        }
+        r.rows=std::move(input.rows);r.cell_row=std::move(input.cell_row);r.mrope=std::move(input.mrope);r.delta=input.delta;
+        for(const auto& image:input.images) r.imgs.push_back({image.cell,image.n,image.hash});
+        return "";
+    } catch(const std::exception& error) {return error.what();}
+}
+
 // ------------------------------------------------------------------------------------------------ serve
 /// A batch slot: a session decoding (its next token is `x`, not yet in the state).
 struct Slot {
@@ -3561,6 +3706,8 @@ struct Serve {
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
+    std::function<void(int64_t)> vision_test_on_chunk; // optional developer gate only
+    double schedule_prefill_ms=0; // optional developer gate measurement
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess), kv_batch_lease((size_t) e.n_sess, false) {
         E.kv_protocol = true;
@@ -3795,7 +3942,7 @@ struct Serve {
     }
 
     /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
-    size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+    size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,const strata::core::Q36ImageSource* image_source=nullptr) const {
         const size_t L = ss.live.size();
         if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
         std::vector<ImgKey> in_live;
@@ -3803,12 +3950,15 @@ struct Serve {
             if (k.cell + k.n <= (int64_t) L) in_live.push_back(k);
             else if (k.cell < (int64_t) L) return 0;   // the held tokens end inside a picture
         }
+        if(E.image_checkpoints && image_source)
+            return E.image_prefix_equal(strata::core::q36_image_source(ss.image_source),*image_source,L) ? L : 0;
         return in_live == ss.imgs ? L : 0;
     }
 
     /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
     /// least recently used (never a decoding slot).
-    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                     const size_t* common_tokens=nullptr,const strata::core::Q36ImageSource* image_source=nullptr) const {
         int best = -1, free_empty = -1, lru = -1;
         size_t bl = 0;
         for (int i = 0; i < E.n_sess; ++i) {
@@ -3818,17 +3968,17 @@ struct Serve {
                 const auto state = E.kv_pool->session((uint32_t) i).state;
                 if (state == strata::core::KvResidency::active || state == strata::core::KvResidency::faulted) continue;
             }
-            const size_t l = match_len(ss, ids, imgs);
+            const size_t l = match_len(ss, ids, imgs,image_source);
             if (l > bl) { bl = l; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
             if (lru < 0 || (E.kv_pool
                 ? E.kv_pool->session((uint32_t) i).last_use < E.kv_pool->session((uint32_t) lru).last_use
                 : ss.used < E.sess[(size_t) lru].used)) lru = i;
         }
-        if (best < 0 && imgs.empty() && E.checkpoint_count) {
+        if (best < 0 && (imgs.empty() || (E.image_checkpoints && image_source)) && E.checkpoint_count) {
             uint64_t longest=0;
             for(int i=0;i<E.n_sess;++i) {
-                const int cp=E.checkpoint_match(i,ids);
+                const int cp=image_source && E.image_checkpoints ? E.image_checkpoint_match(i,ids,*image_source) : E.checkpoint_match(i,ids,common_tokens ? common_tokens[i] : SIZE_MAX);
                 if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>longest) {
                     longest=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;best=i;
                 }
@@ -3836,6 +3986,8 @@ struct Serve {
         }
         return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
     }
+
+#include "q36_cache_diagnostics.inc"
 
     void request(const std::string& line) {
         try { request_body(line); }
@@ -3948,35 +4100,65 @@ struct Serve {
         if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); return; }
         ImgReq ir;
         if (geni) {
-            const std::string ve = build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
+            const std::string ve = E.kv_bank ? build_images_bounded(emb,ids,E,img_keys,ir)
+                                             : build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
             if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); return; }
         }
+        const bool image_checkpoint_mode=geni && E.image_checkpoints;
+        const auto* image_source=image_checkpoint_mode ? ir.image_source.get() : nullptr;
         stop.store(false);
+        // Reuse the actual rendered-token LCP once per slot, before admission.
+        std::array<size_t,Engine::kVerify> common_cache{};const size_t* common_tokens=nullptr;
+        if((!geni || image_checkpoint_mode) && E.checkpoint_count && E.checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive) {
+            for(int i=0;i<E.n_sess;++i) common_cache[(size_t)i]=image_checkpoint_mode ?
+                strata::core::q36_image_common(strata::core::q36_image_source(E.sess[(size_t)i].image_source),*image_source,E.checkpoint_common(i,ids)) : E.checkpoint_common(i,ids);
+            common_tokens=common_cache.data();
+        }
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
-        const int s = adm ? slot : pick_session(ids, ir.imgs);
+        if(E.cache_diagnostics) cache_diag_before(adm,geni,slot,ids,ir,emb,img_keys);
+        const int s = adm ? slot : pick_session(ids, ir.imgs,common_tokens,image_source);
+        if(E.cache_diagnostics) cache_diag_selected(s);
         if (s < 0) {
             std::printf("ERR kv_session_busy: all inference slots are active\n"); std::fflush(stdout); return;
         }
+        struct CacheRetainedScope {
+            Serve& server;int slot;
+            ~CacheRetainedScope(){if(server.E.cache_diagnostics) server.cache_diag_retained(slot);}
+        } cache_retained_scope{*this,s};
         Engine::Sess& ss = E.sess[(size_t) s];
-        size_t reuse = match_len(ss, ids, ir.imgs);
+        size_t reuse = match_len(ss, ids, ir.imgs,image_source);
         E.checkpoint_last_reused=0;
-        int cp_src=-1, cp_index=-1;
+        E.discard_restore_snapshot(); // a producer's deferred observation never crosses requests
+        int cp_src=-1, cp_index=-1,image_full_source=-1;
+        size_t image_full_length=0;
         bool restored=false, full_donor=false;
         std::unique_ptr<strata::core::KvIdlePin> cp_pin;
-        if (!reuse && !geni && E.checkpoint_count) {
+        // Keep hints local across reset; never mutate/republish donor records.
+        const auto learned = common_tokens ? (image_checkpoint_mode ? E.image_checkpoint_learning(common_tokens) : E.checkpoint_learning(common_tokens)) : strata::core::Q36PrefixCheckpoints::Learning{};
+        if(adm && image_checkpoint_mode) for(int i=0;i<E.n_sess;++i) if(i!=s && !E.sess[(size_t)i].active) {
+            const auto n=match_len(E.sess[(size_t)i],ids,ir.imgs,image_source);
+            if(n>std::max(reuse,image_full_length) && E.kv_pool->session((uint32_t)i).state==strata::core::KvResidency::idle && E.kv_adapters[(size_t)i]->covers(n)) {image_full_source=i;image_full_length=n;}
+        }
+        if (!reuse && (!geni || image_checkpoint_mode) && E.checkpoint_count) {
             // Prefer any full-state donor, exactly as before; checkpoint work is
             // only for requests the existing exact-prefix path cannot serve.
             if(adm) for(int i=0;i<E.n_sess;++i)
-                if(i!=s && !E.sess[(size_t)i].active && match_len(E.sess[(size_t)i],ids,ir.imgs)) full_donor=true;
+                if(i!=s && !E.sess[(size_t)i].active) {
+                    const auto n=match_len(E.sess[(size_t)i],ids,ir.imgs,image_source);
+                    if(n) full_donor=true;
+                    if(image_checkpoint_mode && n>image_full_length && E.kv_pool->session((uint32_t)i).state==strata::core::KvResidency::idle && E.kv_adapters[(size_t)i]->covers(n)) {image_full_source=i;image_full_length=n;}
+                }
             if(!full_donor) for(int i=0;i<E.n_sess;++i) {
-                const int cp=E.checkpoint_match(i,ids);
+                const int cp=image_checkpoint_mode ? E.image_checkpoint_match(i,ids,*image_source) : E.checkpoint_match(i,ids,common_tokens ? common_tokens[i] : SIZE_MAX);
                 if(cp>=0 && E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos>reuse) {
                     reuse=E.sess[(size_t)i].checkpoints.points[(size_t)cp].pos;cp_src=i;cp_index=cp;
                 }
             }
             // Protect a donor BEFORE admission/growth can reclaim idle owners.
             if(cp_src>=0 && cp_src!=s) cp_pin=std::make_unique<strata::core::KvIdlePin>(E.kv_pool.get(),E.kv_ids[(size_t)cp_src]);
+            else if(image_full_source>=0) cp_pin=std::make_unique<strata::core::KvIdlePin>(E.kv_pool.get(),E.kv_ids[(size_t)image_full_source]);
         }
+        if(image_full_source>=0 && !cp_pin) cp_pin=std::make_unique<strata::core::KvIdlePin>(E.kv_pool.get(),E.kv_ids[(size_t)image_full_source]);
         if (E.kv_pool) {
             const auto before = E.kv_pool->session(s);
             if (kv_generation && kv_generation != before.id.generation)
@@ -3986,7 +4168,7 @@ struct Serve {
                 throw strata::core::KvFailure({strata::core::KvCode::cache_miss, "full-history replay required"});
             E.kv_begin(s, ids.size() + (uint64_t) max_new, reuse == 0 || (cp_src>=0 && cp_src!=s));
             if(cp_src>=0) {
-                restored=E.checkpoint_restore(cp_src,cp_index,s,cp_pin.get());
+                restored=E.checkpoint_restore(cp_src,cp_index,s,cp_pin.get(),image_checkpoint_mode);
                 if(!restored) { // stale/unavailable record: never shorten a live recurrent sequence
                     reuse=0;
                     strata::core::kv_require(E.kv_pool->replay_started(E.kv_ids[(size_t)s]));
@@ -4004,31 +4186,59 @@ struct Serve {
             size_t best = reuse;
             for (int i = 0; i < E.n_sess; ++i) {
                 if (i == s || E.sess[(size_t) i].active) continue;
-                const size_t l = match_len(E.sess[(size_t) i], ids, ir.imgs);
+                const size_t l = match_len(E.sess[(size_t) i], ids, ir.imgs,image_source);
                 if (l > best) { best = l; src = i; }
             }
             if (src >= 0) {
-                const strata::core::KvIdlePin source_pin(E.kv_pool.get(), E.kv_pool ? E.kv_ids[(size_t) src] : strata::core::KvIdentity{});
+                const strata::core::KvIdlePin source_pin(src==image_full_source ? nullptr : E.kv_pool.get(), E.kv_pool ? E.kv_ids[(size_t) src] : strata::core::KvIdentity{});
+                if(src==image_full_source && (!cp_pin || !cp_pin->holds(E.kv_pool.get(),E.kv_ids[(size_t)src]))) throw std::logic_error("image full-prefix donor lost its pin");
                 E.kv_ensure(s, (uint64_t) E.sess[(size_t) src].pos);
                 E.copy_session(src, s);
+                if(E.cache_diagnostics) std::fprintf(stderr,"Q36CACHE donor request=%llu source=%d destination=%d kind=complete_state\n",(unsigned long long)cache_request,src,s);
                 reuse = best;
             }
         }
+        cp_pin.reset(); // complete-state image donor stayed pinned THROUGH admission/copy
+        if(E.cache_diagnostics) cache_diag_resolved(s,reuse,cp_src,restored);
         E.select(s);
+        // A complete-state donor copy deferred its observation to exactly here: dst is
+        // now current (its CPU/device rotary state loaded) and the incoming rows/table
+        // and suffix processing have not started. checkpoint_restore observed already.
+        E.fire_restore_snapshot();
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
         }
+        if((!geni || image_checkpoint_mode) && E.checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive && E.checkpoint_count) {
+            ss.checkpoints.learning=learned;
+            ss.checkpoints.plan(reuse,ids.size(),(uint64_t)E.tmax);
+            std::fprintf(stderr,"Q36CHECKPOINT event=plan session=%d start_tokens=%zu target0=%llu target1=%llu\n",
+                s,reuse,(unsigned long long)ss.checkpoints.targets[0],(unsigned long long)ss.checkpoints.targets[1]);
+        }
+        const bool image_prefix_ready=E.image_checkpoints && (reuse==0 || restored || ss.image_ready_end==reuse);
+        if(image_checkpoint_mode) {
+            ss.image_source=ir.image_source;
+            ss.image_plan.make(ss.checkpoints,*image_source,reuse,ids.size(),(uint64_t)E.tmax);
+        } else if(E.image_checkpoints) ss.image_source.reset();
+        Engine::VisionPrefillScope vision_scope(E,geni && bool(E.kv_bank));
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
+        if(E.schedule_book) {
+            E.schedule_book->begin(s,ids.data()+reuse,fresh,restored);
+            if(geni) {auto& call=E.schedule_book->live.at(s).back();call.image_file=emb;call.image_ids=ids;call.image_keys=img_keys;}
+        }
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+            if(E.schedule_book) E.schedule_book->progress(s,(uint64_t)done);
+            if(geni && vision_test_on_chunk) vision_test_on_chunk(done);
             // Only fresh/restored text-prefill lineage has a fully seeded MTP
             // prefix. Preserve the exact-prefix decode fast path unchanged.
+            if(E.image_checkpoints && image_prefix_ready && (fresh>1 || restored) && E.m->has_mtp && E.mtp_d>0) ss.image_ready_end=(uint64_t)E.pos;
             if(!geni && fresh>1 && (!reuse || restored)) E.checkpoint_capture();
+            if(image_checkpoint_mode && image_prefix_ready && (fresh>1 || restored)) E.image_checkpoint_capture();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
@@ -4042,6 +4252,7 @@ struct Serve {
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
         }, restored);
+        vision_scope.finish(); // shared rows/table are not a decoding slot's persistent state
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -4053,10 +4264,16 @@ struct Serve {
             ss.live.clear();
             ss.imgs.clear();
         }
+        if(geni && E.kv_bank) E.set_delta(cut ? 0 : strata::core::q36_vision_prefix_delta(ir.mrope,ss.live.size()));
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
+        if(E.schedule_book) schedule_prefill_ms=prompt_ms;
         if (cancelled) {
             E.kv_end(s);
+            if(geni && cut && E.kv_bank) {
+                strata::core::kv_require(E.kv_pool->reset(E.kv_ids[(size_t)s],E.kv_ids[(size_t)s]));
+                E.kv_required[(size_t)s]=0;
+            }
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) got);
             if (adm) std::printf("BADM %d 0\n", slot);
             std::fflush(stdout);
@@ -4254,6 +4471,12 @@ public:
         const auto s=text.str(); vector(std::vector<char>(s.begin(),s.end()));
     }
 };
+
+#define STRATA_Q36_VISION_PREALLOCATION_IMPL 1
+#include "q36_vision_regression.inc"
+#include "q36_image_cache_regression.inc"
+#include "q36_checkpoint_schedule.inc"
+#include "q36_image_checkpoint_regression.inc"
 
 // Developer-only focused GPU/model gate, not a benchmark or an HTTP feature.
 // FILE is two CSV token lines: the original prompt, then its revised system suffix.
@@ -4512,13 +4735,17 @@ int serve(Engine& E) {
 }  // namespace
 
 static int q36_run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump;
+    std::string model, tokens, force, dump_full, emb_file, checkpoint_test, sampled_mtp_test, test_state_dump, vision_test;
+    std::string schedule_test, schedule_corrupt, image_cache_test,image_checkpoint_test,image_checkpoint_corrupt;
+    bool image_checkpoints=false;
+    uint64_t kv_vision_max_tokens=0;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
-    bool warm = true, kv_preallocate = false;
+    bool warm = true, kv_preallocate = false, cache_diagnostics = false;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv_int8 = false, mtp_sampled = false;
     uint64_t kv_pool_tokens = 0, kv_pool_bytes = UINT64_MAX, checkpoint_budget = 0, checkpoint_interval = 1024;
+    auto checkpoint_policy = strata::core::Q36PrefixCheckpoints::Policy::fixed;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4562,11 +4789,21 @@ static int q36_run(int argc, char** argv) {
             kv_int8 = format == "int8";
         }
         else if (a == "--kv-preallocate") kv_preallocate = true;
+        else if (a == "--kv-cache-diagnostics") cache_diagnostics = true;
+        else if (a == "--kv-image-cache-test") image_cache_test = next();
+        else if (a == "--kv-image-checkpoints") image_checkpoints=true;
+        else if (a == "--kv-image-checkpoint-test") image_checkpoint_test=next();
+        else if (a == "--kv-image-checkpoint-corrupt") image_checkpoint_corrupt=next();
+        else if (a == "--kv-vision-max-tokens") kv_vision_max_tokens=strata::core::kv_parse_limit(next(),"--kv-vision-max-tokens");
+        else if (a == "--kv-vision-test") vision_test=next();
         else if (a == "--kv-pool-tokens") kv_pool_tokens = strata::core::kv_parse_limit(next(), "--kv-pool-tokens");
         else if (a == "--kv-pool-mib") kv_pool_bytes = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-pool-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-mib") checkpoint_budget = strata::core::kv_mul(strata::core::kv_parse_limit(next(), "--kv-checkpoint-mib"), 1ull << 20);
         else if (a == "--kv-checkpoint-interval") checkpoint_interval = strata::core::kv_parse_limit(next(), "--kv-checkpoint-interval");
+        else if (a == "--kv-checkpoint-policy") checkpoint_policy = strata::core::Q36PrefixCheckpoints::parse_policy(next());
         else if (a == "--kv-checkpoint-test") checkpoint_test = next();
+        else if (a == "--kv-schedule-test") schedule_test = next();
+        else if (a == "--kv-schedule-corrupt") schedule_corrupt = next();
         else if (a == "--test-state-dump") test_state_dump = next();
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
@@ -4586,8 +4823,14 @@ static int q36_run(int argc, char** argv) {
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n"
                          "       [--batch 4 --kv-pool-tokens 500000 [--kv-pool-mib N] --kv fp32|int8 --mtp 2 --batch-mtp]\n"
-                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024] [--kv-checkpoint-test FILE]\n"
-                         "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n");
+                         "       [--kv-checkpoint-mib N --kv-checkpoint-interval 1024 --kv-checkpoint-policy fixed|adaptive]\n"
+                         "       [--kv-checkpoint-test FILE]\n"
+                         "       [--kv-cache-diagnostics] (bounded host-only cache observations on stderr)\n"
+                         "       [--kv-image-cache-test FILE --test-state-dump FILE] (developer OFF/ON replay)\n"
+                         "       [--kv-image-checkpoints] [--kv-image-checkpoint-test FILE] (opt-in, unqualified)\n"
+                         "       [--kv-schedule-test FILE [--kv-schedule-corrupt conv|gdn|hlast]]\n"
+                         "       [--mtp-sampled [--mtp-sampled-test FILE]] [--kv-preallocate]\n"
+                         "       [--vision [--kv-vision-max-tokens N] [--kv-vision-test FILE]]\n");
             return 2;
         }
     }
@@ -4610,22 +4853,41 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
     if (!kv_pool_tokens && kv_pool_bytes != UINT64_MAX)
         throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
+    if(image_checkpoints && (!kv_preallocate || !vision || !serve_mode || !checkpoint_budget || !kv_vision_max_tokens || kv_vision_max_tokens>1024 || chunk!=512))
+        throw std::invalid_argument("--kv-image-checkpoints requires strict --serve --vision, checkpoints, --chunk 512 and an explicit combined image-row cap <=1024; default disabled pending Orin qualification");
+    if(!image_checkpoint_corrupt.empty() && (image_checkpoint_test.empty() || !image_checkpoints || image_checkpoint_corrupt!="conv")) throw std::invalid_argument("image checkpoint corruption control requires its gate and conv");
+    if(!image_checkpoint_test.empty() && (!schedule_test.empty() || !image_cache_test.empty() || !checkpoint_test.empty() || !vision_test.empty() || !sampled_mtp_test.empty()))
+        throw std::invalid_argument("image checkpoint gate cannot combine developer gates");
+    if(checkpoint_policy==strata::core::Q36PrefixCheckpoints::Policy::adaptive && !checkpoint_budget)
+        throw std::invalid_argument("--kv-checkpoint-policy adaptive requires --kv-checkpoint-mib");
     if (checkpoint_budget && !kv_pool_tokens) throw std::invalid_argument("--kv-checkpoint-mib requires --kv-pool-tokens");
     if (checkpoint_budget && checkpoint_interval > (uint64_t)ctx) throw std::invalid_argument("checkpoint interval exceeds context");
+    if(!schedule_corrupt.empty() && schedule_test.empty()) throw std::invalid_argument("--kv-schedule-corrupt requires --kv-schedule-test");
+    if(!image_cache_test.empty() && (!schedule_test.empty() || !checkpoint_test.empty() || !vision_test.empty() || !sampled_mtp_test.empty()))
+        throw std::invalid_argument("select only one native developer test");
+    if(!schedule_test.empty() && (!checkpoint_test.empty() || !vision_test.empty() || !sampled_mtp_test.empty()))
+        throw std::invalid_argument("select only one native developer test");
+    if(!schedule_test.empty() && (!checkpoint_budget || !kv_pool_tokens || batch!=4))
+        throw std::invalid_argument("--kv-schedule-test requires checkpoints, unified pool and four slots");
     if (!checkpoint_test.empty() && (!checkpoint_budget || !kv_pool_tokens))
         throw std::invalid_argument("--kv-checkpoint-test requires opt-in checkpoints and a unified pool");
-    if (checkpoint_budget && !serve_mode && checkpoint_test.empty())
+    if (checkpoint_budget && !serve_mode && checkpoint_test.empty() && schedule_test.empty())
         throw std::invalid_argument("prefix checkpoints require --serve or --kv-checkpoint-test");
-    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty())
-        throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test or --mtp-sampled-test");
+    if (!test_state_dump.empty() && checkpoint_test.empty() && sampled_mtp_test.empty() && vision_test.empty() && schedule_test.empty() && image_cache_test.empty() && image_checkpoint_test.empty())
+        throw std::invalid_argument("--test-state-dump requires --kv-checkpoint-test, --mtp-sampled-test or --kv-vision-test");
+    if(kv_vision_max_tokens && (!kv_preallocate || !vision || kv_vision_max_tokens>(uint64_t)ctx))
+        throw std::invalid_argument("--kv-vision-max-tokens requires --kv-preallocate --vision and a limit <= context");
+    if(!vision_test.empty() && (!vision || !kv_pool_tokens || batch!=4 || mtp_d!=2))
+        throw std::invalid_argument("--kv-vision-test requires --vision, unified KV, four slots and MTP2");
     if (kv_preallocate) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
         throw std::invalid_argument("--kv-preallocate requires CUDA SM87 Qwen3.6; omit it on this backend");
 #else
-        if (!kv_pool_tokens || !kv_int8 || mtp_d != 2 || batch != 4 || !batch_mtp || vision ||
+        if (!kv_pool_tokens || !kv_int8 || mtp_d != 2 || batch != 4 || !batch_mtp || (vision && !serve_mode) ||
             !emb_file.empty() || expert_slots > 0 || expert_vram >= 0 || chunk == 0 || !warm)
-            throw std::invalid_argument("--kv-preallocate supports text full-GPU Qwen3.6 only: use --kv-pool-tokens N "
-                "--kv int8 --mtp 2 --batch 4 --batch-mtp --chunk N; keep warmup, omit vision and expert placement overrides");
+            throw std::invalid_argument("--kv-preallocate supports full-GPU Qwen3.6: use --kv-pool-tokens N "
+                "--kv int8 --mtp 2 --batch 4 --batch-mtp --chunk N; keep warmup, omit --emb and expert placement overrides; "
+                "--vision uses bounded startup staging with --serve GENI/BGENI");
         int device = 0; cudaDeviceProp prop{};
         CK(cudaGetDevice(&device)); CK(cudaGetDeviceProperties(&prop, device));
         if (prop.major != 8 || prop.minor != 7)
@@ -4643,10 +4905,15 @@ static int q36_run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv_int8 = kv_int8;
+    E.cache_diagnostics = cache_diagnostics;
     E.kv_preallocate = kv_preallocate;
+    E.vision_max_rows=kv_vision_max_tokens;
     if (kv_preallocate && !m.has_mtp) throw std::runtime_error("--kv-preallocate requires the loaded Qwen3.6 MTP block");
     E.checkpoint_budget = checkpoint_budget;
     E.checkpoint_interval = checkpoint_interval;
+    E.checkpoint_policy = checkpoint_policy;
+    E.image_checkpoints=image_checkpoints;
+    if(checkpoint_budget) std::fprintf(stderr,"Qwen3.6 checkpoint policy: %s\n",strata::core::Q36PrefixCheckpoints::name(checkpoint_policy));
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -4729,10 +4996,14 @@ static int q36_run(int argc, char** argv) {
             throw std::runtime_error("--kv-preallocate: post-warmup memory headroom exhausted; refusing READY");
         strata::core::kv_print_status(*E.kv_pool, E.n_sess, strata::core::unified_kv_available());
     }
-    if (!checkpoint_test.empty() || !sampled_mtp_test.empty()) {
+    if (!vision_test.empty() || !checkpoint_test.empty() || !sampled_mtp_test.empty() || !schedule_test.empty() || !image_cache_test.empty() || !image_checkpoint_test.empty()) {
         const auto allocations=E.kv_bank ? E.kv_bank->backing_info().allocations : 0;
         const auto driver=strata::core::vmm_allocation_stats();
-        const int result=!checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
+        const int result=!image_checkpoint_test.empty() ? image_checkpoint_regression(E,image_checkpoint_test,test_state_dump,image_checkpoint_corrupt)
+                        : !image_cache_test.empty() ? image_cache_regression(E,image_cache_test,test_state_dump)
+                        : !schedule_test.empty() ? checkpoint_schedule_regression(E,schedule_test,test_state_dump,schedule_corrupt)
+                        : !vision_test.empty() ? vision_preallocation_regression(E,vision_test,test_state_dump)
+                        : !checkpoint_test.empty() ? checkpoint_regression(E,checkpoint_test,test_state_dump)
                                                 : sampled_mtp_regression(E,sampled_mtp_test,test_state_dump);
         if(E.kv_bank) {
             const auto info=E.kv_pool->info();
