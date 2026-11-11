@@ -15,7 +15,7 @@ struct Q36ImageRecord {
 };
 struct Q36ImageSource {
     // The explicit configured cap still controls staging; this is its ceiling.
-    static constexpr uint64_t max_rows=4096;
+    static constexpr uint64_t max_rows=32768;
     uint64_t width=0;
     std::vector<float> rows; // immutable ACTUAL uploaded FP32 bytes, shared by live/points
     std::vector<Q36ImageRecord> images;

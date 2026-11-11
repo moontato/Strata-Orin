@@ -36,27 +36,27 @@ int main(int argc,char** argv) {
     write(true);fails([&]{q36_read_vision(path,ids,2,32,16);});write(false,true);fails([&]{q36_read_vision(path,ids,2,32,16);});
     write();{std::fstream out(path,std::ios::in|std::ios::out|std::ios::binary);out.seekp(20);float v=0.25f;out.write((char*)&v,4);}
     assert(q36_read_vision(path,ids,2,32,16,{17,19}).images[0].hash!=input.images[0].hash);
-    // Four full encoder outputs fit only with the higher budget.
+    // Thirty-two full encoder outputs fit only with the higher budget.
     constexpr uint64_t cap=Q36ImageSource::max_rows;
-    static_assert(cap==4096);
-    assert(Q36VisionBudget::make(262144,2048,512,cap).embedding_bytes==32*1024*1024);
+    static_assert(cap==32768);
+    assert(Q36VisionBudget::make(262144,2048,512,cap).embedding_bytes==256*1024*1024);
     std::vector<int32_t> multi={42};
     {
         std::ofstream out(path,std::ios::binary|std::ios::trunc);
         const int32_t header[]={0x31455653,1024,32,32,2048};
         std::vector<float> rows(1024*2048,0.25f);
-        for(int i=0;i<4;++i) {
+        for(int i=0;i<32;++i) {
             out.write((const char*)header,sizeof header);
             out.write((const char*)rows.data(),rows.size()*sizeof(float));
             multi.insert(multi.end(),1024,q36_image_pad);multi.push_back(43+i);
         }
         assert(out);
     }
-    fails([&]{q36_read_vision(path,multi,2048,8192,1024);});
+    fails([&]{q36_read_vision(path,multi,2048,65536,16384);});
     {
-        const auto four=q36_read_vision(path,multi,2048,8192,cap);
-        assert(four.images.size()==4 && four.rows.size()==cap*2048);
-        assert(four.images.back().row==3072 && four.prefix_delta(multi.size())==-3968);
+        const auto full=q36_read_vision(path,multi,2048,65536,cap);
+        assert(full.images.size()==32 && full.rows.size()==cap*2048);
+        assert(full.images.back().row==31*1024 && full.prefix_delta(multi.size())==-32*(1024-32));
     }
     {
         std::ofstream out(path,std::ios::binary|std::ios::app);
@@ -66,8 +66,8 @@ int main(int argc,char** argv) {
         out.write((const char*)row.data(),row.size()*sizeof(float));
         assert(out);
     }
-    multi.push_back(q36_image_pad);multi.push_back(47);
-    fails([&]{q36_read_vision(path,multi,2048,8192,cap);});
+    multi.push_back(q36_image_pad);multi.push_back(75);
+    fails([&]{q36_read_vision(path,multi,2048,65536,cap);});
     // One shared prefill lease; no second slot can overwrite its buffer. Reset
     // another slot leaves the owner intact; generation/epoch changes are stale.
     Q36VisionLease lease;lease.acquire(0,3,7);lease.check(0,3,7);lease.invalidate(2);assert(lease.busy());

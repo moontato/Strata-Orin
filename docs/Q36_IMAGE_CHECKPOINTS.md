@@ -2,7 +2,7 @@
 
 `--kv-image-checkpoints` is opt-in. It extends prefix restoration to eligible
 image histories with strict preallocation, a checkpoint budget, `--vision`,
-`--chunk 512` and an explicit combined image cap no larger than 4096 rows.
+`--chunk 512` and an explicit combined image cap no larger than 32768 rows.
 The flag remains off by default.
 
 ```text
@@ -15,9 +15,9 @@ The flag remains off by default.
 
 `--kv-vision-max-tokens` counts all image rows in a request, including images
 resent by a tool loop. It is independent of the encoder's per-image
-`vision.max_tokens` setting. A 4096-row cap allows four 1024-row images.
-The example keeps the previous 1024-row profile. At width 2048, the larger
-cap raises the shared device embedding staging from 8 MiB to 32 MiB.
+`vision.max_tokens` setting. A 32768-row cap allows thirty-two 1024-row images.
+The example keeps the 1024-row profile. At width 2048, the larger cap
+reserves 256 MiB of shared device embedding staging.
 Retained CPU image proofs can also grow; the KV bank and checkpoint count
 are unchanged.
 
