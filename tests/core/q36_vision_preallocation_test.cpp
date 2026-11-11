@@ -1,4 +1,5 @@
 #include "strata/core/q36_vision_preallocation.hpp"
+#include "strata/core/q36_image_checkpoint.hpp"
 #include "strata/core/unified_kv_capacity.hpp"
 #include <cassert>
 #include <iostream>
@@ -35,6 +36,38 @@ int main(int argc,char** argv) {
     write(true);fails([&]{q36_read_vision(path,ids,2,32,16);});write(false,true);fails([&]{q36_read_vision(path,ids,2,32,16);});
     write();{std::fstream out(path,std::ios::in|std::ios::out|std::ios::binary);out.seekp(20);float v=0.25f;out.write((char*)&v,4);}
     assert(q36_read_vision(path,ids,2,32,16,{17,19}).images[0].hash!=input.images[0].hash);
+    // Four full encoder outputs fit only with the higher budget.
+    constexpr uint64_t cap=Q36ImageSource::max_rows;
+    static_assert(cap==4096);
+    assert(Q36VisionBudget::make(262144,2048,512,cap).embedding_bytes==32*1024*1024);
+    std::vector<int32_t> multi={42};
+    {
+        std::ofstream out(path,std::ios::binary|std::ios::trunc);
+        const int32_t header[]={0x31455653,1024,32,32,2048};
+        std::vector<float> rows(1024*2048,0.25f);
+        for(int i=0;i<4;++i) {
+            out.write((const char*)header,sizeof header);
+            out.write((const char*)rows.data(),rows.size()*sizeof(float));
+            multi.insert(multi.end(),1024,q36_image_pad);multi.push_back(43+i);
+        }
+        assert(out);
+    }
+    fails([&]{q36_read_vision(path,multi,2048,8192,1024);});
+    {
+        const auto four=q36_read_vision(path,multi,2048,8192,cap);
+        assert(four.images.size()==4 && four.rows.size()==cap*2048);
+        assert(four.images.back().row==3072 && four.prefix_delta(multi.size())==-3968);
+    }
+    {
+        std::ofstream out(path,std::ios::binary|std::ios::app);
+        const int32_t header[]={0x31455653,1,1,1,2048};
+        std::vector<float> row(2048,0.5f);
+        out.write((const char*)header,sizeof header);
+        out.write((const char*)row.data(),row.size()*sizeof(float));
+        assert(out);
+    }
+    multi.push_back(q36_image_pad);multi.push_back(47);
+    fails([&]{q36_read_vision(path,multi,2048,8192,cap);});
     // One shared prefill lease; no second slot can overwrite its buffer. Reset
     // another slot leaves the owner intact; generation/epoch changes are stale.
     Q36VisionLease lease;lease.acquire(0,3,7);lease.check(0,3,7);lease.invalidate(2);assert(lease.busy());

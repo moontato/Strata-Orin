@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <string>
 #include <vector>
 namespace strata::core {
 constexpr int32_t q36_image_pad=248056;
@@ -64,14 +65,16 @@ inline Q36VisionInput q36_read_vision(const std::string& path,const std::vector<
     if(!file) throw std::invalid_argument("cannot open embeddings file");
     const auto end=file.tellg();
     const auto max_file=kv_mul(max_rows,kv_add(kv_mul(width,4),20));
-    if(end<=0 || (uint64_t)end>max_file) throw std::invalid_argument("embeddings file exceeds strict vision bound or is empty");
+    if(end<=0) throw std::invalid_argument("embeddings file is empty or its size could not be read");
+    if((uint64_t)end>max_file)
+        throw std::invalid_argument("combined image embeddings exceed --kv-vision-max-tokens (" + std::to_string(max_rows) + " rows per request)");
     struct Record {int32_t n,nx,ny;uint64_t offset;};std::vector<Record> records;
     uint64_t at=0,total=0;
     while(at<(uint64_t)end) {
         int32_t h[5];file.seekg((std::streamoff)at);file.read((char*)h,sizeof h);
         if(!file || h[0]!=0x31455653 || h[1]<1 || h[2]<1 || h[3]<1 || (int64_t)h[2]*h[3]!=h[1] || h[4]!=(int64_t)width)
             throw std::invalid_argument("bad/short SVE1 header or embedding width/grid");
-        total=kv_add(total,(uint64_t)h[1]);if(total>max_rows) throw std::invalid_argument("image rows exceed --kv-vision-max-tokens");
+        total=kv_add(total,(uint64_t)h[1]);if(total>max_rows) throw std::invalid_argument("combined image rows exceed --kv-vision-max-tokens (" + std::to_string(max_rows) + " rows per request)");
         const uint64_t offset=kv_add(at,20),bytes=kv_mul(kv_mul((uint64_t)h[1],width),4);
         if(offset>(uint64_t)end || bytes>(uint64_t)end-offset) throw std::invalid_argument("short SVE1 payload");
         records.push_back({h[1],h[2],h[3],offset});at=kv_add(offset,bytes);

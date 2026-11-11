@@ -3659,7 +3659,8 @@ std::string build_images_bounded(const std::string& path,const std::vector<int32
         auto input=strata::core::q36_read_vision(path,ids,(uint64_t)e.m->g.n_embd,(uint64_t)e.ctx,e.vision_max_rows,keys);
         if(e.image_checkpoints) {
             strata::core::Q36ImageHostTimer timer(e.image_metadata_us);
-            if(e.vision_max_rows>strata::core::Q36ImageSource::max_rows) throw std::invalid_argument("image checkpoints require the combined 1024-row cap");
+            if(e.vision_max_rows>strata::core::Q36ImageSource::max_rows)
+                throw std::invalid_argument("image checkpoint budget exceeds the combined image-row ceiling");
             auto proof=std::make_shared<strata::core::Q36ImageSource>();proof->width=(uint64_t)e.m->g.n_embd;proof->rows=input.rows;
             for(const auto& x:input.images) proof->images.push_back({(uint64_t)x.cell,(uint64_t)x.n,(uint64_t)x.nx,(uint64_t)x.ny,x.rotary,x.row,x.hash});
             r.image_source=std::move(proof);
@@ -4853,8 +4854,10 @@ static int q36_run(int argc, char** argv) {
         throw std::invalid_argument("unified KV: --batch must be 0..8 (four slots: --batch 4)");
     if (!kv_pool_tokens && kv_pool_bytes != UINT64_MAX)
         throw std::invalid_argument("--kv-pool-mib requires --kv-pool-tokens");
-    if(image_checkpoints && (!kv_preallocate || !vision || !serve_mode || !checkpoint_budget || !kv_vision_max_tokens || kv_vision_max_tokens>1024 || chunk!=512))
-        throw std::invalid_argument("--kv-image-checkpoints requires strict --serve --vision, checkpoints, --chunk 512 and an explicit combined image-row cap <=1024; default disabled pending Orin qualification");
+    if(image_checkpoints && (!kv_preallocate || !vision || !serve_mode || !checkpoint_budget || !kv_vision_max_tokens ||
+                            kv_vision_max_tokens>strata::core::Q36ImageSource::max_rows || chunk!=512))
+        throw std::invalid_argument("--kv-image-checkpoints requires strict --serve --vision, checkpoints, --chunk 512 and an explicit combined image-row cap <=" +
+                                    std::to_string(strata::core::Q36ImageSource::max_rows));
     if(!image_checkpoint_corrupt.empty() && (image_checkpoint_test.empty() || !image_checkpoints || image_checkpoint_corrupt!="conv")) throw std::invalid_argument("image checkpoint corruption control requires its gate and conv");
     if(!image_checkpoint_test.empty() && (!schedule_test.empty() || !image_cache_test.empty() || !checkpoint_test.empty() || !vision_test.empty() || !sampled_mtp_test.empty()))
         throw std::invalid_argument("image checkpoint gate cannot combine developer gates");
